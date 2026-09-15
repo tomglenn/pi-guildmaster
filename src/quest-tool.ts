@@ -294,4 +294,32 @@ export function registerQuestTool(pi: ExtensionAPI): void {
 			return { content: [{ type: "text", text }], details: {} };
 		},
 	});
+
+	pi.registerTool({
+		name: "quest_dismiss",
+		label: "Quest Dismiss",
+		description: [
+			"Stand a Quest down and remove it from the Guild board. Cancels it if still running; for a finished",
+			"Quest it tears down the isolated worktree + branch, deletes the record and its saved diff, and",
+			"refreshes the board. In-place Quests keep their branch (that is the user's real checkout) — only the",
+			"record is removed. Never touches the user's checkout. Use to clean up demo/abandoned Quests.",
+		].join(" "),
+		promptSnippet: "Stand down and remove a Quest (cancel if running, tear down its worktree/branch, clear the board)",
+		promptGuidelines: [
+			"Use quest_dismiss to stand down and clean up a Quest the user is done with instead of deleting files by hand. It cancels a running Quest, and for a finished one removes its worktree, branch, record and diff, then refreshes the Guild board. In-place Quests keep their branch (the user's real checkout).",
+		],
+		parameters: Type.Object({
+			questId: Type.String({ description: "Id of the Quest to stand down and remove." }),
+		}),
+		async execute(_toolCallId, params) {
+			const manager = getQuestManager();
+			const { record, cancelledRunning, tornDown } = manager.dismiss(params.questId);
+			if (!record) throw new Error(`No Quest with id ${params.questId}.`);
+			const title = `"${record.title}"`;
+			const text = cancelledRunning
+				? `Quest ${title} was still running — sent it a cancel. It will settle to "cancelled" shortly; dismiss again afterwards to remove its record and worktree.`
+				: `Dismissed Quest ${title} — ${tornDown ? "worktree + branch torn down" : "in-place branch left intact"}, record and diff removed, and cleared from the Guild board.`;
+			return { content: [{ type: "text", text }], details: { id: params.questId, cancelledRunning, tornDown } };
+		},
+	});
 }

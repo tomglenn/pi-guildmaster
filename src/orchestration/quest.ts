@@ -9,6 +9,10 @@
  * store; a cancelled run is recorded as cancelled even if the executor returned.
  */
 
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { discardIsolation } from "../execution/isolation.ts";
+import { questsDir } from "../paths.ts";
 import {
 	newQuestId,
 	type QuestMember,
@@ -82,6 +86,39 @@ export class QuestManager {
 		entry.cancelled = true;
 		entry.controller.abort();
 		return true;
+	}
+
+	/**
+	 * Stand a Quest down and remove it. If it is still running, this cancels it and
+	 * lets the run loop settle to `cancelled` (no record deleted, to avoid racing the
+	 * executor's final persist). If it is terminal, this tears down any worktree
+	 * isolations + branches, deletes the record and its diff artifacts, and emits a
+	 * change so the Guild board repaints. In-place branches are left untouched.
+	 */
+	dismiss(id: string): { record?: QuestRecord; cancelledRunning: boolean; tornDown: boolean } {
+		const record = this.store.load(id);
+		if (this.active.has(id)) {
+			this.cancel(id);
+			return { record, cancelledRunning: true, tornDown: false };
+		}
+		if (!record) return { cancelledRunning: false, tornDown: false };
+		let tornDown = false;
+		for (const iso of record.isolations ?? []) {
+			discardIsolation(iso);
+			if (iso.worktreePath !== iso.repoRoot) tornDown = true;
+		}
+		// Best-effort: remove any saved diff artifacts for this quest.
+		try {
+			for (const f of fs.readdirSync(questsDir())) {
+				if (f.startsWith(`${id}.`) && f.endsWith(".diff")) fs.unlinkSync(path.join(questsDir(), f));
+			}
+		} catch {
+			/* ignore */
+		}
+		this.store.delete(id);
+		record.state = "cancelled";
+		this.emit(record); // listeners recompute from store (now empty of this id) and repaint
+		return { record, cancelledRunning: false, tornDown };
 	}
 
 	/**

@@ -131,3 +131,28 @@ export function removeWorktree(iso: Isolation): void {
 		/* ignore */
 	}
 }
+
+/** True when this isolation is the user's real checkout (in-place mode), not a worktree. */
+export function isInPlace(iso: Isolation): boolean {
+	return iso.worktreePath === iso.repoRoot;
+}
+
+/**
+ * Tear down a worktree isolation: remove the worktree, delete its branch, prune.
+ * NO-OP for in-place isolations — that branch lives in the user's real checkout and
+ * must never be force-removed by a dismiss.
+ */
+export function discardIsolation(iso: Isolation): void {
+	if (isInPlace(iso)) return;
+	removeWorktree(iso);
+	try {
+		git(["branch", "-D", iso.branch], iso.repoRoot);
+	} catch {
+		/* ignore */
+	}
+	try {
+		git(["worktree", "prune"], iso.repoRoot);
+	} catch {
+		/* ignore */
+	}
+}

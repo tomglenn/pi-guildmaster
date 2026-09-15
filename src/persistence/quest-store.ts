@@ -103,6 +103,16 @@ export class QuestStore {
 		return record;
 	}
 
+	/** Delete a quest's record file. Returns true if a file was actually removed. */
+	delete(id: string): boolean {
+		try {
+			fs.unlinkSync(this.filePath(id));
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
 	load(id: string): QuestRecord | undefined {
 		try {
 			return JSON.parse(fs.readFileSync(this.filePath(id), "utf-8")) as QuestRecord;
