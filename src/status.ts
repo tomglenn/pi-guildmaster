@@ -13,7 +13,7 @@
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Container, Text } from "@earendil-works/pi-tui";
+import { Container, Spacer, Text } from "@earendil-works/pi-tui";
 import { getApprovalManager, getQuestManager } from "./orchestration/manager.ts";
 import type { QuestMemberStatus, QuestRecord } from "./persistence/quest-store.ts";
 
@@ -110,6 +110,7 @@ export class StatusSurface {
 		this.ctx.ui.setWidget(WIDGET, (_tui, theme) => {
 			const fg = (c: string, t: string) => theme.fg(c, t);
 			const box = new Container();
+			box.addChild(new Spacer(1));
 			box.addChild(new Text(fg("toolTitle", theme.bold("◆ Guild")), 0, 0));
 			for (const q of snapshot.active) {
 				const label = q.project ? fg("muted", `[${q.project}] `) : "";
