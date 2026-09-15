@@ -98,11 +98,53 @@ export function inPlaceIsolation(cwd: string, questId: string, title: string, re
 }
 
 /**
+ * Agent scratch/tooling litter that must never enter a commit. Kept narrow and
+ * unambiguous so real new files are never excluded. Critical for in-place mode,
+ * where the index maps onto the user's real repo; harmless in a disposable worktree.
+ */
+const SCRATCH_PATTERNS: RegExp[] = [
+	/(^|\/)\.?temp[_-]?commit[^/]*\.sh$/i, // e.g. a runner's .temp_commit.sh used to self-commit
+	/(^|\/)\.guildmaster[-_][^/]*$/i, // stray guildmaster-* scratch files
+];
+
+function isScratch(p: string): boolean {
+	return SCRATCH_PATTERNS.some((re) => re.test(p));
+}
+
+/**
  * Stage and commit whatever the Party changed in the worktree (so the branch is
  * PR-ready), then return the diff vs the base. Skips hooks to stay bounded.
+ *
+ * Agent scratch litter is unstaged before committing so it never enters history.
+ * In in-place mode (index == the user's real repo) such litter is also deleted
+ * from disk, since a clean start means it was created by this quest.
  */
 export function commitAndDiff(iso: Isolation, message: string): WorktreeChanges {
 	git(["add", "-A"], iso.worktreePath);
+
+	// Never commit agent scratch/tooling litter.
+	const staged = git(["diff", "--cached", "--name-only"], iso.worktreePath)
+		.split("\n")
+		.map((s) => s.trim())
+		.filter(Boolean);
+	for (const f of staged.filter(isScratch)) {
+		try {
+			git(["restore", "--staged", "--", f], iso.worktreePath);
+		} catch {
+			try {
+				git(["reset", "-q", "--", f], iso.worktreePath);
+			} catch {
+				/* ignore */
+			}
+		}
+		if (isInPlace(iso)) {
+			try {
+				fs.unlinkSync(path.join(iso.worktreePath, f));
+			} catch {
+				/* ignore */
+			}
+		}
+	}
 
 	let hasChanges = false;
 	try {
