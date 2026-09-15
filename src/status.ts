@@ -18,13 +18,23 @@ import { getApprovalManager, getQuestManager } from "./orchestration/manager.ts"
 import type { QuestMemberStatus, QuestRecord } from "./persistence/quest-store.ts";
 
 const WIDGET = "guildmaster-board";
-const STATUS = "guildmaster";
 const QUEST_CARD = "guildmaster-quest";
 
 const MEMBER_GLYPH: Record<QuestMemberStatus, string> = { pending: "○", running: "●", done: "✓", failed: "✗" };
+/** Per-status colour for a party member's glyph + name. */
+const MEMBER_COLOR: Record<QuestMemberStatus, string> = { pending: "muted", running: "accent", done: "success", failed: "error" };
 
-function memberGlyphs(record: QuestRecord): string {
-	return record.members.map((m) => `${MEMBER_GLYPH[m.status]}${m.name}`).join(" ");
+/** Colour-coded member glyphs with a space between icon and name, e.g. "✓ scout". */
+function memberGlyphs(record: QuestRecord, theme: { fg: (c: string, t: string) => string }): string {
+	return record.members.map((m) => theme.fg(MEMBER_COLOR[m.status], `${MEMBER_GLYPH[m.status]} ${m.name}`)).join("  ");
+}
+
+/** Overall party status colour: failed → awaiting-approval → all-done → in-flight. */
+function partyColor(record: QuestRecord): string {
+	if (record.members.some((m) => m.status === "failed")) return "error";
+	if (record.state === "awaiting-approval") return "warning";
+	if (record.members.length > 0 && record.members.every((m) => m.status === "done")) return "success";
+	return "accent";
 }
 
 export class StatusSurface {
@@ -100,22 +110,19 @@ export class StatusSurface {
 
 		if (active.length === 0 && pending.length === 0 && ready.length === 0) {
 			this.ctx.ui.setWidget(WIDGET, undefined);
-			this.ctx.ui.setStatus(STATUS, undefined);
 			return;
 		}
 
-		this.ctx.ui.setStatus(STATUS, `guild ⚑${pending.length} ●${active.length} ✔${ready.length}`);
 		// Snapshot for the render closure.
 		const snapshot = { active: [...active], pending: [...pending], ready: [...ready] };
 		this.ctx.ui.setWidget(WIDGET, (_tui, theme) => {
 			const fg = (c: string, t: string) => theme.fg(c, t);
 			const box = new Container();
 			box.addChild(new Spacer(1));
-			box.addChild(new Text(fg("muted", "\u2500".repeat(48)), 0, 0));
 			box.addChild(new Text(fg("toolTitle", theme.bold("◆ Guild")), 0, 0));
 			for (const q of snapshot.active) {
 				const label = q.project ? fg("muted", `[${q.project}] `) : "";
-				box.addChild(new Text(`  ${fg("accent", "●")} ${label}${fg("toolTitle", q.title)}  ${fg("dim", memberGlyphs(q))}`, 0, 0));
+				box.addChild(new Text(`  ${fg(partyColor(q), "●")} ${label}${fg("toolTitle", q.title)}  ${memberGlyphs(q, theme)}`, 0, 0));
 			}
 			for (const a of snapshot.pending) {
 				box.addChild(new Text(`  ${fg("warning", "⚑")} ${fg("dim", a.id)}  ${a.title}  ${fg("muted", "/approve")}`, 0, 0));
