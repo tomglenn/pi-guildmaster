@@ -124,7 +124,7 @@ export class StatusSurface {
 				box.addChild(new Text(`  ${fg("success", "✔")} ${fg("toolTitle", q.title)}  ${fg("muted", "draft PR ready → raise_pr")}`, 0, 0));
 			}
 			return box;
-		});
+		}, { placement: "belowEditor" });
 	}
 }
 
