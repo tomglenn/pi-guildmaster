@@ -41,6 +41,15 @@ export function isGitRepo(cwd: string): boolean {
 	}
 }
 
+/** True if the repo has no uncommitted changes (clean base for in-place work). */
+export function isWorkingTreeClean(cwd: string): boolean {
+	try {
+		return git(["status", "--porcelain"], cwd).trim() === "";
+	} catch {
+		return false;
+	}
+}
+
 export function slugify(text: string): string {
 	return (
 		text
@@ -65,6 +74,27 @@ export function createWorktree(cwd: string, questId: string, title: string, repo
 	fs.mkdirSync(path.dirname(worktreePath), { recursive: true });
 	git(["worktree", "add", "-b", branch, worktreePath, baseRef], repoRoot);
 	return { repo, branch, worktreePath, baseRef, repoRoot };
+}
+
+/**
+ * IN-PLACE isolation (opt-in, fast-iteration): no separate worktree. Creates a
+ * fresh branch off HEAD checked out in the user's REAL repo, so the Party edits
+ * the live checkout directly. Changes still land on a reviewable branch. Requires
+ * a clean working tree so the branch has a clean base to diff against.
+ *
+ * This deliberately bypasses the worktree safety boundary and mutates the user's
+ * actual checkout — only used when the caller explicitly asks for it.
+ */
+export function inPlaceIsolation(cwd: string, questId: string, title: string, repoName?: string): Isolation {
+	const repoRoot = git(["rev-parse", "--show-toplevel"], cwd).trim();
+	const repo = repoName ?? path.basename(repoRoot);
+	if (!isWorkingTreeClean(repoRoot)) {
+		throw new Error(`In-place Quest requires a clean working tree in "${repo}"; commit or stash your changes first.`);
+	}
+	const baseRef = git(["rev-parse", "HEAD"], repoRoot).trim();
+	const branch = `guildmaster/${slugify(title)}-${questId.slice(-4)}`;
+	git(["checkout", "-b", branch], repoRoot);
+	return { repo, branch, worktreePath: repoRoot, baseRef, repoRoot };
 }
 
 /**

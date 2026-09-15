@@ -19,7 +19,7 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { effectiveConfig, loadConfig } from "./config.ts";
 import type { GuildmasterConfig } from "./config.ts";
-import { commitAndDiff, createWorktree, isGitRepo } from "./execution/isolation.ts";
+import { commitAndDiff, createWorktree, inPlaceIsolation, isGitRepo, isWorkingTreeClean } from "./execution/isolation.ts";
 import { getQuestManager } from "./orchestration/manager.ts";
 import { runParty } from "./orchestration/party-leader.ts";
 import { readonlyContexts, resolveProjectQuery } from "./orchestration/resolve.ts";
@@ -28,10 +28,13 @@ import type { QuestRecord } from "./persistence/quest-store.ts";
 import { questsDir } from "./paths.ts";
 import { loadRoster } from "./roster.ts";
 
-function started(record: QuestRecord, projectId?: string, targetRepo?: string, write = false) {
+function started(record: QuestRecord, projectId?: string, targetRepo?: string, write = false, inPlace = false) {
 	const scope = projectId ? ` for project ${projectId}${targetRepo ? `/${targetRepo}` : ""}` : "";
+	const branch = record.isolations?.[0]?.branch;
 	const tail = write
-		? "When it finishes it will produce a draft PR you can raise with raise_pr."
+		? inPlace
+			? `It is working IN-PLACE in your real checkout${branch ? ` on branch ${branch}` : ""} — changes are committed there for you to review directly. No worktree, no PR.`
+			: "When it finishes it will produce a draft PR you can raise with raise_pr."
 		: "Ask me to show the results when it's done, or check /quests.";
 	return {
 		content: [
@@ -59,7 +62,7 @@ function draftPrFromReport(report: string): { title: string; body: string } {
 /** Run a Quest to completion in the background. Errors are recorded as failed by the manager. */
 async function runQuestInBackground(
 	record: QuestRecord,
-	opts: { write: boolean; contexts: RepoContext[]; config: GuildmasterConfig; instructions?: string },
+	opts: { write: boolean; inPlace?: boolean; contexts: RepoContext[]; config: GuildmasterConfig; instructions?: string },
 ): Promise<void> {
 	const manager = getQuestManager();
 	const roster = loadRoster();
@@ -93,6 +96,8 @@ async function runQuestInBackground(
 							/* best effort */
 						}
 					}
+					// In-place: changes are already committed on the user's real branch; no PR is drafted.
+					if (opts.inPlace) continue;
 					prs.push({
 						repo: iso.repo,
 						branch: iso.branch,
@@ -158,11 +163,20 @@ export function registerQuestTool(pi: ExtensionAPI): void {
 						"produces a committed branch + drafted PR (never touching the user's checkout, nothing pushed).",
 				}),
 			),
+			inPlace: Type.Optional(
+				Type.Boolean({
+					description:
+						"Opt-in fast-iteration mode for write Quests only. Skips the isolated worktree and lets the Party " +
+						"edit the user's REAL checkout directly, on a fresh branch (requires a clean working tree; commits " +
+						"but does not open a PR). Dangerous — only when the user explicitly asks to bypass isolation.",
+				}),
+			),
 		}),
 
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const manager = getQuestManager();
 			const write = params.write ?? false;
+			const inPlace = (params.inPlace ?? false) && write;
 
 			// Resolve the named project (if any). cwd is only a fallback.
 			const projectStore = new ProjectStore();
@@ -201,16 +215,20 @@ export function registerQuestTool(pi: ExtensionAPI): void {
 				}
 				for (const t of targets) {
 					if (!isGitRepo(t.path)) throw new Error(`Write Quests require a git repository; "${t.name}" is not one.`);
+					if (inPlace && !isWorkingTreeClean(t.path))
+						throw new Error(`In-place Quest requires a clean working tree in "${t.name}"; commit or stash your changes first.`);
 				}
 				const record = manager.create({ cwd: targets[0].path, title: params.title, brief: params.brief, project: project?.id });
-				record.isolations = targets.map((t) => createWorktree(t.path, record.id, params.title, t.name));
+				record.isolations = targets.map((t) =>
+					inPlace ? inPlaceIsolation(t.path, record.id, params.title, t.name) : createWorktree(t.path, record.id, params.title, t.name),
+				);
 				manager.store.save(record);
 				contexts = record.isolations.map((iso) => ({ name: iso.repo, path: iso.worktreePath, writable: true }));
 				if (project) {
 					for (const r of project.repos) if (!targets.some((t) => t.name === r.name)) contexts.push({ name: r.name, path: r.path, writable: false });
 				}
-				void runQuestInBackground(record, { write: true, contexts, config, instructions });
-				return started(record, project?.id, targets.map((t) => t.name).join("+"), true);
+				void runQuestInBackground(record, { write: true, inPlace, contexts, config, instructions });
+				return started(record, project?.id, targets.map((t) => t.name).join("+"), true, inPlace);
 			}
 
 			// Read/investigation Quest: all project repos read-only, or the cwd.
