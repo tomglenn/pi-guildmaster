@@ -111,6 +111,7 @@ export class StatusSurface {
 			const fg = (c: string, t: string) => theme.fg(c, t);
 			const box = new Container();
 			box.addChild(new Spacer(1));
+			box.addChild(new Text(fg("muted", "\u2500".repeat(48)), 0, 0));
 			box.addChild(new Text(fg("toolTitle", theme.bold("◆ Guild")), 0, 0));
 			for (const q of snapshot.active) {
 				const label = q.project ? fg("muted", `[${q.project}] `) : "";
