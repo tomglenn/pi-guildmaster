@@ -1,0 +1,137 @@
+/**
+ * Quest persistence — boring JSON, one file per Quest (§19).
+ *
+ * State lives at ~/.pi/agent/guildmaster/quests/<id>.json, independent of Pi's
+ * session storage, so Quests survive restarts and can be read by external tools.
+ *
+ * The store enforces the one invariant that matters: state must reflect reality.
+ * A Quest cannot be persisted as `completed` unless it actually has a report.
+ */
+
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { questsDir } from "../paths.ts";
+
+/** The six lifecycle states (§5). Do not add states without a demonstrated need. */
+export type QuestState = "created" | "running" | "awaiting-approval" | "completed" | "failed" | "cancelled";
+
+export type QuestMemberStatus = "pending" | "running" | "done" | "failed";
+
+export interface QuestMember {
+	name: string;
+	task: string;
+	model?: string;
+	status: QuestMemberStatus;
+	summary?: string;
+	/** Which project repo this member worked in (multi-repo projects). */
+	repo?: string;
+}
+
+/** Git worktree isolation for one repo of a write-Quest (§11). One per writable repo. */
+export interface QuestIsolation {
+	repo: string;
+	branch: string;
+	worktreePath: string;
+	baseRef: string;
+	repoRoot: string;
+}
+
+/** Drafted (M8) or opened (M9) pull request for one repo. Guildmaster never merges. */
+export interface QuestPr {
+	repo: string;
+	branch: string;
+	title: string;
+	body: string;
+	draft: boolean;
+	diffStat?: string;
+	url?: string;
+	number?: number;
+}
+
+export interface QuestRecord {
+	id: string;
+	title: string;
+	brief: string;
+	cwd: string;
+	/** Registered project id this Quest belongs to (undefined = ad-hoc / cwd-scoped). */
+	project?: string;
+	state: QuestState;
+	createdAt: number;
+	updatedAt: number;
+	members: QuestMember[];
+	/** Present only when state === "completed". */
+	report?: string;
+	error?: string;
+	usage?: { cost: number; turns: number };
+	/** Write-Quest fields: one isolation + one drafted PR per writable repo (§ Projects P3). */
+	isolations?: QuestIsolation[];
+	prs?: QuestPr[];
+}
+
+const TERMINAL: ReadonlySet<QuestState> = new Set(["completed", "failed", "cancelled"]);
+
+export function isTerminal(state: QuestState): boolean {
+	return TERMINAL.has(state);
+}
+
+/** Throw if a record would misrepresent reality. Enforced on every write. */
+function assertValid(record: QuestRecord): void {
+	if (record.state === "completed" && !record.report?.trim()) {
+		throw new Error(`Quest ${record.id} cannot be "completed" without a report.`);
+	}
+}
+
+export class QuestStore {
+	private readonly dir: string;
+
+	constructor(dir: string = questsDir()) {
+		this.dir = dir;
+	}
+
+	private filePath(id: string): string {
+		return path.join(this.dir, `${id}.json`);
+	}
+
+	/** Persist a record. Atomic (temp + rename). Bumps updatedAt. Enforces invariant. */
+	save(record: QuestRecord): QuestRecord {
+		assertValid(record);
+		record.updatedAt = Date.now();
+		fs.mkdirSync(this.dir, { recursive: true });
+		const tmp = this.filePath(`.${record.id}.tmp`);
+		fs.writeFileSync(tmp, JSON.stringify(record, null, 2), { encoding: "utf-8", mode: 0o600 });
+		fs.renameSync(tmp, this.filePath(record.id));
+		return record;
+	}
+
+	load(id: string): QuestRecord | undefined {
+		try {
+			return JSON.parse(fs.readFileSync(this.filePath(id), "utf-8")) as QuestRecord;
+		} catch {
+			return undefined;
+		}
+	}
+
+	/** All persisted Quests, newest first. */
+	list(): QuestRecord[] {
+		let names: string[];
+		try {
+			names = fs.readdirSync(this.dir);
+		} catch {
+			return [];
+		}
+		const records: QuestRecord[] = [];
+		for (const name of names) {
+			if (!name.endsWith(".json") || name.startsWith(".")) continue;
+			const rec = this.load(name.slice(0, -".json".length));
+			if (rec) records.push(rec);
+		}
+		return records.sort((a, b) => b.createdAt - a.createdAt);
+	}
+}
+
+/** Short, sortable, filesystem-safe id. */
+export function newQuestId(): string {
+	const ts = new Date().toISOString().replace(/[:.]/g, "-").replace("T", "_").slice(0, 19);
+	const rand = Math.random().toString(36).slice(2, 6);
+	return `${ts}_${rand}`;
+}

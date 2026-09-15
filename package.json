@@ -1,0 +1,18 @@
+{
+  "name": "pi-guildmaster",
+  "version": "0.0.1",
+  "description": "Guildmaster: an opinionated multi-agent development workflow built on top of Pi.",
+  "keywords": ["pi-package", "pi-guildmaster"],
+  "type": "module",
+  "license": "MIT",
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  }
+}

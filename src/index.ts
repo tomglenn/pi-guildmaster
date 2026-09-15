@@ -1,0 +1,85 @@
+/**
+ * Guildmaster — an opinionated multi-agent development workflow built on Pi.
+ *
+ * Pi is the harness; Guildmaster is the workflow. This extension composes Pi's
+ * public primitives (SDK sessions, model/provider selection, tool restriction,
+ * events, custom UI, commands) rather than modifying Pi internals (§15).
+ *
+ * Milestone 1 — Extension Skeleton:
+ *   - proper Pi package that loads and hot-reloads (`/reload`);
+ *   - durable, user-owned roster seeded from bundled defaults on first use;
+ *   - configuration (model aliases);
+ *   - status commands and native TUI card rendering.
+ *
+ * Delegation (Consult / Quest / Party) is added in later milestones.
+ */
+
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { registerApprovals } from "./approvals-ui.ts";
+import { registerCommands } from "./commands.ts";
+import { registerConsultTool } from "./consult.ts";
+import { getApprovalManager, getQuestManager } from "./orchestration/manager.ts";
+import { ProjectStore } from "./persistence/project-store.ts";
+import { registerProjects } from "./projects-ui.ts";
+import { registerQuestTool } from "./quest-tool.ts";
+import { ensureGuildSeeded, loadGuildmasterPrompt } from "./roster.ts";
+import { getStatusSurface } from "./status.ts";
+import { registerInfoCard } from "./ui.ts";
+
+export default function guildmaster(pi: ExtensionAPI): void {
+	// Seed the durable user-owned guild directory once. Filesystem-only and
+	// idempotent, so it is safe during extension load.
+	let seeded = false;
+	try {
+		seeded = ensureGuildSeeded();
+	} catch {
+		// Non-fatal: commands surface an empty roster if seeding failed.
+	}
+
+	registerInfoCard(pi);
+	registerConsultTool(pi);
+	registerQuestTool(pi);
+	registerApprovals(pi);
+	registerProjects(pi);
+	registerCommands(pi);
+
+	// Make the main agent actually BE the Guildmaster, and aware of the user's projects,
+	// every turn. Project resolution is name-based (location-independent), not cwd-based.
+	pi.on("before_agent_start", async (event) => {
+		const persona = loadGuildmasterPrompt();
+		const projects = new ProjectStore().list();
+		const projectBlock =
+			projects.length > 0
+				? `## Registered projects\n${projects
+						.map(
+							(p) =>
+								`- ${p.id}${p.aliases?.length ? ` (aka ${p.aliases.join(", ")})` : ""}: ${p.description ?? p.name} — repos: ${p.repos.map((r) => r.name).join(", ")}`,
+						)
+						.join("\n")}`
+				: "## Registered projects\n(none yet — if the user names a project you don't know, ask where it lives and offer to register it with register_project.)";
+		const guidance =
+			"When the user refers to a project by name, resolve it to a registered project id and pass it as the `project` argument to consult/quest — do not rely on the current working directory. If the name is unknown or ambiguous, ask the user rather than guessing.";
+		const addition = [persona, projectBlock, guidance].filter(Boolean).join("\n\n");
+		return { systemPrompt: `${event.systemPrompt}\n\n${addition}` };
+	});
+
+	// Ambient status board: subscribes to the Quest + Approval managers and repaints
+	// the widget/footer + toasts on every change, so the user never has to poll (§12).
+	const status = getStatusSurface();
+	status.init(pi);
+
+	// Cancel any in-flight Quests and release any parked approvals when the session
+	// tears down, so background work and dangling promises do not outlive it (§5, §9).
+	pi.on("session_shutdown", async () => {
+		const manager = getQuestManager();
+		for (const quest of manager.getActive()) manager.cancel(quest.id);
+		getApprovalManager().denyAll();
+	});
+
+	pi.on("session_start", async (event, ctx) => {
+		status.attach(ctx);
+		if (event.reason === "startup" && seeded) {
+			ctx.ui.notify("Guildmaster: seeded default guild roster.", "info");
+		}
+	});
+}
