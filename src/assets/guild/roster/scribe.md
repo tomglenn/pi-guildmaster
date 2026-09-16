@@ -18,3 +18,17 @@ Write for the reader, not the party.
 
 The reader is a busy engineer who was not in the room. Give them exactly what they
 need to act.
+
+## When the party is a PR review
+
+You write the final review the human will read (and, once approved, the envoy will
+post). Build it only from the specialists' findings — correctness, security
+(warden), and adversarial (inquisitor).
+
+- Open with a short plain-English summary: what the PR does and whether it looks sound.
+- Group the findings by theme (correctness, security, design, tests). Keep each point
+  short and specific, with file:line where a specialist gave it.
+- End with a clear verdict recommendation: comment, approve, or request-changes, and
+  the top one or two things that drove it.
+- Do not invent findings or soften the specialists' concerns. If inquisitor left
+  something unresolved, say so.

@@ -18,6 +18,10 @@ const TIER_TOOLS: Record<Tier, string[]> = {
 	"read-only": ["read", "grep", "find", "ls"],
 	write: ["read", "grep", "find", "ls", "edit", "write"],
 	exec: ["read", "grep", "find", "ls", "bash"],
+	// Envoy talks to GitHub. It gets read-only FILE tools here; its shell access is a
+	// separate POLICY-GATED custom tool injected by orchestration (see execution/gh-tool.ts),
+	// never the raw `bash` tool — so it structurally cannot run an ungated mutation.
+	envoy: ["read", "grep", "find", "ls"],
 	// Orchestrators do not run as child agents; give them read-only if ever built as one.
 	orchestrator: ["read", "grep", "find", "ls"],
 };

@@ -61,6 +61,33 @@ export function classifyCommand(command: string): OpDecision {
 	return { klass: "read", operation: bin, reason: "non-privileged command" };
 }
 
+export interface ReviewGate extends OpDecision {
+	/** Requires human approval before it may run (mutations in a review quest). */
+	needsApproval: boolean;
+	/** Hard-blocked regardless of approval (merge; suspected security fix auto-publish). */
+	blocked: boolean;
+}
+
+/**
+ * Gate a shell command for the review envoy. Reads run freely; mutations require
+ * approval and are only allowed in review mode; `gh pr merge` is always blocked;
+ * a suspected security fix is blocked from auto-publish so it cannot be posted
+ * without explicit out-of-band confirmation (§ org policy).
+ */
+export function gateReviewCommand(command: string, opts: { reviewMode: boolean; prText?: string }): ReviewGate {
+	const d = classifyCommand(command);
+	if (d.klass === "forbidden") return { ...d, needsApproval: false, blocked: true };
+	if (d.klass === "read") return { ...d, needsApproval: false, blocked: false };
+	// mutate:
+	if (!opts.reviewMode) {
+		return { ...d, reason: "mutations are only allowed inside a PR-review quest", needsApproval: false, blocked: true };
+	}
+	if (opts.prText && isLikelySecurityFix(opts.prText)) {
+		return { ...d, reason: "suspected security fix — must be confirmed out of band before posting", needsApproval: false, blocked: true };
+	}
+	return { ...d, needsApproval: true, blocked: false };
+}
+
 // Heuristic only. Errs toward flagging so a security fix is not auto-published (§ org policy).
 const SECURITY_SIGNALS =
 	/\b(cve-\d|vulnerabilit|security fix|security patch|exploit|xss|csrf|\bssrf\b|\brce\b|sql injection|auth(?:entication|orization)?\s+bypass|privilege escalation|path traversal|secret leak|hardcoded (?:secret|password|token))\b/i;

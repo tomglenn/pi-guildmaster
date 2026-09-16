@@ -13,9 +13,9 @@ import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import { ASSETS_DIR, guildDir, guildmasterPromptPath, partyLeaderPromptPath, rosterDir } from "./paths.ts";
 
 /** Coarse capability tier (§8). Maps to real tool sets in later milestones. */
-export type Tier = "read-only" | "write" | "exec" | "orchestrator";
+export type Tier = "read-only" | "write" | "exec" | "envoy" | "orchestrator";
 
-const TIERS: readonly Tier[] = ["read-only", "write", "exec", "orchestrator"];
+const TIERS: readonly Tier[] = ["read-only", "write", "exec", "envoy", "orchestrator"];
 
 export interface Guildmate {
 	name: string;
