@@ -20,7 +20,9 @@ function basename(p: string): string {
 	return i === -1 ? p : p.slice(i + 1);
 }
 
-const GH_PR_READ = new Set(["view", "list", "checks", "diff", "status"]);
+// `checkout` is local-only (fetches the PR ref + switches a local branch); no remote
+// mutation, so it counts as a read for gating purposes.
+const GH_PR_READ = new Set(["view", "list", "checks", "diff", "status", "checkout"]);
 
 /** Classify a shell command's privilege. Unknown/non-git-gh commands are treated as read. */
 export function classifyCommand(command: string): OpDecision {
