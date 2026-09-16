@@ -21,16 +21,7 @@ const WIDGET = "guildmaster-board";
 const QUEST_CARD = "guildmaster-quest";
 
 const MEMBER_GLYPH: Record<QuestMemberStatus, string> = { pending: "○", running: "●", done: "✓", failed: "✗" };
-/** Format elapsed run time as m:ss (or h:mm:ss past an hour). */
-function formatElapsed(ms: number): string {
-	const total = Math.max(0, Math.floor(ms / 1000));
-	const s = total % 60;
-	const m = Math.floor(total / 60) % 60;
-	const h = Math.floor(total / 3600);
-	const mm = String(m).padStart(2, "0");
-	const ss = String(s).padStart(2, "0");
-	return h > 0 ? `${h}:${mm}:${ss}` : `${m}:${ss}`;
-}
+
 /** Per-status colour for a party member's glyph + name. */
 const MEMBER_COLOR: Record<QuestMemberStatus, ThemeColor> = { pending: "muted", running: "accent", done: "success", failed: "error" };
 
@@ -53,7 +44,6 @@ export class StatusSurface {
 	private readonly questStates = new Map<string, string>();
 	private knownApprovals = new Set<string>();
 	private initialized = false;
-	private tickTimer?: ReturnType<typeof setInterval>;
 
 	/** Wire subscriptions once. The quest card renderer is registered here too. */
 	init(pi: ExtensionAPI): void {
@@ -111,21 +101,6 @@ export class StatusSurface {
 		this.pi?.appendEntry(QUEST_CARD, record);
 	}
 
-	/** Stop the refresh timer (e.g. on session shutdown) so no interval leaks. */
-	stopTicker(): void {
-		this.ensureTicker(false);
-	}
-
-	/** Run a gentle 1s repaint while a Quest is running, so the elapsed-time readout stays live. */
-	private ensureTicker(running: boolean): void {
-		if (running && !this.tickTimer) {
-			this.tickTimer = setInterval(() => this.repaint(), 1000);
-		} else if (!running && this.tickTimer) {
-			clearInterval(this.tickTimer);
-			this.tickTimer = undefined;
-		}
-	}
-
 	/** Recompute and repaint the board + footer. Safe to call anytime. */
 	repaint(): void {
 		if (!this.ctx) return;
@@ -139,13 +114,9 @@ export class StatusSurface {
 			.filter((q) => (q.state === "completed" || q.state === "failed" || q.state === "cancelled") && !q.acknowledgedAt);
 
 		if (active.length === 0 && pending.length === 0 && done.length === 0) {
-			this.ensureTicker(false);
 			this.ctx.ui.setWidget(WIDGET, undefined);
 			return;
 		}
-
-		// Keep a live elapsed-time readout only while something is actively running.
-		this.ensureTicker(active.some((q) => q.state === "running"));
 
 		// Snapshot for the render closure.
 		// Resolve parent titles for any chained (fromQuest) Quests, for lineage display.
@@ -164,12 +135,7 @@ export class StatusSurface {
 			box.addChild(new Text(fg("toolTitle", theme.bold("◆ Guildmaster Quest Log")), 0, 0));
 			for (const q of snapshot.active) {
 				const label = q.project ? fg("muted", `[${q.project}] `) : "";
-				const end =
-					q.state === "running"
-						? `  ${fg("muted", formatElapsed(Date.now() - q.createdAt))}`
-						: q.state === "awaiting-approval"
-							? `  ${fg("warning", "⏸ awaiting approval")}`
-							: "";
+				const end = q.state === "awaiting-approval" ? `  ${fg("warning", "⏸ awaiting approval")}` : "";
 				box.addChild(new Text(`  ${fg(partyColor(q), "●")} ${label}${fg("toolTitle", q.title)}  ${memberGlyphs(q, theme)}${end}`, 0, 0));
 				if (snapshot.lineage[q.id]) box.addChild(new Text(`      ${fg("muted", `↳ from ${snapshot.lineage[q.id]}`)}`, 0, 0));
 			}
