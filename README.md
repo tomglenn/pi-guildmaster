@@ -1,101 +1,237 @@
 # Guildmaster for Pi
 
 An opinionated multi-agent development workflow built on top of [Pi](https://pi.dev).
-Pi is the harness; Guildmaster is the workflow.
+**Pi is the harness; Guildmaster is the workflow.**
 
-Guildmaster adds a Guildmaster orchestrator, a roster of specialist **Guildmates**,
-lightweight synchronous **Consults**, asynchronous **Quests** coordinated by a
-**Party Leader**, per-agent model diversity, real capability boundaries, and
-asynchronous human approval — all through Pi's public extension and SDK surface.
+You talk to a single **Guildmaster**. It does small things itself, delegates
+bounded questions to specialists, and hands substantial work to background
+**parties** of specialist agents — so your main context stays light and you never
+have to wrangle agents by hand.
 
-## Status
+---
 
-Built vertically, milestone by milestone.
+## What it is
 
-- [x] **M1 — Extension skeleton**: package, config, durable roster seeding,
-      status commands, native TUI cards, dev/reload workflow.
-- [x] **M2 — One Guildmate (Scout)**: isolated in-process child agent with
-      structurally read-only tools, independent context, concise return.
-- [x] **M3 — Consult primitive**: generic across read-only Guildmates, declarative
-      roster. Predictably bounded by a deterministic **step budget** with a graceful
-      wrap-up at the cap (wall-clock is only a hang backstop). Verified Scout, Delver, Warden.
-- [x] **M4 — Multi-provider**: per-Guildmate provider proven — Delver on
-      `anthropic/claude-sonnet-4-5` produced a conclusion, Inquisitor on
-      `openai-codex/gpt-5.5` adversarially reviewed it. Clean plain-text cross-family handoff.
-- [x] **M5 — Quest lifecycle + persistence**: six states, per-Quest JSON outside
-      Pi's session store, cancellation, and the reality invariant (no `completed`
-      without a report). All transitions verified.
-- [x] **M6 — Party Leader**: orchestrator-tier agent whose only tool is `dispatch`,
-      dynamically composing a Party of read-only specialists. Verified live
-      (Scout → Delver → synthesis) with a persisted final report.
-- [x] **M7 — Mixed-model adversarial Party**: within one Party, Anthropic specialists
-      produce conclusions and Inquisitor (`openai-codex/gpt-5.5`) challenges them; clean
-      plain-text cross-provider handoff. Final report extracted structurally (no preamble).
-- [x] **M8 — Write isolation**: write-Quests run in a git worktree; Smith implements,
-      Runner verifies, and the branch is committed + a draft PR is composed — the user's
-      checkout is untouched and nothing is pushed. Verified live (real change + `node` verification).
-- [x] **M9 — Asynchronous approval**: parked (non-blocking) approvals — a pending
-      approval never destroys unrelated party work. Operation-aware git/gh policy
-      (view=read, push/create=approval, merge=refused). Gated draft-PR raise, security-fix
-      and grafana first-party guards. Verified against the prototype's failure mode.
-- [x] **Projects P1 (multi-repo)**: named registry resolved by name/alias from ANY
-      directory (not cwd). Persona + project list injected each turn; `consult`/`quest`
-      take `project`/`repo`; Parties investigate across a project's repos; Quests scoped
-      per project. Verified live on a two-repo project.
-- [x] **Projects P2 (management + customization)**: `update_project` / `remove_project`
-      tools + `/project-remove`; per-project model-alias overrides and standing
-      `instructions`, layered over the global config. Verified.
-- [x] **Projects P3 (cross-repo writes)**: one Quest changes several repos — per-repo
-      worktrees/branches, per-repo commits, and per-repo **independently approval-gated**,
-      cross-linked draft PRs (never merged). Verified live across two repos.
-- [~] **M10 — Daily use**: Quests now run in the BACKGROUND (Guildmaster stays free,
-      its context stays light), surfaced by an always-on **Guild status board** (widget +
-      footer + transition toasts) plus `quest_status` for on-demand detail. Remaining M10
-      work is adoption/observation, not building.
+Guildmaster adds a few concepts on top of Pi:
 
-## Install (development)
+- **Guildmaster** — the primary agent you chat with. It decides the cheapest way
+  to get each turn done: answer directly, consult one specialist, or start a Quest.
+- **Guildmates** — a roster of specialist agents, each with a persona, a model, and
+  a **capability tier** that structurally limits what it can do (a read-only agent
+  simply has no write or shell tools).
+- **Consult** — one bounded, read-only investigation delegated to a single
+  Guildmate. Runs inline and returns a concise, evidence-backed result.
+- **Quest** — substantial work run in the **background** by a **Party Leader** that
+  composes a party of Guildmates. Returns immediately; you keep working. Its
+  transcript never enters your context — only the final report does.
+- **Approvals** — anything that touches the outside world (pushing a branch,
+  posting a PR review) is **parked for your approval**, never auto-done, and never
+  blocks unrelated work.
+
+Everything runs through Pi's public extension and SDK surface — Guildmaster does
+not patch Pi internals.
+
+---
+
+## Requirements
+
+- [Pi](https://pi.dev) installed (`pi`).
+- Authentication configured for whatever model providers your roster uses
+  (defaults use Anthropic; the adversarial reviewer uses an OpenAI-family model).
+- [`gh`](https://cli.github.com/) authenticated (`gh auth login`) if you want the
+  PR-review flow.
+
+---
+
+## Install
+
+**For development** (symlinks `src/` into Pi's extension dir; supports `/reload`):
 
 ```bash
+git clone git@github.com:tomglenn/pi-guildmaster.git
+cd pi-guildmaster
 ./scripts/dev-install.sh
 ```
 
-This symlinks `src/` into `~/.pi/agent/extensions/guildmaster`. Start `pi` and run
-`/guild`. After editing `src/`, run `/reload` in Pi.
-
-## Install (as a package)
+**As a package:**
 
 ```bash
-pi install /absolute/path/to/guildmaster
+pi install /absolute/path/to/pi-guildmaster
 ```
 
+Start `pi` and run `/guild` to confirm the roster loaded. After editing `src/`,
+run `/reload` in Pi. (Note: `/reload` and `/new` cancel any in-flight Quests.)
+
+---
+
+## Using it
+
+Natural language is the primary interface. Just tell the Guildmaster what you want:
+
+> "Where is auth handled in this repo?" → a quick **Consult**.
+
+> "Investigate the flaky checkout test and report back." → a background **Quest**.
+
+> "Implement X, then review it." → a write Quest (isolated worktree → branch →
+> draft PR; your checkout is never touched).
+
+> "Review PR 1905 on the pathfinder app." → a **review party** (see below).
+
+Work is tracked on the always-on **Guild board** above/below your input: active
+parties with live per-member status, pending approvals, and finished Quests that
+persist until you turn them in — colour-coded so nothing is missed while you
+multitask.
+
+### Reviewing a pull request
+
+A review is a party, not a single agent:
+
+1. The **envoy** (the only agent that talks to GitHub, through a policy-gated
+   shell) fetches the PR.
+2. Specialists review in parallel — correctness (**scout**/**delver**), security
+   (**warden**), adversarial (**inquisitor**).
+3. **Scribe** writes the human-facing review.
+4. The Quest **pauses for your approval**: `/approve` to have the envoy post it,
+   or leave it as a draft.
+
+`gh pr merge` is always refused, and a suspected security fix is blocked from
+auto-posting.
+
+---
+
 ## Commands
+
+Commands are introspection and power-user controls — never required ceremony.
 
 | Command | Purpose |
 |---|---|
 | `/guild` | Show the roster and configured model aliases |
 | `/guildmaster` | Show Guildmaster configuration and status |
-| `/party` | Show active Party / Quest state |
+| `/party` | Show active party / Quest state |
 | `/quests` | Show current and recent Quests |
-| `/consult <guildmate> <question>` | Directly consult a Guildmate (power user) |
+| `/quest-cancel <id>` | Cancel a running background Quest |
+| `/consult <guildmate> <question>` | Consult a Guildmate directly |
+| `/approvals` · `/approve <id>` · `/deny <id>` | List / resolve parked approvals |
+| `/projects` · `/project-remove <id>` | List / remove registered projects |
 
-Natural language remains the primary interface; commands are introspection and
-power-user controls, never required ceremony.
+---
+
+## Projects
+
+Register a project once and target it by name from any directory (resolution is
+name-based, not cwd-based). Projects can span multiple repos.
+
+```
+"Register my pathfinder project — the app, backend and RFC repos in ~/projects."
+```
+
+Consults and Quests then take a `project` (and `repo` for multi-repo projects).
+You can also set per-project model overrides and standing instructions.
+
+---
 
 ## Configuration
 
-On first use, Guildmaster seeds a durable, user-owned copy of the guild into:
+On first use, Guildmaster seeds a durable, user-owned copy of the guild into
+`~/.pi/agent/guildmaster/`:
 
 ```
-~/.pi/agent/guildmaster/guild/
-├── config.json          # model aliases + orchestrator models
-├── guildmaster.md       # Guildmaster orchestrator prompt
-├── party-leader.md      # Party Leader prompt
-└── roster/
-    ├── scout.md  delver.md  architect.md  warden.md
-    ├── inquisitor.md  smith.md  runner.md  scribe.md
+guild/
+├── config.json      # model aliases + orchestrator models
+├── guildmaster.md   # Guildmaster orchestrator prompt
+├── party-leader.md  # Party Leader prompt
+└── roster/          # one markdown persona per Guildmate
 ```
 
-Edit these freely. Upgrades never overwrite your copy. Model diversity is
-configured via aliases in `config.json` (`fast`, `capable`, `reasoning`,
-`adversarial`, `coding`); each Guildmate references an alias or an explicit
-`provider/model`.
+Edit these freely — upgrades never overwrite your copy. Models are chosen via
+aliases in `config.json`:
+
+| alias | default |
+|---|---|
+| `fast` | `anthropic/claude-haiku-4-5` |
+| `capable` | `anthropic/claude-sonnet-4-5` |
+| `reasoning` | `anthropic/claude-opus-4-5` |
+| `adversarial` | `openai-codex/gpt-5.5` |
+| `coding` | `anthropic/claude-sonnet-4-5` |
+
+Each Guildmate references an alias or an explicit `provider/model`, so you get
+per-agent model diversity (the adversarial reviewer deliberately runs on a
+different model family).
+
+---
+
+## The roster
+
+| Guildmate | Tier | Role |
+|---|---|---|
+| **scout** | read-only | Fast, broad reconnaissance |
+| **delver** | read-only | Narrow, exhaustive deep tracing |
+| **architect** | read-only | Plans, not code |
+| **warden** | read-only | Security hunting |
+| **inquisitor** | read-only | Adversarial review (different model family) |
+| **scribe** | write | Human-facing synthesis / final write-ups |
+| **smith** | write | Implementation (in an isolated worktree) |
+| **runner** | exec | Builds and tests |
+| **envoy** | envoy | The party's only contact with GitHub (gated shell) |
+
+Capability tiers are enforced **structurally** by the tools each agent is given —
+not by prompting.
+
+---
+
+## Safety model
+
+- **Structural capability tiers** — read-only agents have no write/exec/GitHub
+  tools at all.
+- **Write isolation** — write Quests run in a dedicated git worktree on a branch;
+  your working checkout is never touched and nothing is pushed without approval.
+  (An opt-in in-place mode exists for fast iteration on a clean tree.)
+- **Parked approvals** — pushing a branch or posting a review needs your
+  `/approve`; a pending approval never blocks other party work.
+- **Operation-aware GitHub policy** — `gh pr view/diff` is a read; `gh pr review`
+  needs approval; `gh pr merge` is refused. Suspected security fixes are held back
+  from auto-posting.
+
+---
+
+## Contributing
+
+Guildmaster is TypeScript, run directly by Pi (no build step for local dev).
+
+```bash
+./scripts/dev-install.sh      # symlink into ~/.pi/agent/extensions
+# edit src/…
+# in Pi: /reload
+```
+
+Before opening a PR:
+
+- **Type-check:** `tsc --noEmit -p tsconfig.json` (peer `@earendil-works/*` and
+  `@types/node` resolve at runtime under Pi; local unresolved-import errors from a
+  bare checkout are expected).
+- Keep changes focused and match the existing style (tabs, small modules,
+  doc-commented files).
+- Commits use Conventional Commit prefixes (`feat:`, `fix:`, `docs:`…).
+
+### Project layout
+
+```
+src/
+├── index.ts             # extension entry: wires tools, commands, board, persona
+├── quest-tool.ts        # quest / quest_status / quest_dismiss / quest_turn_in
+├── consult.ts           # consult tool
+├── status.ts            # the Guild status board (widget + cards)
+├── capabilities.ts      # tier → tool allowlists
+├── roster.ts            # roster loading + seeding
+├── config.ts            # model aliases + resolution
+├── orchestration/       # party leader, quest lifecycle, approvals, PR raising
+├── execution/           # child-agent runner, git worktree isolation, gh policy + gated shell
+├── persistence/         # quest + project stores (JSON on disk)
+└── assets/guild/        # bundled default roster + prompts (seeded on first use)
+```
+
+---
+
+## License
+
+MIT.
