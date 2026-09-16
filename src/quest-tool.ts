@@ -47,6 +47,23 @@ function started(record: QuestRecord, projectId?: string, targetRepo?: string, w
 	};
 }
 
+/**
+ * Build a child Quest's brief by prepending the parent Quest's report (and any
+ * draft-PR branch/diff) as a structured "upstream artifact". This is how a
+ * multi-step flow (e.g. review → fix) hands the prior result to the next party
+ * without the Guildmaster hand-copying it.
+ */
+function briefWithUpstream(brief: string, parent: QuestRecord): string {
+	const parts: string[] = [`## Upstream artifact — from Quest "${parent.title}" (${parent.id})`];
+	parts.push(parent.report?.trim() || "(The upstream Quest recorded no report.)");
+	for (const pr of parent.prs ?? []) {
+		parts.push(`Upstream branch: ${pr.repo} → ${pr.branch}${pr.url ? ` (PR ${pr.url})` : " (draft, not raised)"}`);
+		if (pr.diffStat) parts.push(`Upstream diff:\n${pr.diffStat}`);
+	}
+	parts.push("---", "## Your task", brief);
+	return parts.join("\n\n");
+}
+
 function draftPrFromReport(report: string): { title: string; body: string } {
 	let title = "Guildmaster change";
 	for (const line of report.trim().split("\n")) {
@@ -171,6 +188,13 @@ export function registerQuestTool(pi: ExtensionAPI): void {
 						"but does not open a PR). Dangerous — only when the user explicitly asks to bypass isolation.",
 				}),
 			),
+			fromQuest: Type.Optional(
+				Type.String({
+					description:
+						"Chain this Quest off a previous one: auto-loads that Quest's report (and any draft-PR branch/diff) " +
+						"into the brief as an upstream artifact, and records lineage. Use for multi-step flows like review → fix.",
+				}),
+			),
 		}),
 
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -189,6 +213,11 @@ export function registerQuestTool(pi: ExtensionAPI): void {
 			// Effective config = global merged with this project's overrides (Phase 2).
 			const config = effectiveConfig(loadConfig(), project?.config);
 			const instructions = project?.instructions;
+
+			// Chain off a prior Quest: fold its report (+ any draft-PR branch/diff) into the brief.
+			const parent = params.fromQuest ? manager.store.load(params.fromQuest) : undefined;
+			if (params.fromQuest && !parent) throw new Error(`fromQuest: no Quest with id ${params.fromQuest}.`);
+			const brief = parent ? briefWithUpstream(params.brief, parent) : params.brief;
 
 			let contexts: RepoContext[];
 			let baseCwd: string;
@@ -218,7 +247,8 @@ export function registerQuestTool(pi: ExtensionAPI): void {
 					if (inPlace && !isWorkingTreeClean(t.path))
 						throw new Error(`In-place Quest requires a clean working tree in "${t.name}"; commit or stash your changes first.`);
 				}
-				const record = manager.create({ cwd: targets[0].path, title: params.title, brief: params.brief, project: project?.id });
+				const record = manager.create({ cwd: targets[0].path, title: params.title, brief, project: project?.id });
+				if (parent) record.parentId = parent.id;
 				record.isolations = targets.map((t) =>
 					inPlace ? inPlaceIsolation(t.path, record.id, params.title, t.name) : createWorktree(t.path, record.id, params.title, t.name),
 				);
@@ -239,7 +269,11 @@ export function registerQuestTool(pi: ExtensionAPI): void {
 				contexts = [{ name: "cwd", path: ctx.cwd, writable: false }];
 				baseCwd = ctx.cwd;
 			}
-			const record = manager.create({ cwd: baseCwd, title: params.title, brief: params.brief, project: project?.id });
+			const record = manager.create({ cwd: baseCwd, title: params.title, brief, project: project?.id });
+			if (parent) {
+				record.parentId = parent.id;
+				manager.store.save(record);
+			}
 			void runQuestInBackground(record, { write: false, contexts, config, instructions });
 			return started(record, project?.id, undefined, false);
 		},

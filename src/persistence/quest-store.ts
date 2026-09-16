@@ -68,6 +68,8 @@ export interface QuestRecord {
 	prs?: QuestPr[];
 	/** Set when the user "turns in" a finished Quest: it leaves the board but stays in history. */
 	acknowledgedAt?: number;
+	/** The Quest this one was chained from (fromQuest) — multi-step lineage. */
+	parentId?: string;
 }
 
 const TERMINAL: ReadonlySet<QuestState> = new Set(["completed", "failed", "cancelled"]);

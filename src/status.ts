@@ -116,7 +116,15 @@ export class StatusSurface {
 		}
 
 		// Snapshot for the render closure.
-		const snapshot = { active: [...active], pending: [...pending], done: [...done] };
+		// Resolve parent titles for any chained (fromQuest) Quests, for lineage display.
+		const lineage: Record<string, string> = {};
+		for (const q of [...active, ...done]) {
+			if (q.parentId) {
+				const p = quests.store.load(q.parentId);
+				if (p) lineage[q.id] = p.title;
+			}
+		}
+		const snapshot = { active: [...active], pending: [...pending], done: [...done], lineage };
 		this.ctx.ui.setWidget(WIDGET, (_tui, theme) => {
 			const fg = (c: string, t: string) => theme.fg(c, t);
 			const box = new Container();
@@ -125,6 +133,7 @@ export class StatusSurface {
 			for (const q of snapshot.active) {
 				const label = q.project ? fg("muted", `[${q.project}] `) : "";
 				box.addChild(new Text(`  ${fg(partyColor(q), "●")} ${label}${fg("toolTitle", q.title)}  ${memberGlyphs(q, theme)}`, 0, 0));
+				if (snapshot.lineage[q.id]) box.addChild(new Text(`      ${fg("muted", `↳ from ${snapshot.lineage[q.id]}`)}`, 0, 0));
 			}
 			for (const a of snapshot.pending) {
 				box.addChild(new Text(`  ${fg("warning", "⚑")} ${fg("dim", a.id)}  ${a.title}  ${fg("muted", "/approve")}`, 0, 0));
@@ -140,6 +149,7 @@ export class StatusSurface {
 				box.addChild(
 					new Text(`  ${fg(failed ? "error" : "success", failed ? "✗" : "✔")} ${label}${fg("toolTitle", q.title)}  ${fg("muted", hint)}`, 0, 0),
 				);
+				if (snapshot.lineage[q.id]) box.addChild(new Text(`      ${fg("muted", `↳ from ${snapshot.lineage[q.id]}`)}`, 0, 0));
 			}
 			return box;
 		}, { placement: "belowEditor" });
