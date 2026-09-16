@@ -15,10 +15,62 @@
  */
 
 import { execSync } from "node:child_process";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { ApprovalManager } from "../orchestration/approvals.ts";
 import { gateReviewCommand } from "./policy.ts";
+
+export type ReviewVerdict = "approve" | "request-changes" | "comment";
+
+/**
+ * Post a PR review via `gh pr review` (the envoy's action, run by the extension
+ * once the user has approved). Re-runs the policy gate as a final safety check:
+ * a suspected security fix stays blocked, and merge is never reachable here.
+ */
+export function postReview(opts: {
+	cwd: string;
+	number: string;
+	slug?: string;
+	verdict: ReviewVerdict;
+	body: string;
+	prText?: string;
+}): { url?: string; error?: string } {
+	const flag = opts.verdict === "approve" ? "--approve" : opts.verdict === "request-changes" ? "--request-changes" : "--comment";
+	const repoFlag = opts.slug ? ` --repo ${opts.slug}` : "";
+	const gate = gateReviewCommand(`gh pr review ${opts.number}${repoFlag} ${flag}`, { reviewMode: true, prText: opts.prText });
+	if (gate.blocked) return { error: gate.reason };
+	const tmp = path.join(os.tmpdir(), `gm-review-${Date.now()}.md`);
+	try {
+		fs.writeFileSync(tmp, opts.body, "utf-8");
+		execSync(`gh pr review ${opts.number}${repoFlag} ${flag} --body-file ${tmp}`, {
+			cwd: opts.cwd,
+			encoding: "utf-8",
+			timeout: 60_000,
+			stdio: ["ignore", "pipe", "pipe"],
+		});
+		let url: string | undefined;
+		try {
+			url =
+				execSync(`gh pr view ${opts.number}${repoFlag} --json reviews -q ".reviews[-1].url"`, {
+					cwd: opts.cwd,
+					encoding: "utf-8",
+					timeout: 20_000,
+					stdio: ["ignore", "pipe", "pipe"],
+				}).trim() || undefined;
+		} catch {
+			/* url is best-effort */
+		}
+		return { url };
+	} catch (err) {
+		const e = err as { stderr?: string; message?: string };
+		return { error: e.stderr || e.message || String(err) };
+	} finally {
+		fs.rmSync(tmp, { force: true });
+	}
+}
 
 export function createEnvoyShellTool(opts: {
 	cwd: string;

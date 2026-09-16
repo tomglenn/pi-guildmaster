@@ -36,6 +36,16 @@ export interface QuestIsolation {
 	repoRoot: string;
 }
 
+/** A PR review a review-Quest produced, awaiting or having completed its approved post. */
+export interface QuestReview {
+	number: string;
+	slug?: string;
+	repoName?: string;
+	verdict: "approve" | "request-changes" | "comment";
+	posted?: boolean;
+	url?: string;
+}
+
 /** Drafted (M8) or opened (M9) pull request for one repo. Guildmaster never merges. */
 export interface QuestPr {
 	repo: string;
@@ -66,6 +76,8 @@ export interface QuestRecord {
 	/** Write-Quest fields: one isolation + one drafted PR per writable repo (§ Projects P3). */
 	isolations?: QuestIsolation[];
 	prs?: QuestPr[];
+	/** Review-Quest: the review produced and its post status (approval-gated). */
+	review?: QuestReview;
 	/** Set when the user "turns in" a finished Quest: it leaves the board but stays in history. */
 	acknowledgedAt?: number;
 	/** The Quest this one was chained from (fromQuest) — multi-step lineage. */

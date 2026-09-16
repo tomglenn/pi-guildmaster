@@ -20,6 +20,7 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { effectiveConfig, loadConfig } from "./config.ts";
 import type { GuildmasterConfig } from "./config.ts";
+import { postReview, type ReviewVerdict } from "./execution/gh-tool.ts";
 import { commitAndDiff, createWorktree, inPlaceIsolation, isGitRepo, isWorkingTreeClean } from "./execution/isolation.ts";
 import type { ApprovalManager } from "./orchestration/approvals.ts";
 import { getApprovalManager, getQuestManager } from "./orchestration/manager.ts";
@@ -79,6 +80,15 @@ function draftPrFromReport(report: string): { title: string; body: string } {
 }
 
 /** Run a Quest to completion in the background. Errors are recorded as failed by the manager. */
+/** Read the party's intended verdict from the review text (defaults to a plain comment). */
+function parseVerdict(report: string): ReviewVerdict {
+	const m = report.match(/verdict[^\n]*?(request[\s-]*changes|approve|comment)/i);
+	const v = m?.[1]?.toLowerCase();
+	if (v?.startsWith("request")) return "request-changes";
+	if (v === "approve") return "approve";
+	return "comment";
+}
+
 /** Parse a PR target: a number, `owner/repo#number`, or a full GitHub PR URL. */
 function parsePrTarget(pr: string): { number: string; slug?: string } {
 	const url = pr.match(/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/i);
@@ -97,7 +107,7 @@ async function runQuestInBackground(
 		contexts: RepoContext[];
 		config: GuildmasterConfig;
 		instructions?: string;
-		review?: { prText?: string; approvals: ApprovalManager };
+		review?: { prText?: string; approvals: ApprovalManager; number: string; slug?: string; repoName?: string; label: string };
 	},
 ): Promise<void> {
 	const manager = getQuestManager();
@@ -145,6 +155,37 @@ async function runQuestInBackground(
 					});
 				}
 				record.prs = prs;
+			}
+
+			// Review-Quest finalize: pause for approval, then let the envoy post (or leave a draft).
+			if (opts.review && party.report?.trim()) {
+				const verdict = parseVerdict(party.report);
+				record.review = { number: opts.review.number, slug: opts.review.slug, repoName: opts.review.repoName, verdict };
+				record.report = party.report; // so the card / quest_status show the review while it awaits approval
+				record.state = "awaiting-approval";
+				manager.store.save(record);
+				const approved = await opts.review.approvals.request({
+					title: `Post ${verdict} review to ${opts.review.label}?`,
+					description: party.report.slice(0, 4000),
+					operation: `gh pr review --${verdict}`,
+					questId: record.id,
+				});
+				if (approved) {
+					const cwd = opts.contexts[0]?.path ?? process.cwd();
+					const res = postReview({ cwd, number: opts.review.number, slug: opts.review.slug, verdict, body: party.report, prText: opts.review.prText });
+					if (!res.error) {
+						record.review.posted = true;
+						record.review.url = res.url;
+					}
+					const note = res.error
+						? `\n\n---\n⚠\ufe0f Posting failed: ${res.error}. Left as a draft.`
+						: `\n\n---\n✅ Posted **${verdict}** review${res.url ? `: ${res.url}` : ""}.`;
+					return { report: `${party.report}${note}`, usage: party.usage };
+				}
+				return {
+					report: `${party.report}\n\n---\n🚪 Not posted — left as a draft. Ask me to post it when you're ready.`,
+					usage: party.usage,
+				};
 			}
 			return { report: party.report, usage: party.usage };
 		}, {});
@@ -318,12 +359,18 @@ export function registerQuestTool(pi: ExtensionAPI): void {
 					contexts = [{ name: "pr", path: scratch, writable: true }];
 				}
 				manager.store.save(record);
-				void runQuestInBackground(record, { write: false, contexts, config, instructions, review: { prText, approvals } });
+				void runQuestInBackground(record, {
+					write: false,
+					contexts,
+					config,
+					instructions,
+					review: { prText, approvals, number: target.number, slug: target.slug, repoName, label: prLabel },
+				});
 				return {
 					content: [
 						{
 							type: "text" as const,
-							text: `Started PR review Quest "${record.title}" (id ${record.id})${project ? ` for ${project.id}` : ""} on ${prLabel}. The party will fetch the PR, review it (correctness, security, adversarial), and Scribe will draft the review. Posting it back to GitHub needs your /approve — nothing is posted otherwise, and it never merges.`,
+							text: `Started PR review Quest "${record.title}" (id ${record.id})${project ? ` for ${project.id}` : ""} on ${prLabel}. The party fetches the PR, reviews it (correctness, security, adversarial), and Scribe drafts the review. When it's ready the Quest PAUSES for your approval: /approve to have the envoy post it, or leave it as a draft. Nothing is posted without your /approve, and it never merges.`,
 						},
 					],
 					details: { id: record.id, project: project?.id, pr: prLabel },

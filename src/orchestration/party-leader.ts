@@ -115,9 +115,9 @@ function buildSystemPrompt(basePrompt: string, available: Guildmate[], config: G
 		"  security, inquisitor to attack the conclusions. Use architect for large or structural changes.",
 		"- Then dispatch `scribe` to write the final human-facing review from their findings: a short summary,",
 		"  findings grouped by theme with file:line, and a verdict (comment / approve / request-changes).",
-		"- To POST it, dispatch `envoy` with the EXACT review text to run `gh pr review`. That needs the user's",
-		"  approval and may be blocked; if denied or blocked, leave the review as a draft and say so. NEVER merge.",
-		"- The final report IS the review Scribe wrote (note it if posting was denied/blocked).",
+		"- Do NOT post the review yourself. Your final report IS the review Scribe wrote. After you finish, a",
+		"  separate human-approved step posts it via the envoy (or leaves it as a draft). Never merge.",
+		"- End with an explicit verdict line, e.g. `Verdict: Request changes`, so the post step knows what to submit.",
 	];
 
 	const workflow = reviewMode
