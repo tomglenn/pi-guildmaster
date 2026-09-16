@@ -17,6 +17,7 @@ import { Type } from "typebox";
 import { type GuildmasterConfig, resolveModelSpec } from "../config.ts";
 import { collectUsage, lastAssistantText, runChildAgent, runSession } from "../execution/child-agent.ts";
 import { createEnvoyShellTool } from "../execution/gh-tool.ts";
+import { createRunnerShellTool } from "../execution/runner-shell.ts";
 import { findGuildmate, type Guildmate, loadPartyLeaderPrompt } from "../roster.ts";
 import type { QuestMember } from "../persistence/quest-store.ts";
 import type { RepoContext } from "../persistence/project-store.ts";
@@ -159,14 +160,23 @@ function buildSystemPrompt(basePrompt: string, available: Guildmate[], config: G
 		? reviewWorkflow
 		: write
 		? [
-				"- IMPLEMENTATION WORKFLOW: first understand the code (scout/delver) and get a plan (architect).",
-				"  Have inquisitor review the plan. THEN dispatch `smith` to implement it, and `runner` to build",
-				"  and test. Only dispatch smith after a plan exists; if smith reports the plan is wrong, stop and",
-				"  re-plan rather than improvising. Runner must not start non-terminating processes.",
+				"- IMPLEMENTATION WORKFLOW: understand the code (scout/delver), get a plan (architect), and have",
+				"  inquisitor attack the PLAN. THEN dispatch `smith` to implement and `runner` to build/test. Only",
+				"  dispatch smith after a plan exists; if smith says the plan is wrong, stop and re-plan rather than",
+				"  improvising. (Runner can only run bounded commands; watch modes/servers are refused by its shell.)",
+				"- REVIEW YOUR OWN DIFF BEFORE FINALIZING: once smith has implemented and runner's build/tests are",
+				"  green, you MUST dispatch `inquisitor` (and `warden` when the change touches security/auth/input",
+				"  handling) to review the ACTUAL CHANGES, not the plan. Give the reviewer the changed-file list and",
+				"  the brief's acceptance criteria; it reads those files (and may ask runner for `git diff`) and checks",
+				"  the implementation against EVERY requirement in the brief.",
+				"- HAND BACK ON MATERIAL ISSUES: if the reviewer finds a correctness bug, a security hole, a broken or",
+				"  missing test, or a brief requirement not met, dispatch `smith` to fix it and then re-review. Cap",
+				"  this at TWO review→fix rounds. Do NOT loop on nits or style — record minor items under Unresolved",
+				"  and move on. Finalize only when the review is clean or the two rounds are spent.",
 				"- The final report is a PULL REQUEST DESCRIPTION. First line: a concise PR title as an H1",
 				"  (`# ...`). Then sections: Summary, Changes (with file references), Testing (what runner ran and",
-				"  observed), and Risks / Unresolved (including anything inquisitor flagged). Do not claim tests",
-				"  passed unless runner actually reported it.",
+				"  observed), and Risks / Unresolved (including anything inquisitor/warden flagged). Do not claim",
+				"  tests passed unless runner actually reported it.",
 			]
 		: [
 				"- When you have enough, STOP dispatching and produce the FINAL REPORT: clean human-facing markdown",
@@ -245,8 +255,10 @@ export async function runParty(opts: {
 				members.push({ name: mate.name, task: params.task, model: modelSpec, status: "running", repo: context.name }) - 1;
 			opts.onProgress?.(members.slice());
 
-			// The envoy gets the gated GitHub shell (never raw bash) for review parties.
-			const envoyTools =
+			// Shell access is always a bounded/gated CUSTOM tool, never raw bash: the envoy gets the
+			// policy-gated GitHub shell for review parties; the runner (exec) gets the bounded shell
+			// that refuses non-terminating commands and reaps a silently hung one.
+			const shellTools =
 				mate.tier === "envoy" && opts.review
 					? [
 							createEnvoyShellTool({
@@ -257,16 +269,26 @@ export async function runParty(opts: {
 								questId: opts.review.questId,
 							}),
 						]
-					: undefined;
+					: mate.tier === "exec"
+						? [createRunnerShellTool({ cwd: context.path })]
+						: undefined;
+
+			// Requirement fidelity: write/exec members act on the code, so they must see the quest's
+			// authoritative constraints, not just the leader's paraphrase of one bounded task. The brief
+			// is appended so smith/runner satisfy EVERY requirement, not only the observable one.
+			const memberTask =
+				mate.tier === "write" || mate.tier === "exec"
+					? `${params.task}\n\n## Quest brief (authoritative requirements — satisfy ALL of these, not just the task above)\n${opts.brief}`
+					: params.task;
 
 			const res = await runChildAgent({
 				guildmate: mate,
-				task: params.task,
+				task: memberTask,
 				modelSpec,
 				cwd: context.path,
 				signal,
-				customTools: envoyTools,
-				extraTools: envoyTools ? ["shell"] : undefined,
+				customTools: shellTools,
+				extraTools: shellTools ? ["shell"] : undefined,
 			});
 
 			memberCost += res.usage.cost;
