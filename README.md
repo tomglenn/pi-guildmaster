@@ -206,9 +206,10 @@ Guildmaster is TypeScript, run directly by Pi (no build step for local dev).
 
 Before opening a PR:
 
-- **Type-check:** `tsc --noEmit -p tsconfig.json` (peer `@earendil-works/*` and
-  `@types/node` resolve at runtime under Pi; local unresolved-import errors from a
-  bare checkout are expected).
+- **Install dev deps once:** `npm install` (pulls the `@earendil-works/*` type
+  declarations + `typescript` so the typecheck is authoritative).
+- **Type-check:** `npm run typecheck`. This also runs in CI on every push and PR
+  (`.github/workflows/ci.yml`), so type errors can't reach `main`.
 - Keep changes focused and match the existing style (tabs, small modules,
   doc-commented files).
 - Commits use Conventional Commit prefixes (`feat:`, `fix:`, `docs:`…).

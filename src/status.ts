@@ -12,7 +12,7 @@
  * completed, failed) — live churn stays in the widget, never as toast spam.
  */
 
-import { type ExtensionAPI, type ExtensionContext, getMarkdownTheme } from "@earendil-works/pi-coding-agent";
+import { type ExtensionAPI, type ExtensionContext, getMarkdownTheme, type ThemeColor } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { getApprovalManager, getQuestManager } from "./orchestration/manager.ts";
 import type { QuestMemberStatus, QuestRecord } from "./persistence/quest-store.ts";
@@ -24,15 +24,15 @@ const MEMBER_GLYPH: Record<QuestMemberStatus, string> = { pending: "○", runnin
 /** Braille spinner frames for the animated "working" indicator on running rows. */
 const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 /** Per-status colour for a party member's glyph + name. */
-const MEMBER_COLOR: Record<QuestMemberStatus, string> = { pending: "muted", running: "accent", done: "success", failed: "error" };
+const MEMBER_COLOR: Record<QuestMemberStatus, ThemeColor> = { pending: "muted", running: "accent", done: "success", failed: "error" };
 
 /** Colour-coded member glyphs with a space between icon and name, e.g. "✓ scout". */
-function memberGlyphs(record: QuestRecord, theme: { fg: (c: string, t: string) => string }): string {
+function memberGlyphs(record: QuestRecord, theme: { fg: (c: ThemeColor, t: string) => string }): string {
 	return record.members.map((m) => theme.fg(MEMBER_COLOR[m.status], `${MEMBER_GLYPH[m.status]} ${m.name}`)).join("  ");
 }
 
 /** Overall party status colour: failed → awaiting-approval → all-done → in-flight. */
-function partyColor(record: QuestRecord): string {
+function partyColor(record: QuestRecord): ThemeColor {
 	if (record.members.some((m) => m.status === "failed")) return "error";
 	if (record.state === "awaiting-approval") return "warning";
 	if (record.members.length > 0 && record.members.every((m) => m.status === "done")) return "success";
@@ -154,7 +154,7 @@ export class StatusSurface {
 		}
 		const snapshot = { active: [...active], pending: [...pending], done: [...done], lineage };
 		this.ctx.ui.setWidget(WIDGET, (_tui, theme) => {
-			const fg = (c: string, t: string) => theme.fg(c, t);
+			const fg = (c: ThemeColor, t: string) => theme.fg(c, t);
 			const box = new Container();
 			box.addChild(new Spacer(1));
 			box.addChild(new Text(fg("toolTitle", theme.bold("◆ Guildmaster Quest Log")), 0, 0));
@@ -175,7 +175,7 @@ export class StatusSurface {
 			}
 			for (const q of snapshot.done) {
 				const label = q.project ? fg("muted", `[${q.project}] `) : "";
-				let color = "success";
+				let color: ThemeColor = "success";
 				let glyph = "✔";
 				let hint = "completed";
 				if (q.state === "failed") {
@@ -198,7 +198,7 @@ export class StatusSurface {
 }
 
 // Lightweight quest card renderer, kept here to avoid an import cycle.
-function renderQuestCard(record: QuestRecord, theme: { fg: (c: string, t: string) => string; bold: (t: string) => string }, expanded: boolean): Container {
+function renderQuestCard(record: QuestRecord, theme: { fg: (c: ThemeColor, t: string) => string; bold: (t: string) => string }, expanded: boolean): Container {
 	const fg = theme.fg.bind(theme);
 	const stateColor = record.state === "completed" ? "success" : record.state === "failed" ? "error" : "accent";
 	const c = new Container();

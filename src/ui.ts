@@ -9,7 +9,7 @@
  * commands. Party/Quest live-status widgets are added in later milestones.
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ThemeColor } from "@earendil-works/pi-coding-agent";
 import { Container, Text } from "@earendil-works/pi-tui";
 
 export const INFO_CARD_ENTRY = "guildmaster-info";
@@ -17,7 +17,7 @@ export const INFO_CARD_ENTRY = "guildmaster-info";
 /** A single line in a card. `color` names a theme foreground colour. */
 export interface CardLine {
 	text: string;
-	color?: string;
+	color?: ThemeColor;
 	bold?: boolean;
 	indent?: number;
 }

@@ -13,7 +13,7 @@
  * and the Quest path for write work arrive in later milestones.
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ThemeColor } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -42,7 +42,7 @@ function isFailed(r: ChildAgentResult): boolean {
 	return Boolean(r.error) || r.stopReason === "error" || r.stopReason === "aborted";
 }
 
-function formatToolCall(name: string, args: Record<string, unknown>, fg: (c: string, t: string) => string): string {
+function formatToolCall(name: string, args: Record<string, unknown>, fg: (c: ThemeColor, t: string) => string): string {
 	const path = (args.path as string) ?? "";
 	switch (name) {
 		case "grep":

@@ -49,7 +49,7 @@ export function registerProjects(pi: ExtensionAPI): void {
 		async execute() {
 			const all = new ProjectStore().list();
 			if (all.length === 0) {
-				return { content: [{ type: "text", text: "No projects registered yet." }], details: {} };
+				return { content: [{ type: "text", text: "No projects registered yet." }], details: { projects: all } };
 			}
 			const text = all
 				.map((p) => `- ${p.id}${p.aliases?.length ? ` (aka ${p.aliases.join(", ")})` : ""}: ${p.description ?? p.name}\n    repos: ${p.repos.map((r) => `${r.name} → ${r.path}`).join(", ")}`)

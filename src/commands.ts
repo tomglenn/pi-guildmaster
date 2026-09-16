@@ -10,7 +10,7 @@
  */
 
 import type { AutocompleteItem } from "@earendil-works/pi-tui";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ThemeColor } from "@earendil-works/pi-coding-agent";
 import { type GuildmasterConfig, loadConfig, resolveModelSpec } from "./config.ts";
 import { runChildAgent } from "./execution/child-agent.ts";
 import { getQuestManager } from "./orchestration/manager.ts";
@@ -19,7 +19,7 @@ import { guildmasterHome } from "./paths.ts";
 import { findGuildmate, type Guildmate, loadRoster } from "./roster.ts";
 import { type CardLine, showCard } from "./ui.ts";
 
-const TIER_COLOR: Record<string, string> = {
+const TIER_COLOR: Record<string, ThemeColor> = {
 	"read-only": "success",
 	write: "warning",
 	exec: "error",
@@ -192,7 +192,7 @@ export function registerCommands(pi: ExtensionAPI): void {
 					lines: [
 						{ text: `${result.model ?? mate.model ?? "?"} · ${result.usage.turns} turns · $${result.usage.cost.toFixed(4)}`, color: "dim" },
 						{ text: "", color: "muted" },
-						...body.map((line) => ({ text: line, color: result.error ? "error" : undefined })),
+						...body.map((line) => ({ text: line, color: result.error ? ("error" as ThemeColor) : undefined })),
 					],
 				});
 			} finally {

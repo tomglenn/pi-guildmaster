@@ -94,7 +94,7 @@ export function createEnvoyShellTool(opts: {
 			if (gate.blocked) {
 				return {
 					content: [{ type: "text", text: `BLOCKED (${gate.operation}): ${gate.reason}. Command not run.` }],
-					details: { blocked: true, operation: gate.operation },
+					details: {},
 				};
 			}
 			if (gate.needsApproval) {
@@ -107,7 +107,7 @@ export function createEnvoyShellTool(opts: {
 				if (!approved) {
 					return {
 						content: [{ type: "text", text: `DENIED by user: ${gate.operation}. Left as a draft; not posted.` }],
-						details: { denied: true, operation: gate.operation },
+						details: {},
 					};
 				}
 			}
@@ -121,7 +121,7 @@ export function createEnvoyShellTool(opts: {
 				return { content: [{ type: "text", text: out.slice(0, 20_000) || "(no output)" }], details: {} };
 			} catch (err) {
 				const e = err as { stderr?: string; message?: string };
-				return { content: [{ type: "text", text: `Command failed: ${e.stderr || e.message || String(err)}` }], details: { failed: true } };
+				return { content: [{ type: "text", text: `Command failed: ${e.stderr || e.message || String(err)}` }], details: {} };
 			}
 		},
 	});
