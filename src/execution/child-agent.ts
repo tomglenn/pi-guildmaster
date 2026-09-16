@@ -271,6 +271,10 @@ export interface RunChildOptions {
 	maxTurns?: number;
 	graceTurns?: number;
 	hardTimeoutMs?: number;
+	/** Extra custom tools (e.g. the envoy's gated shell). */
+	customTools?: ToolDefinition[];
+	/** Extra tool NAMES to allow alongside the tier's built-ins (the custom tools' names). */
+	extraTools?: string[];
 }
 
 /** Run a single Guildmate (tier-derived tools + system prompt) and shape a result. */
@@ -293,7 +297,8 @@ export async function runChildAgent(options: RunChildOptions): Promise<ChildAgen
 		cwd,
 		systemPrompt: guildmate.systemPrompt,
 		modelSpec,
-		tools: toolsForTier(guildmate.tier),
+		tools: [...toolsForTier(guildmate.tier), ...(options.extraTools ?? [])],
+		customTools: options.customTools,
 		promptText: `Task: ${task}`,
 		maxTurns: options.maxTurns,
 		graceTurns: options.graceTurns,

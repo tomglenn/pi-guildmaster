@@ -12,6 +12,7 @@
  * so context is only spent when the user actually wants the detail.
  */
 
+import { execSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -20,12 +21,13 @@ import { Type } from "typebox";
 import { effectiveConfig, loadConfig } from "./config.ts";
 import type { GuildmasterConfig } from "./config.ts";
 import { commitAndDiff, createWorktree, inPlaceIsolation, isGitRepo, isWorkingTreeClean } from "./execution/isolation.ts";
-import { getQuestManager } from "./orchestration/manager.ts";
+import type { ApprovalManager } from "./orchestration/approvals.ts";
+import { getApprovalManager, getQuestManager } from "./orchestration/manager.ts";
 import { runParty } from "./orchestration/party-leader.ts";
 import { readonlyContexts, resolveProjectQuery } from "./orchestration/resolve.ts";
 import { ProjectStore, type RepoContext } from "./persistence/project-store.ts";
 import type { QuestRecord } from "./persistence/quest-store.ts";
-import { questsDir } from "./paths.ts";
+import { guildmasterHome, questsDir } from "./paths.ts";
 import { loadRoster } from "./roster.ts";
 
 function started(record: QuestRecord, projectId?: string, targetRepo?: string, write = false, inPlace = false) {
@@ -77,9 +79,26 @@ function draftPrFromReport(report: string): { title: string; body: string } {
 }
 
 /** Run a Quest to completion in the background. Errors are recorded as failed by the manager. */
+/** Parse a PR target: a number, `owner/repo#number`, or a full GitHub PR URL. */
+function parsePrTarget(pr: string): { number: string; slug?: string } {
+	const url = pr.match(/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/i);
+	if (url) return { slug: url[1], number: url[2] };
+	const slugHash = pr.match(/^([^/\s]+\/[^/\s#]+)#(\d+)$/);
+	if (slugHash) return { slug: slugHash[1], number: slugHash[2] };
+	const num = pr.match(/^#?(\d+)$/);
+	return { number: num ? num[1] : pr };
+}
+
 async function runQuestInBackground(
 	record: QuestRecord,
-	opts: { write: boolean; inPlace?: boolean; contexts: RepoContext[]; config: GuildmasterConfig; instructions?: string },
+	opts: {
+		write: boolean;
+		inPlace?: boolean;
+		contexts: RepoContext[];
+		config: GuildmasterConfig;
+		instructions?: string;
+		review?: { prText?: string; approvals: ApprovalManager };
+	},
 ): Promise<void> {
 	const manager = getQuestManager();
 	const roster = loadRoster();
@@ -93,6 +112,7 @@ async function runQuestInBackground(
 				signal: api.signal,
 				write: opts.write,
 				instructions: opts.instructions,
+				review: opts.review ? { prText: opts.review.prText, approvals: opts.review.approvals, questId: record.id } : undefined,
 				onProgress: (members) => api.setMembers(members),
 			});
 			if (!party.report?.trim() && party.error) throw new Error(party.error);
@@ -195,12 +215,21 @@ export function registerQuestTool(pi: ExtensionAPI): void {
 						"into the brief as an upstream artifact, and records lineage. Use for multi-step flows like review → fix.",
 				}),
 			),
+			pr: Type.Optional(
+				Type.String({
+					description:
+						"Review a pull request: a PR number, `owner/repo#number`, or a full GitHub PR URL. Runs a review " +
+						"party (envoy fetches → specialists review → Scribe writes it up → posting needs your /approve). Pass " +
+						"`project`/`repo` when the PR's repo is registered so it can be checked out locally.",
+				}),
+			),
 		}),
 
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const manager = getQuestManager();
 			const write = params.write ?? false;
 			const inPlace = (params.inPlace ?? false) && write;
+			const reviewMode = Boolean(params.pr);
 
 			// Resolve the named project (if any). cwd is only a fallback.
 			const projectStore = new ProjectStore();
@@ -221,6 +250,85 @@ export function registerQuestTool(pi: ExtensionAPI): void {
 
 			let contexts: RepoContext[];
 			let baseCwd: string;
+
+			if (reviewMode) {
+				const approvals = getApprovalManager();
+				const target = parsePrTarget(params.pr as string);
+
+				// A local checkout to review in, when the PR's repo is registered.
+				let repoPath: string | undefined;
+				let repoName: string | undefined;
+				if (project) {
+					const r = params.repo
+						? project.repos.find((x) => x.name === params.repo)
+						: project.repos.length === 1
+							? project.repos[0]
+							: undefined;
+					if (params.repo && !r) throw new Error(`Project "${project.id}" has no repo "${params.repo}".`);
+					if (r) {
+						repoPath = r.path;
+						repoName = r.name;
+					}
+				}
+
+				// Best-effort: fetch PR title/body up front for the security gate (and to confirm it exists).
+				let prText: string | undefined;
+				try {
+					const repoFlag = target.slug ? ` --repo ${target.slug}` : "";
+					const out = execSync(`gh pr view ${target.number}${repoFlag} --json title,body`, {
+						cwd: repoPath ?? process.cwd(),
+						encoding: "utf-8",
+						timeout: 20_000,
+						stdio: ["ignore", "pipe", "pipe"],
+					});
+					const j = JSON.parse(out) as { title?: string; body?: string };
+					prText = [j.title, j.body].filter(Boolean).join("\n\n") || undefined;
+				} catch {
+					/* envoy will fetch; if that also fails the party reports FAILED and the Quest fails honestly */
+				}
+
+				const prLabel = target.slug ? `${target.slug}#${target.number}` : `#${target.number}`;
+				const reviewBrief = [
+					`Review pull request ${prLabel}.`,
+					target.slug ? `Repo: ${target.slug}.` : "",
+					repoPath
+						? `A git worktree of the repo is your cwd; have the envoy run \`gh pr checkout ${target.number}\` to get the code, plus \`gh pr diff ${target.number}\`.`
+						: `No local checkout; have the envoy run \`gh pr diff ${target.number}${target.slug ? ` --repo ${target.slug}` : ""}\` and \`gh pr view\` to gather the PR.`,
+					"",
+					params.brief,
+				]
+					.filter(Boolean)
+					.join("\n");
+
+				const record = manager.create({
+					cwd: repoPath ?? process.cwd(),
+					title: params.title,
+					brief: parent ? briefWithUpstream(reviewBrief, parent) : reviewBrief,
+					project: project?.id,
+				});
+				if (parent) record.parentId = parent.id;
+
+				if (repoPath && isGitRepo(repoPath)) {
+					const iso = createWorktree(repoPath, record.id, params.title, repoName);
+					record.isolations = [iso];
+					contexts = [{ name: iso.repo, path: iso.worktreePath, writable: true }];
+				} else {
+					const scratch = path.join(guildmasterHome(), "review", record.id);
+					fs.mkdirSync(scratch, { recursive: true });
+					contexts = [{ name: "pr", path: scratch, writable: true }];
+				}
+				manager.store.save(record);
+				void runQuestInBackground(record, { write: false, contexts, config, instructions, review: { prText, approvals } });
+				return {
+					content: [
+						{
+							type: "text" as const,
+							text: `Started PR review Quest "${record.title}" (id ${record.id})${project ? ` for ${project.id}` : ""} on ${prLabel}. The party will fetch the PR, review it (correctness, security, adversarial), and Scribe will draft the review. Posting it back to GitHub needs your /approve — nothing is posted otherwise, and it never merges.`,
+						},
+					],
+					details: { id: record.id, project: project?.id, pr: prLabel },
+				};
+			}
 
 			if (write) {
 				// A write Quest targets one OR MORE repos (each worktree writable); any other

@@ -16,9 +16,11 @@ import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent
 import { Type } from "typebox";
 import { type GuildmasterConfig, resolveModelSpec } from "../config.ts";
 import { collectUsage, lastAssistantText, runChildAgent, runSession } from "../execution/child-agent.ts";
+import { createEnvoyShellTool } from "../execution/gh-tool.ts";
 import { findGuildmate, type Guildmate, loadPartyLeaderPrompt } from "../roster.ts";
 import type { QuestMember } from "../persistence/quest-store.ts";
 import type { RepoContext } from "../persistence/project-store.ts";
+import type { ApprovalManager } from "./approvals.ts";
 
 const READONLY_MAX_TURNS = 6;
 const READONLY_HARD_TIMEOUT_MS = 120_000;
@@ -31,6 +33,8 @@ const LEADER_HARD_TIMEOUT_MS = 420_000;
 
 const DISPATCHABLE_READONLY: ReadonlySet<string> = new Set(["read-only"]);
 const DISPATCHABLE_WRITE: ReadonlySet<string> = new Set(["read-only", "write", "exec"]);
+// Review: read-only specialists judge, scribe (write) composes, envoy talks to GitHub.
+const DISPATCHABLE_REVIEW: ReadonlySet<string> = new Set(["read-only", "write", "envoy"]);
 
 export interface PartyResult {
 	report: string;
@@ -73,7 +77,7 @@ function buildRepoBlock(contexts: RepoContext[]): string[] {
 	];
 }
 
-function buildSystemPrompt(basePrompt: string, available: Guildmate[], config: GuildmasterConfig, write: boolean, contexts: RepoContext[], instructions?: string): string {
+function buildSystemPrompt(basePrompt: string, available: Guildmate[], config: GuildmasterConfig, write: boolean, contexts: RepoContext[], instructions?: string, reviewMode = false): string {
 	const roster = available
 		.map((m) => `- ${m.name} [${m.tier}] (model: ${resolveModelSpec(config, m.model) ?? "default"}): ${m.tagline ?? m.description}`)
 		.join("\n");
@@ -85,10 +89,12 @@ function buildSystemPrompt(basePrompt: string, available: Guildmate[], config: G
 		...buildRepoBlock(contexts),
 		basePrompt,
 		"",
-		`## Available Guildmates${write ? "" : " (read-only specialists)"}`,
-		write
-			? "You are running in an ISOLATED git worktree on a dedicated branch. Writes by `smith` and commands by `runner` happen ONLY in this worktree and never touch the user's checkout. Dispatch via the `dispatch` tool; you have NO tools of your own."
-			: "Dispatch these via the `dispatch` tool. You have NO file tools yourself — you MUST delegate all investigation.",
+		`## Available Guildmates${reviewMode ? " (PR review)" : write ? "" : " (read-only specialists)"}`,
+		reviewMode
+			? "Dispatch via the `dispatch` tool; you have NO tools of your own. `envoy` is the party's ONLY contact with GitHub (a gated shell): it fetches the PR and, with the user's approval, posts the review. All other members work read-only on the fetched PR."
+			: write
+				? "You are running in an ISOLATED git worktree on a dedicated branch. Writes by `smith` and commands by `runner` happen ONLY in this worktree and never touch the user's checkout. Dispatch via the `dispatch` tool; you have NO tools of your own."
+				: "Dispatch these via the `dispatch` tool. You have NO file tools yourself — you MUST delegate all investigation.",
 		"",
 		roster,
 		"",
@@ -101,7 +107,22 @@ function buildSystemPrompt(basePrompt: string, available: Guildmate[], config: G
 		"  model family by design: take its objections seriously and resolve them before finalizing.",
 	];
 
-	const workflow = write
+	const reviewWorkflow = [
+		"- PR REVIEW WORKFLOW: first dispatch `envoy` to ACQUIRE the PR (it runs `gh pr view` / `gh pr diff`,",
+		"  and `gh pr checkout <n>` when a repo worktree is the cwd). If the envoy cannot acquire the PR,",
+		"  do not fabricate a review — emit the FAILED signal (see finalize).",
+		"- Dispatch reviewers in PARALLEL against the acquired PR: scout/delver for correctness, warden for",
+		"  security, inquisitor to attack the conclusions. Use architect for large or structural changes.",
+		"- Then dispatch `scribe` to write the final human-facing review from their findings: a short summary,",
+		"  findings grouped by theme with file:line, and a verdict (comment / approve / request-changes).",
+		"- To POST it, dispatch `envoy` with the EXACT review text to run `gh pr review`. That needs the user's",
+		"  approval and may be blocked; if denied or blocked, leave the review as a draft and say so. NEVER merge.",
+		"- The final report IS the review Scribe wrote (note it if posting was denied/blocked).",
+	];
+
+	const workflow = reviewMode
+		? reviewWorkflow
+		: write
 		? [
 				"- IMPLEMENTATION WORKFLOW: first understand the code (scout/delver) and get a plan (architect).",
 				"  Have inquisitor review the plan. THEN dispatch `smith` to implement it, and `runner` to build",
@@ -121,6 +142,9 @@ function buildSystemPrompt(basePrompt: string, available: Guildmate[], config: G
 		"- Produce the final report as your last message, wrapped EXACTLY between the markers",
 		"  `<<<REPORT>>>` and `<<<END>>>`, with nothing after `<<<END>>>`. Any thinking/preamble must come",
 		"  BEFORE `<<<REPORT>>>`. Note any point Inquisitor left unresolved.",
+		"- HONEST FAILURE: if you could not actually complete the task (e.g. the PR could not be acquired),",
+		"  do NOT write a normal report. Instead make the content between the markers begin with `FAILED:`",
+		"  followed by the reason. This records the Quest as failed rather than a false success.",
 	];
 
 	return [...common, ...workflow, ...finalize].join("\n");
@@ -138,10 +162,13 @@ export async function runParty(opts: {
 	write?: boolean;
 	/** Standing project context to fold into the Party Leader's prompt. */
 	instructions?: string;
+	/** When set, this is a PR-review party: envoy becomes dispatchable with a gated shell. */
+	review?: { prText?: string; approvals: ApprovalManager; questId?: string };
 }): Promise<PartyResult> {
 	const write = opts.write ?? false;
+	const reviewMode = Boolean(opts.review);
 	const contexts = opts.contexts;
-	const dispatchable = write ? DISPATCHABLE_WRITE : DISPATCHABLE_READONLY;
+	const dispatchable = reviewMode ? DISPATCHABLE_REVIEW : write ? DISPATCHABLE_WRITE : DISPATCHABLE_READONLY;
 	const available = opts.roster.filter((m) => dispatchable.has(m.tier));
 	const members: QuestMember[] = [];
 	let memberCost = 0;
@@ -183,6 +210,20 @@ export async function runParty(opts: {
 				members.push({ name: mate.name, task: params.task, model: modelSpec, status: "running", repo: context.name }) - 1;
 			opts.onProgress?.(members.slice());
 
+			// The envoy gets the gated GitHub shell (never raw bash) for review parties.
+			const envoyTools =
+				mate.tier === "envoy" && opts.review
+					? [
+							createEnvoyShellTool({
+								cwd: context.path,
+								reviewMode: true,
+								prText: opts.review.prText,
+								approvals: opts.review.approvals,
+								questId: opts.review.questId,
+							}),
+						]
+					: undefined;
+
 			const res = await runChildAgent({
 				guildmate: mate,
 				task: params.task,
@@ -191,6 +232,8 @@ export async function runParty(opts: {
 				signal,
 				maxTurns: readOnly ? READONLY_MAX_TURNS : WORK_MAX_TURNS,
 				hardTimeoutMs: readOnly ? READONLY_HARD_TIMEOUT_MS : WORK_HARD_TIMEOUT_MS,
+				customTools: envoyTools,
+				extraTools: envoyTools ? ["shell"] : undefined,
 			});
 
 			memberCost += res.usage.cost;
@@ -212,7 +255,7 @@ export async function runParty(opts: {
 	const run = await runSession({
 		// The leader has no file tools; it just needs a valid cwd for session setup.
 		cwd: contexts[0]?.path ?? process.cwd(),
-		systemPrompt: buildSystemPrompt(loadPartyLeaderPrompt() ?? DEFAULT_LEADER_PROMPT, available, opts.config, write, contexts, opts.instructions),
+		systemPrompt: buildSystemPrompt(loadPartyLeaderPrompt() ?? DEFAULT_LEADER_PROMPT, available, opts.config, write, contexts, opts.instructions, reviewMode),
 		modelSpec: resolveModelSpec(opts.config, opts.config.partyLeaderModel),
 		tools: ["dispatch"],
 		customTools: [dispatch],
@@ -223,9 +266,12 @@ export async function runParty(opts: {
 		signal: opts.signal,
 	});
 
-	const report = extractReport(lastAssistantText(run.messages));
+	const rawReport = extractReport(lastAssistantText(run.messages));
 	const leaderUsage = collectUsage(run.messages);
-	const error = run.error ?? (report.trim() ? undefined : "Party produced no report.");
+	// Honest failure: a leader that could not complete emits `FAILED: <reason>` instead of a report.
+	const failedSignal = /^FAILED:/i.test(rawReport.trim());
+	const report = failedSignal ? "" : rawReport;
+	const error = run.error ?? (failedSignal ? rawReport.trim().replace(/^FAILED:\s*/i, "") : report.trim() ? undefined : "Party produced no report.");
 
 	return {
 		report,
