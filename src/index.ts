@@ -74,6 +74,7 @@ export default function guildmaster(pi: ExtensionAPI): void {
 		const manager = getQuestManager();
 		for (const quest of manager.getActive()) manager.cancel(quest.id);
 		getApprovalManager().denyAll();
+		status.stopAnimation();
 	});
 
 	pi.on("session_start", async (event, ctx) => {

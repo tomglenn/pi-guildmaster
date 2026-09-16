@@ -21,6 +21,8 @@ const WIDGET = "guildmaster-board";
 const QUEST_CARD = "guildmaster-quest";
 
 const MEMBER_GLYPH: Record<QuestMemberStatus, string> = { pending: "○", running: "●", done: "✓", failed: "✗" };
+/** Braille spinner frames for the animated "working" indicator on running rows. */
+const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 /** Per-status colour for a party member's glyph + name. */
 const MEMBER_COLOR: Record<QuestMemberStatus, string> = { pending: "muted", running: "accent", done: "success", failed: "error" };
 
@@ -43,6 +45,8 @@ export class StatusSurface {
 	private readonly questStates = new Map<string, string>();
 	private knownApprovals = new Set<string>();
 	private initialized = false;
+	private spinnerFrame = 0;
+	private spinnerTimer?: ReturnType<typeof setInterval>;
 
 	/** Wire subscriptions once. The quest card renderer is registered here too. */
 	init(pi: ExtensionAPI): void {
@@ -100,6 +104,24 @@ export class StatusSurface {
 		this.pi?.appendEntry(QUEST_CARD, record);
 	}
 
+	/** Stop the animation timer (e.g. on session shutdown) so no interval leaks. */
+	stopAnimation(): void {
+		this.ensureSpinner(false);
+	}
+
+	/** Start/stop the animation timer so the spinner only ticks while a Quest is running. */
+	private ensureSpinner(working: boolean): void {
+		if (working && !this.spinnerTimer) {
+			this.spinnerTimer = setInterval(() => {
+				this.spinnerFrame = (this.spinnerFrame + 1) % SPINNER.length;
+				this.repaint();
+			}, 120);
+		} else if (!working && this.spinnerTimer) {
+			clearInterval(this.spinnerTimer);
+			this.spinnerTimer = undefined;
+		}
+	}
+
 	/** Recompute and repaint the board + footer. Safe to call anytime. */
 	repaint(): void {
 		if (!this.ctx) return;
@@ -113,9 +135,13 @@ export class StatusSurface {
 			.filter((q) => (q.state === "completed" || q.state === "failed" || q.state === "cancelled") && !q.acknowledgedAt);
 
 		if (active.length === 0 && pending.length === 0 && done.length === 0) {
+			this.ensureSpinner(false);
 			this.ctx.ui.setWidget(WIDGET, undefined);
 			return;
 		}
+
+		// Drive the animated working indicator only while something is actively running.
+		this.ensureSpinner(active.some((q) => q.state === "running"));
 
 		// Snapshot for the render closure.
 		// Resolve parent titles for any chained (fromQuest) Quests, for lineage display.
@@ -132,9 +158,16 @@ export class StatusSurface {
 			const box = new Container();
 			box.addChild(new Spacer(1));
 			box.addChild(new Text(fg("toolTitle", theme.bold("◆ Guildmaster Quest Log")), 0, 0));
+			const frame = SPINNER[this.spinnerFrame % SPINNER.length];
 			for (const q of snapshot.active) {
 				const label = q.project ? fg("muted", `[${q.project}] `) : "";
-				box.addChild(new Text(`  ${fg(partyColor(q), "●")} ${label}${fg("toolTitle", q.title)}  ${memberGlyphs(q, theme)}`, 0, 0));
+				const end =
+					q.state === "running"
+						? `  ${fg("accent", frame)}`
+						: q.state === "awaiting-approval"
+							? `  ${fg("warning", "⏸ awaiting approval")}`
+							: "";
+				box.addChild(new Text(`  ${fg(partyColor(q), "●")} ${label}${fg("toolTitle", q.title)}  ${memberGlyphs(q, theme)}${end}`, 0, 0));
 				if (snapshot.lineage[q.id]) box.addChild(new Text(`      ${fg("muted", `↳ from ${snapshot.lineage[q.id]}`)}`, 0, 0));
 			}
 			for (const a of snapshot.pending) {
