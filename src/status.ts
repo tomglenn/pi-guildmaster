@@ -131,7 +131,7 @@ export class StatusSurface {
 			const fg = (c: string, t: string) => theme.fg(c, t);
 			const box = new Container();
 			box.addChild(new Spacer(1));
-			box.addChild(new Text(fg("toolTitle", theme.bold("◆ Guild")), 0, 0));
+			box.addChild(new Text(fg("toolTitle", theme.bold("◆ Guildmaster Quest Log")), 0, 0));
 			for (const q of snapshot.active) {
 				const label = q.project ? fg("muted", `[${q.project}] `) : "";
 				box.addChild(new Text(`  ${fg(partyColor(q), "●")} ${label}${fg("toolTitle", q.title)}  ${memberGlyphs(q, theme)}`, 0, 0));
