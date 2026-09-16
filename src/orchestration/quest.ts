@@ -96,17 +96,19 @@ export class QuestManager {
 	 * isolations + branches, deletes the record and its diff artifacts, and emits a
 	 * change so the Guild board repaints. In-place branches are left untouched.
 	 */
-	dismiss(id: string): { record?: QuestRecord; cancelledRunning: boolean; tornDown: boolean } {
+	dismiss(id: string): { record?: QuestRecord; cancelledRunning: boolean; tornDown: boolean; inPlaceKept: boolean } {
 		const record = this.store.load(id);
 		if (this.active.has(id)) {
 			this.cancel(id);
-			return { record, cancelledRunning: true, tornDown: false };
+			return { record, cancelledRunning: true, tornDown: false, inPlaceKept: false };
 		}
-		if (!record) return { cancelledRunning: false, tornDown: false };
+		if (!record) return { cancelledRunning: false, tornDown: false, inPlaceKept: false };
 		let tornDown = false;
+		let inPlaceKept = false;
 		for (const iso of record.isolations ?? []) {
 			discardIsolation(iso);
 			if (iso.worktreePath !== iso.repoRoot) tornDown = true;
+			else inPlaceKept = true;
 		}
 		// Best-effort: remove any saved diff artifacts for this quest.
 		try {
@@ -119,7 +121,7 @@ export class QuestManager {
 		this.store.delete(id);
 		record.state = "cancelled";
 		this.emit(record); // listeners recompute from store (now empty of this id) and repaint
-		return { record, cancelledRunning: false, tornDown };
+		return { record, cancelledRunning: false, tornDown, inPlaceKept };
 	}
 
 	/**

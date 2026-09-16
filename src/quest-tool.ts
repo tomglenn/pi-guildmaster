@@ -502,12 +502,13 @@ export function registerQuestTool(pi: ExtensionAPI): void {
 		}),
 		async execute(_toolCallId, params) {
 			const manager = getQuestManager();
-			const { record, cancelledRunning, tornDown } = manager.dismiss(params.questId);
+			const { record, cancelledRunning, tornDown, inPlaceKept } = manager.dismiss(params.questId);
 			if (!record) throw new Error(`No Quest with id ${params.questId}.`);
 			const title = `"${record.title}"`;
+			const branchNote = tornDown ? "worktree + branch torn down, " : inPlaceKept ? "in-place branch left intact, " : "";
 			const text = cancelledRunning
 				? `Quest ${title} was still running — sent it a cancel. It will settle to "cancelled" shortly; dismiss again afterwards to remove its record and worktree.`
-				: `Dismissed Quest ${title} — ${tornDown ? "worktree + branch torn down" : "in-place branch left intact"}, record and diff removed, and cleared from the Guild board.`;
+				: `Dismissed Quest ${title} — ${branchNote}record and diff removed, and cleared from the Guild board.`;
 			return { content: [{ type: "text", text }], details: { id: params.questId, cancelledRunning, tornDown } };
 		},
 	});

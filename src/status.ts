@@ -107,8 +107,10 @@ export class StatusSurface {
 		const active = quests.getActive();
 		const pending = getApprovalManager().list();
 		// Finished Quests persist on the board until the user turns them in (§ turn-in),
-		// so a completion is never missed while multitasking with a scrolling transcript.
-		const done = quests.store.list().filter((q) => (q.state === "completed" || q.state === "failed") && !q.acknowledgedAt);
+		// so a completion (or a cancellation from a reload) is never missed while multitasking.
+		const done = quests.store
+			.list()
+			.filter((q) => (q.state === "completed" || q.state === "failed" || q.state === "cancelled") && !q.acknowledgedAt);
 
 		if (active.length === 0 && pending.length === 0 && done.length === 0) {
 			this.ctx.ui.setWidget(WIDGET, undefined);
@@ -139,16 +141,22 @@ export class StatusSurface {
 				box.addChild(new Text(`  ${fg("warning", "⚑")} ${fg("dim", a.id)}  ${a.title}  ${fg("muted", "/approve")}`, 0, 0));
 			}
 			for (const q of snapshot.done) {
-				const failed = q.state === "failed";
 				const label = q.project ? fg("muted", `[${q.project}] `) : "";
-				const hint = q.prs?.some((p) => !p.url)
-					? "draft PR ready → raise_pr"
-					: failed
-						? "failed — turn in to clear"
-						: "done — turn in to clear";
-				box.addChild(
-					new Text(`  ${fg(failed ? "error" : "success", failed ? "✗" : "✔")} ${label}${fg("toolTitle", q.title)}  ${fg("muted", hint)}`, 0, 0),
-				);
+				let color = "success";
+				let glyph = "✔";
+				let hint = "completed";
+				if (q.state === "failed") {
+					color = "error";
+					glyph = "✗";
+					hint = "failed";
+				} else if (q.state === "cancelled") {
+					color = "muted";
+					glyph = "⊘";
+					hint = "cancelled";
+				}
+				if (q.prs?.some((p) => !p.url)) hint = "draft PR ready → raise_pr";
+				const titleColor = q.state === "cancelled" ? "muted" : "toolTitle";
+				box.addChild(new Text(`  ${fg(color, glyph)} ${label}${fg(titleColor, q.title)}  ${fg("muted", hint)}`, 0, 0));
 				if (snapshot.lineage[q.id]) box.addChild(new Text(`      ${fg("muted", `↳ from ${snapshot.lineage[q.id]}`)}`, 0, 0));
 			}
 			return box;
