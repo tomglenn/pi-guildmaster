@@ -12,8 +12,8 @@
  * completed, failed) — live churn stays in the widget, never as toast spam.
  */
 
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Container, Spacer, Text } from "@earendil-works/pi-tui";
+import { type ExtensionAPI, type ExtensionContext, getMarkdownTheme } from "@earendil-works/pi-coding-agent";
+import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { getApprovalManager, getQuestManager } from "./orchestration/manager.ts";
 import type { QuestMemberStatus, QuestRecord } from "./persistence/quest-store.ts";
 
@@ -172,9 +172,12 @@ function renderQuestCard(record: QuestRecord, theme: { fg: (c: string, t: string
 	}
 	if (record.error) c.addChild(new Text(fg("error", `error: ${record.error}`), 0, 0));
 	if (record.report) {
-		const lines = expanded ? record.report.trim().split("\n") : record.report.trim().split("\n").slice(0, 12);
-		for (const line of lines) c.addChild(new Text(line, 0, 0));
-		if (!expanded && record.report.trim().split("\n").length > 12) c.addChild(new Text(fg("muted", "(Ctrl+O to expand)"), 0, 0));
+		// Render the report as formatted markdown (headings, code, lists) rather than raw text.
+		const full = record.report.trim();
+		const allLines = full.split("\n");
+		const shown = expanded ? full : allLines.slice(0, 20).join("\n");
+		c.addChild(new Markdown(shown, 0, 0, getMarkdownTheme()));
+		if (!expanded && allLines.length > 20) c.addChild(new Text(fg("muted", "(Ctrl+O to expand)"), 0, 0));
 	}
 	return c;
 }
