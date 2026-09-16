@@ -322,4 +322,33 @@ export function registerQuestTool(pi: ExtensionAPI): void {
 			return { content: [{ type: "text", text }], details: { id: params.questId, cancelledRunning, tornDown } };
 		},
 	});
+
+	pi.registerTool({
+		name: "quest_turn_in",
+		label: "Quest Turn In",
+		description: [
+			"Turn in (acknowledge) a finished Quest so it leaves the Guild board while staying in history.",
+			"Completed and failed Quests persist on the board until turned in, so a completion is never missed",
+			"while multitasking. Non-destructive: keeps the record, report, branch and any draft PR. Use",
+			"quest_dismiss instead to fully stand a Quest down and delete it.",
+		].join(" "),
+		promptSnippet: "Turn in (acknowledge) a finished Quest so it leaves the board but stays in history",
+		promptGuidelines: [
+			"Completed and failed Quests stay on the Guild board until turned in. Use quest_turn_in when the user has seen a finished Quest and wants it cleared from the board without deleting it (report/branch/PR are kept). Use quest_dismiss only to fully delete + tear down.",
+		],
+		parameters: Type.Object({
+			questId: Type.String({ description: "Id of the finished Quest to turn in." }),
+		}),
+		async execute(_toolCallId, params) {
+			const manager = getQuestManager();
+			const rec = manager.acknowledge(params.questId);
+			if (!rec) throw new Error(`No Quest with id ${params.questId}.`);
+			if (!rec.acknowledgedAt)
+				throw new Error(`Quest "${rec.title}" is ${rec.state}, not finished yet — only completed/failed Quests can be turned in.`);
+			return {
+				content: [{ type: "text", text: `Turned in Quest "${rec.title}" — cleared from the Guild board, kept in history.` }],
+				details: { id: params.questId },
+			};
+		},
+	});
 }

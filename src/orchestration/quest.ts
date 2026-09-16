@@ -14,6 +14,7 @@ import * as path from "node:path";
 import { discardIsolation } from "../execution/isolation.ts";
 import { questsDir } from "../paths.ts";
 import {
+	isTerminal,
 	newQuestId,
 	type QuestMember,
 	type QuestRecord,
@@ -119,6 +120,20 @@ export class QuestManager {
 		record.state = "cancelled";
 		this.emit(record); // listeners recompute from store (now empty of this id) and repaint
 		return { record, cancelledRunning: false, tornDown };
+	}
+
+	/**
+	 * "Turn in" a finished Quest: mark it acknowledged so it leaves the Guild board
+	 * but stays in history (report, branch and any draft PR are untouched). No-op
+	 * unless the Quest is in a terminal state. Emits so the board repaints.
+	 */
+	acknowledge(id: string): QuestRecord | undefined {
+		const record = this.store.load(id);
+		if (!record || !isTerminal(record.state)) return record;
+		record.acknowledgedAt = Date.now();
+		this.store.save(record);
+		this.emit(record);
+		return record;
 	}
 
 	/**

@@ -106,15 +106,17 @@ export class StatusSurface {
 		const quests = getQuestManager();
 		const active = quests.getActive();
 		const pending = getApprovalManager().list();
-		const ready = quests.store.list().filter((q) => q.state === "completed" && q.prs?.some((p) => !p.url));
+		// Finished Quests persist on the board until the user turns them in (§ turn-in),
+		// so a completion is never missed while multitasking with a scrolling transcript.
+		const done = quests.store.list().filter((q) => (q.state === "completed" || q.state === "failed") && !q.acknowledgedAt);
 
-		if (active.length === 0 && pending.length === 0 && ready.length === 0) {
+		if (active.length === 0 && pending.length === 0 && done.length === 0) {
 			this.ctx.ui.setWidget(WIDGET, undefined);
 			return;
 		}
 
 		// Snapshot for the render closure.
-		const snapshot = { active: [...active], pending: [...pending], ready: [...ready] };
+		const snapshot = { active: [...active], pending: [...pending], done: [...done] };
 		this.ctx.ui.setWidget(WIDGET, (_tui, theme) => {
 			const fg = (c: string, t: string) => theme.fg(c, t);
 			const box = new Container();
@@ -127,8 +129,17 @@ export class StatusSurface {
 			for (const a of snapshot.pending) {
 				box.addChild(new Text(`  ${fg("warning", "⚑")} ${fg("dim", a.id)}  ${a.title}  ${fg("muted", "/approve")}`, 0, 0));
 			}
-			for (const q of snapshot.ready) {
-				box.addChild(new Text(`  ${fg("success", "✔")} ${fg("toolTitle", q.title)}  ${fg("muted", "draft PR ready → raise_pr")}`, 0, 0));
+			for (const q of snapshot.done) {
+				const failed = q.state === "failed";
+				const label = q.project ? fg("muted", `[${q.project}] `) : "";
+				const hint = q.prs?.some((p) => !p.url)
+					? "draft PR ready → raise_pr"
+					: failed
+						? "failed — turn in to clear"
+						: "done — turn in to clear";
+				box.addChild(
+					new Text(`  ${fg(failed ? "error" : "success", failed ? "✗" : "✔")} ${label}${fg("toolTitle", q.title)}  ${fg("muted", hint)}`, 0, 0),
+				);
 			}
 			return box;
 		}, { placement: "belowEditor" });

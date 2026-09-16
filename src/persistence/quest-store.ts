@@ -66,6 +66,8 @@ export interface QuestRecord {
 	/** Write-Quest fields: one isolation + one drafted PR per writable repo (§ Projects P3). */
 	isolations?: QuestIsolation[];
 	prs?: QuestPr[];
+	/** Set when the user "turns in" a finished Quest: it leaves the board but stays in history. */
+	acknowledgedAt?: number;
 }
 
 const TERMINAL: ReadonlySet<QuestState> = new Set(["completed", "failed", "cancelled"]);
