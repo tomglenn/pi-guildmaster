@@ -125,17 +125,26 @@ async function runQuestInBackground(
 				review: opts.review ? { prText: opts.review.prText, approvals: opts.review.approvals, questId: record.id } : undefined,
 				onProgress: (members) => api.setMembers(members),
 			});
-			if (!party.report?.trim() && party.error) throw new Error(party.error);
+			// Persist how the party's run ended, for forensics, before anything can throw.
+			record.stopReason = party.stopReason;
+
+			// A party that did not finalize has no trustworthy report: fail honestly rather
+			// than promoting partial/aborted output to a "completed" Quest.
+			if (!party.report?.trim()) {
+				throw new Error(party.error || "Party produced no report before finalizing.");
+			}
 
 			// Commit each writable repo's worktree + draft a PR per changed repo BEFORE
 			// completion, so the completed record already carries its branches/PRs.
-			if (opts.write && record.isolations?.length && party.report) {
+			let committedAny = false;
+			if (opts.write && record.isolations?.length) {
 				const { title, body } = draftPrFromReport(party.report);
 				const multi = record.isolations.length > 1;
 				const prs = [];
 				for (const iso of record.isolations) {
 					const changes = commitAndDiff(iso, title);
 					if (!changes.committed) continue;
+					committedAny = true;
 					if (changes.diff) {
 						try {
 							fs.writeFileSync(path.join(questsDir(), `${record.id}.${iso.repo}.diff`), changes.diff, { mode: 0o600 });
@@ -155,6 +164,15 @@ async function runQuestInBackground(
 					});
 				}
 				record.prs = prs;
+
+				// A write-Quest that committed nothing did not do its job. Never present an
+				// empty branch as a success — that is what hid a party that planned but never wrote.
+				if (!committedAny) {
+					throw new Error(
+						"Write Quest produced no changes — the party committed nothing to any repo. " +
+							"Treating as failed rather than completing with an empty branch.",
+					);
+				}
 			}
 
 			// Review-Quest finalize: pause for approval, then let the envoy post (or leave a draft).
@@ -197,11 +215,14 @@ async function runQuestInBackground(
 function describeQuest(q: QuestRecord): string {
 	const lines = [`Quest "${q.title}" (${q.id}) — ${q.state}${q.project ? ` [${q.project}]` : ""}`];
 	if (q.members.length) lines.push(`Party: ${q.members.map((m) => `${m.name}@${m.repo ?? "?"}:${m.status}`).join(", ")}`);
-	if (q.isolations?.length) lines.push(`Branches: ${q.isolations.map((i) => `${i.repo}→${i.branch}`).join(", ")}`);
+	if (q.isolations?.length)
+		lines.push(
+			`Branches: ${q.isolations.map((i) => `${i.repo}→${i.branch}${i.baseLabel ? ` (base ${i.baseLabel})` : ""}`).join(", ")}`,
+		);
 	for (const pr of q.prs ?? []) {
 		lines.push(`PR (${pr.repo}): ${pr.url ?? "draft, not raised — use raise_pr"}${pr.diffStat ? `\n${pr.diffStat}` : ""}`);
 	}
-	if (q.error) lines.push(`Error: ${q.error}`);
+	if (q.error) lines.push(`Error: ${q.error}${q.stopReason ? ` [stopReason: ${q.stopReason}]` : ""}`);
 	if (q.report) lines.push(`\n${q.report}`);
 	return lines.join("\n");
 }

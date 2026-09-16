@@ -52,8 +52,6 @@ export interface ChildAgentResult {
 	usage: ChildUsage;
 	stopReason?: string;
 	error?: string;
-	/** Which bound shaped the ending, if any: "steps" (primary) or "time" (hang backstop). */
-	budget?: "steps" | "time";
 }
 
 // One shared ModelRuntime per process (auth + catalogs). Cheap to reuse.
@@ -114,11 +112,6 @@ export interface RunSessionSpec {
 	tools: string[];
 	customTools?: ToolDefinition[];
 	promptText: string;
-	/** Primary bound: approx investigation steps (tool-using turns). 0 = unbounded. */
-	maxTurns?: number;
-	graceTurns?: number;
-	/** Wall-clock BACKSTOP only, for genuine hangs. */
-	hardTimeoutMs?: number;
 	signal?: AbortSignal;
 	/** Called on each turn/tool/message event with the live message list. */
 	onEvent?: (messages: AgentMessage[]) => void;
@@ -130,10 +123,10 @@ export interface RunSessionResult {
 	modelSpec?: string;
 	stopReason?: string;
 	error?: string;
-	budget?: "steps" | "time";
 }
 
-/** Core: run one isolated session with a step budget + graceful wrap-up. */
+/** Core: run one isolated session to completion. No turn/time budget — a run ends
+ * only when the model is done, the caller cancels via `signal`, or a genuine error. */
 export async function runSession(spec: RunSessionSpec): Promise<RunSessionResult> {
 	const modelRuntime = await getRuntime();
 
@@ -178,29 +171,11 @@ export async function runSession(spec: RunSessionSpec): Promise<RunSessionResult
 
 	const usedModelSpec = model ? `${model.provider}/${model.id}` : spec.modelSpec;
 
-	const maxTurns = spec.maxTurns ?? 0;
-	const graceTurns = spec.graceTurns ?? 1;
-	let turns = 0;
-	let wrapUpSent = false;
-	let budget: "steps" | "time" | undefined;
-
+	// No turn/time budget: Parties and Consults run to completion. The only early
+	// endings are an explicit cancel via `signal` (stopReason "aborted") or a genuine
+	// model/transport error. We just relay live events for the progress UI.
 	const unsubscribe = session.subscribe((event) => {
-		if (event.type === "turn_end") {
-			turns++;
-			if (maxTurns > 0 && session.isStreaming) {
-				if (!wrapUpSent && turns >= maxTurns) {
-					wrapUpSent = true;
-					budget = "steps";
-					void session.steer(
-						"You have reached your step budget. Stop delegating/investigating now and " +
-							"give your final, concise, evidence-backed answer. Do not call any more tools.",
-					);
-				} else if (wrapUpSent && turns >= maxTurns + graceTurns) {
-					void session.abort();
-				}
-			}
-			spec.onEvent?.(session.messages);
-		} else if (event.type === "tool_execution_end" || event.type === "message_end") {
+		if (event.type === "turn_end" || event.type === "tool_execution_end" || event.type === "message_end") {
 			spec.onEvent?.(session.messages);
 		}
 	});
@@ -211,27 +186,12 @@ export async function runSession(spec: RunSessionSpec): Promise<RunSessionResult
 		else spec.signal.addEventListener("abort", abort, { once: true });
 	}
 
-	let timer: ReturnType<typeof setTimeout> | undefined;
-	if (spec.hardTimeoutMs && spec.hardTimeoutMs > 0) {
-		timer = setTimeout(() => {
-			budget ??= "time";
-			void session.abort();
-		}, spec.hardTimeoutMs);
-	}
-
-	const budgetNote =
-		maxTurns > 0
-			? `\n\n(You have a budget of about ${maxTurns} steps for this task. ` +
-				`Prioritise a concise, evidence-backed result over exhaustive coverage.)`
-			: "";
-
 	let caught: unknown;
 	try {
-		await session.prompt(`${spec.promptText}${budgetNote}`);
+		await session.prompt(spec.promptText);
 	} catch (err) {
 		caught = err;
 	} finally {
-		if (timer) clearTimeout(timer);
 		spec.signal?.removeEventListener("abort", abort);
 		unsubscribe();
 	}
@@ -247,18 +207,12 @@ export async function runSession(spec: RunSessionSpec): Promise<RunSessionResult
 			if (msg.errorMessage) error = msg.errorMessage;
 		}
 	}
-	if (budget === "time") {
-		stopReason = "timeout";
-		error = undefined;
-	} else if (budget === "steps" && stopReason === "aborted") {
-		stopReason = "budget";
-		error = undefined;
-	} else if (caught) {
+	if (caught) {
 		error ??= caught instanceof Error ? caught.message : String(caught);
 		stopReason ??= "error";
 	}
 
-	return { messages, modelSpec: usedModelSpec, stopReason, error, budget };
+	return { messages, modelSpec: usedModelSpec, stopReason, error };
 }
 
 export interface RunChildOptions {
@@ -268,9 +222,6 @@ export interface RunChildOptions {
 	cwd: string;
 	signal?: AbortSignal;
 	onUpdate?: (partial: ChildAgentResult) => void;
-	maxTurns?: number;
-	graceTurns?: number;
-	hardTimeoutMs?: number;
 	/** Extra custom tools (e.g. the envoy's gated shell). */
 	customTools?: ToolDefinition[];
 	/** Extra tool NAMES to allow alongside the tier's built-ins (the custom tools' names). */
@@ -290,7 +241,6 @@ export async function runChildAgent(options: RunChildOptions): Promise<ChildAgen
 		usage: collectUsage(r.messages),
 		stopReason: r.stopReason,
 		error: r.error,
-		budget: r.budget,
 	});
 
 	const result = await runSession({
@@ -300,9 +250,6 @@ export async function runChildAgent(options: RunChildOptions): Promise<ChildAgen
 		tools: [...toolsForTier(guildmate.tier), ...(options.extraTools ?? [])],
 		customTools: options.customTools,
 		promptText: `Task: ${task}`,
-		maxTurns: options.maxTurns,
-		graceTurns: options.graceTurns,
-		hardTimeoutMs: options.hardTimeoutMs,
 		signal,
 		onEvent: onUpdate ? (messages) => onUpdate(shape({ messages, modelSpec })) : undefined,
 	});

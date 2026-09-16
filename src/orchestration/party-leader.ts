@@ -22,15 +22,6 @@ import type { QuestMember } from "../persistence/quest-store.ts";
 import type { RepoContext } from "../persistence/project-store.ts";
 import type { ApprovalManager } from "./approvals.ts";
 
-const READONLY_MAX_TURNS = 6;
-const READONLY_HARD_TIMEOUT_MS = 120_000;
-// Write/exec members (Smith implementing, Runner building/testing) need more room.
-const WORK_MAX_TURNS = 12;
-const WORK_HARD_TIMEOUT_MS = 240_000;
-const LEADER_MAX_TURNS = 20;
-const LEADER_GRACE_TURNS = 2;
-const LEADER_HARD_TIMEOUT_MS = 420_000;
-
 const DISPATCHABLE_READONLY: ReadonlySet<string> = new Set(["read-only"]);
 const DISPATCHABLE_WRITE: ReadonlySet<string> = new Set(["read-only", "write", "exec"]);
 // Review: read-only specialists judge, scribe (write) composes, envoy talks to GitHub.
@@ -44,20 +35,64 @@ export interface PartyResult {
 	error?: string;
 }
 
+export interface ExtractedReport {
+	/** The report body: marker-delimited when the leader finalized, else the full text. */
+	body: string;
+	/** True ONLY when the leader emitted the explicit <<<REPORT>>> finalization marker. */
+	finalized: boolean;
+}
+
 /**
  * Extract the clean report from the Party Leader's final message. The leader is
  * asked to wrap it in explicit markers; we take what follows the last <<<REPORT>>>
  * (up to <<<END>>>), which strips any preamble/thinking structurally rather than
- * relying on the model to omit it. Falls back to the full text if unmarked.
+ * relying on the model to omit it. Crucially it also reports WHETHER the marker was
+ * present (`finalized`), so a run that stopped before finalizing is never mistaken
+ * for a real report.
  */
-export function extractReport(text: string): string {
+export function extractReport(text: string): ExtractedReport {
 	const startTag = "<<<REPORT>>>";
 	const start = text.lastIndexOf(startTag);
-	if (start === -1) return text.trim();
+	if (start === -1) return { body: text.trim(), finalized: false };
 	let body = text.slice(start + startTag.length);
 	const end = body.indexOf("<<<END>>>");
 	if (end !== -1) body = body.slice(0, end);
-	return body.trim();
+	return { body: body.trim(), finalized: true };
+}
+
+export interface PartyOutcomeInput {
+	/** The leader's last assistant message text. */
+	lastText: string;
+	/** How the underlying session ended (e.g. "endTurn", "aborted", "error"). */
+	stopReason?: string;
+	/** A transport/model error from the session, if any. */
+	error?: string;
+}
+
+/**
+ * Decide the trustworthy outcome of a Party run. A report is accepted ONLY when the
+ * leader DELIBERATELY finalized it (emitted the <<<REPORT>>> marker) AND the run
+ * ended normally. A run that was cancelled/errored, signalled `FAILED:`, or never
+ * emitted the marker yields an error and NO report — so a truncated run can never be
+ * promoted to a "completed" Quest (the failure mode this guards against).
+ */
+export function finalizePartyOutcome(input: PartyOutcomeInput): { report: string; error?: string } {
+	const extracted = extractReport(input.lastText);
+	const failedSignal = /^FAILED:/i.test(extracted.body.trim());
+	const abnormalStop = input.stopReason === "error" || input.stopReason === "aborted";
+	if (input.error || abnormalStop) {
+		return { report: "", error: input.error ?? `Party ended without finalizing (${input.stopReason ?? "unknown"}).` };
+	}
+	if (failedSignal) {
+		return { report: "", error: extracted.body.trim().replace(/^FAILED:\s*/i, "") || "Party reported failure without a reason." };
+	}
+	if (!extracted.finalized) {
+		return { report: "", error: "Party stopped before emitting a final report (no <<<REPORT>>> marker)." };
+	}
+	if (!extracted.body.trim()) {
+		return { report: "", error: "Party emitted an empty report." };
+	}
+	return { report: extracted.body };
 }
 
 const DEFAULT_LEADER_PROMPT =
@@ -230,8 +265,6 @@ export async function runParty(opts: {
 				modelSpec,
 				cwd: context.path,
 				signal,
-				maxTurns: readOnly ? READONLY_MAX_TURNS : WORK_MAX_TURNS,
-				hardTimeoutMs: readOnly ? READONLY_HARD_TIMEOUT_MS : WORK_HARD_TIMEOUT_MS,
 				customTools: envoyTools,
 				extraTools: envoyTools ? ["shell"] : undefined,
 			});
@@ -260,24 +293,15 @@ export async function runParty(opts: {
 		tools: ["dispatch"],
 		customTools: [dispatch],
 		promptText: opts.brief,
-		maxTurns: LEADER_MAX_TURNS,
-		graceTurns: LEADER_GRACE_TURNS,
-		hardTimeoutMs: LEADER_HARD_TIMEOUT_MS,
 		signal: opts.signal,
 	});
 
-	const rawReport = extractReport(lastAssistantText(run.messages));
 	const leaderUsage = collectUsage(run.messages);
-	// Honest failure: a leader that could not complete emits `FAILED: <reason>` instead of a report.
-	const failedSignal = /^FAILED:/i.test(rawReport.trim());
-	const report = failedSignal ? "" : rawReport;
-	const error = run.error ?? (failedSignal ? rawReport.trim().replace(/^FAILED:\s*/i, "") : report.trim() ? undefined : "Party produced no report.");
-
-	return {
-		report,
-		members,
-		usage: { cost: memberCost + leaderUsage.cost, turns: leaderUsage.turns },
+	const usage = { cost: memberCost + leaderUsage.cost, turns: leaderUsage.turns };
+	const { report, error } = finalizePartyOutcome({
+		lastText: lastAssistantText(run.messages),
 		stopReason: run.stopReason,
-		error,
-	};
+		error: run.error,
+	});
+	return { report, members, usage, stopReason: run.stopReason, error };
 }

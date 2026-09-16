@@ -2,8 +2,9 @@
  * Write isolation via git worktrees (§11).
  *
  * Delegated writes must never touch the user's active checkout. A write-Quest
- * gets its own worktree on a new branch off the current HEAD; Smith/Runner work
- * there. When the Party finishes, changes are committed to the branch so it is
+ * gets its own worktree on a new branch off a CLEAN base (the repo's default
+ * branch tip), not whatever the user has checked out; Smith/Runner work there.
+ * When the Party finishes, changes are committed to the branch so it is
  * PR-ready. Nothing is pushed — raising the PR is M9's approval-gated step.
  *
  * The branch is the reconciliation boundary: it becomes a draft PR the user
@@ -19,7 +20,10 @@ export interface Isolation {
 	repo: string;
 	branch: string;
 	worktreePath: string;
+	/** The commit SHA the branch was cut from (used for the base..HEAD diff). */
 	baseRef: string;
+	/** Human-readable label of that base, e.g. "origin/main" (or "HEAD" fallback). */
+	baseLabel?: string;
 	repoRoot: string;
 }
 
@@ -61,19 +65,50 @@ export function slugify(text: string): string {
 }
 
 /**
- * Create a new worktree on a fresh branch off the current HEAD. The branch name is
- * derived from the quest title (shared across a cross-repo quest's repos); the
- * worktree lives under the quest id + repo name so multiple repos don't collide.
+ * Resolve a CLEAN base to branch a write-Quest from: the repo's canonical default
+ * branch tip (origin/HEAD → origin/main → origin/master → local main/master), NOT
+ * whatever the user happens to have checked out. This stops a Quest inheriting the
+ * user's in-progress, unmerged work as its base — which once silently made an
+ * unrelated WIP branch look like the Quest's own output. Falls back to the current
+ * HEAD only when no canonical branch resolves (detached/remote-less repo).
+ */
+export function resolveCleanBase(repoRoot: string): { ref: string; sha: string } {
+	const candidates: string[] = [];
+	try {
+		// e.g. "refs/remotes/origin/HEAD" -> "refs/remotes/origin/main" -> "origin/main"
+		const originHead = git(["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"], repoRoot).trim();
+		if (originHead) candidates.push(originHead.replace(/^refs\/remotes\//, ""));
+	} catch {
+		/* no origin/HEAD; fall through to explicit candidates */
+	}
+	candidates.push("origin/main", "origin/master", "main", "master");
+	for (const ref of candidates) {
+		try {
+			const sha = git(["rev-parse", "--verify", "--quiet", `${ref}^{commit}`], repoRoot).trim();
+			if (sha) return { ref, sha };
+		} catch {
+			/* try next candidate */
+		}
+	}
+	return { ref: "HEAD", sha: git(["rev-parse", "HEAD"], repoRoot).trim() };
+}
+
+/**
+ * Create a new worktree on a fresh branch off a CLEAN base (see resolveCleanBase).
+ * The branch name is derived from the quest title (shared across a cross-repo
+ * quest's repos); the worktree lives under the quest id + repo name so multiple
+ * repos don't collide.
  */
 export function createWorktree(cwd: string, questId: string, title: string, repoName?: string): Isolation {
 	const repoRoot = git(["rev-parse", "--show-toplevel"], cwd).trim();
-	const baseRef = git(["rev-parse", "HEAD"], repoRoot).trim();
+	const base = resolveCleanBase(repoRoot);
 	const repo = repoName ?? path.basename(repoRoot);
 	const branch = `guildmaster/${slugify(title)}-${questId.slice(-4)}`;
 	const worktreePath = path.join(guildmasterHome(), "worktrees", questId, repo);
 	fs.mkdirSync(path.dirname(worktreePath), { recursive: true });
-	git(["worktree", "add", "-b", branch, worktreePath, baseRef], repoRoot);
-	return { repo, branch, worktreePath, baseRef, repoRoot };
+	// Branch off the resolved base by SHA (stable even if refs move mid-Quest).
+	git(["worktree", "add", "-b", branch, worktreePath, base.sha], repoRoot);
+	return { repo, branch, worktreePath, baseRef: base.sha, baseLabel: base.ref, repoRoot };
 }
 
 /**

@@ -33,6 +33,8 @@ export interface QuestIsolation {
 	branch: string;
 	worktreePath: string;
 	baseRef: string;
+	/** Human-readable label of the clean base this branch was cut from (e.g. "origin/main"). */
+	baseLabel?: string;
 	repoRoot: string;
 }
 
@@ -72,6 +74,8 @@ export interface QuestRecord {
 	/** Present only when state === "completed". */
 	report?: string;
 	error?: string;
+	/** How the party's run ended (e.g. "endTurn", "aborted", "error"). Forensics for post-mortems. */
+	stopReason?: string;
 	usage?: { cost: number; turns: number };
 	/** Write-Quest fields: one isolation + one drafted PR per writable repo (§ Projects P3). */
 	isolations?: QuestIsolation[];

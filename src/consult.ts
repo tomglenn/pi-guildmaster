@@ -9,8 +9,8 @@
  * concise result crosses back (§7).
  *
  * M2 scope: the Guildmaster can invoke a single read-only Guildmate (Scout and the
- * other read-only specialists) as an isolated child agent. Consult budgets/timeboxing
- * and the Quest path for write work arrive in later milestones.
+ * other read-only specialists) as an isolated child agent. A Consult runs to
+ * completion — no turn/time budget; it ends only on its own, on cancel, or on error.
  */
 
 import type { ExtensionAPI, ThemeColor } from "@earendil-works/pi-coding-agent";
@@ -23,13 +23,6 @@ import { pickRepo, resolveProjectQuery } from "./orchestration/resolve.ts";
 import { ProjectStore } from "./persistence/project-store.ts";
 import { findGuildmate, loadRoster } from "./roster.ts";
 
-// A Consult is predictably bounded (§5). The PRIMARY bound is a step budget the
-// specialist can self-limit against and that is enforced structurally (graceful
-// wrap-up at the cap). The wall-clock limit is only a generous hang backstop.
-const CONSULT_MAX_TURNS = 6;
-const CONSULT_GRACE_TURNS = 1;
-const CONSULT_HARD_TIMEOUT_MS = 120_000;
-
 const ConsultParams = Type.Object({
 	agent: Type.String({ description: "Name of the read-only Guildmate to consult (e.g. scout, delver, warden)" }),
 	task: Type.String({ description: "The single, bounded investigation to delegate. Be specific." }),
@@ -37,7 +30,7 @@ const ConsultParams = Type.Object({
 	repo: Type.Optional(Type.String({ description: "Which project repo to investigate (for multi-repo projects)." })),
 });
 
-// Real failures only. Budget endings ("budget"/"timeout") are bounded, not failed.
+// Real failures only: a transport/model error or an explicit cancel.
 function isFailed(r: ChildAgentResult): boolean {
 	return Boolean(r.error) || r.stopReason === "error" || r.stopReason === "aborted";
 }
@@ -125,9 +118,6 @@ export function registerConsultTool(pi: ExtensionAPI): void {
 				modelSpec,
 				cwd,
 				signal,
-				maxTurns: CONSULT_MAX_TURNS,
-				graceTurns: CONSULT_GRACE_TURNS,
-				hardTimeoutMs: CONSULT_HARD_TIMEOUT_MS,
 				onUpdate: (partial) => {
 					onUpdate?.({
 						content: [{ type: "text", text: partial.finalText || `Consulting ${mate.name}…` }],
@@ -149,20 +139,8 @@ export function registerConsultTool(pi: ExtensionAPI): void {
 				};
 			}
 
-			// Wall-clock backstop fired: a genuine hang. Result may be partial or empty.
-			if (result.stopReason === "timeout") {
-				const text = result.finalText
-					? `${result.finalText}\n\n[timeboxed backstop hit; result may be partial]`
-					: `Consult of ${mate.name} hit the wall-clock backstop before answering ` +
-						`(tool activity: ${result.toolCalls.map((c) => c.name).join(", ") || "none"}). ` +
-						`Consider a narrower question or a Quest.`;
-				return { content: [{ type: "text", text }], details: result };
-			}
-
-			// Step budget reached: a clean, bounded result (possibly scoped).
-			const budgetNote = result.budget === "steps" ? "\n\n_(reached step budget; result is scoped)_" : "";
 			return {
-				content: [{ type: "text", text: (result.finalText || "(no result)") + budgetNote }],
+				content: [{ type: "text", text: result.finalText || "(no result)" }],
 				details: result,
 			};
 		},
@@ -184,13 +162,11 @@ export function registerConsultTool(pi: ExtensionAPI): void {
 			}
 			const fg = theme.fg.bind(theme);
 			const failed = isFailed(r);
-			const icon = failed ? fg("error", "✗") : r.budget ? fg("warning", "◐") : fg("success", "✓");
+			const icon = failed ? fg("error", "✗") : fg("success", "✓");
 			const container = new Container();
 			container.addChild(new Text(`${icon} ${fg("toolTitle", theme.bold(`consult ${r.guildmate}`))}`, 0, 0));
 
 			if (failed) container.addChild(new Text(fg("error", r.error ?? r.stopReason ?? "failed"), 0, 0));
-			else if (r.budget === "time") container.addChild(new Text(fg("warning", "timeboxed (backstop) — partial"), 0, 0));
-			else if (r.budget === "steps") container.addChild(new Text(fg("warning", "reached step budget — scoped result"), 0, 0));
 
 			for (const call of r.toolCalls) {
 				container.addChild(new Text(`  ${fg("muted", "→ ")}${formatToolCall(call.name, call.args, fg)}`, 0, 0));
