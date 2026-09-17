@@ -3,8 +3,10 @@
  *
  * Verify that:
  *  - Small parties render full individual chips when they fit.
- *  - Large parties collapse to a compact summary.
- *  - Width-budget logic correctly decides between full chips and summary.
+ *  - Large parties collapse ONLY completed members into `✓N`, keeping active
+ *    (running/pending/failed) members visible in full.
+ *  - The counts-only summary is used only as a last resort when even the active
+ *    chips overflow the width budget.
  */
 
 import assert from "node:assert/strict";
@@ -132,7 +134,7 @@ test("formatMemberChips uses full chips when they fit the budget", () => {
 	assert.doesNotMatch(result, /·.*members/);
 });
 
-test("formatMemberChips uses summary when budget is exceeded", () => {
+test("formatMemberChips collapses completed but keeps active members when full chips exceed budget", () => {
 	const record: QuestRecord = {
 		id: "q1",
 		title: "Large Party",
@@ -149,10 +151,37 @@ test("formatMemberChips uses summary when budget is exceeded", () => {
 	};
 
 	const theme = mockTheme();
-	// Budget too small for full chips (✓ scout  ✓ delver  ● runner ~ 31 chars)
+	// Budget too small for full chips (✓ scout  ✓ delver  ● runner ~ 31 chars) but
+	// roomy enough to collapse the 2 completed into ✓2 and still show the active runner.
 	const result = formatMemberChips(record, theme, 20);
-	// Should be summary format
-	assert.match(result, /· 3 members · ✓2 ●1/);
+	assert.match(result, /✓2/); // completed collapsed to a count
+	assert.match(result, /● runner/); // active member still shown in full
+	assert.doesNotMatch(result, /scout|delver/); // completed names hidden
+	assert.doesNotMatch(result, /·.*members/); // NOT the counts-only summary
+});
+
+test("formatMemberChips keeps active members visible on a large party (the ✓21 ●1 case)", () => {
+	const record: QuestRecord = {
+		id: "q1",
+		title: "Big Party",
+		brief: "Test quest",
+		cwd: "/test",
+		state: "running",
+		members: [
+			...Array.from({ length: 21 }, () => ({ name: "worker", status: "done" as const, task: "w", summary: "" })),
+			{ name: "runner", status: "running" as const, task: "run", summary: "" },
+		],
+		createdAt: Date.now(),
+		updatedAt: Date.now(),
+	};
+
+	const theme = mockTheme();
+	// Full chips for 22 members are far too wide, but the collapsed form keeps the
+	// one active member visible — the visibility the old collapse-everything hid.
+	const result = formatMemberChips(record, theme, 40);
+	assert.match(result, /✓21/);
+	assert.match(result, /● runner/);
+	assert.doesNotMatch(result, /·.*members/);
 });
 
 test("formatMemberChips uses 6-member threshold when budget is undefined", () => {
@@ -195,9 +224,11 @@ test("formatMemberChips uses 6-member threshold when budget is undefined", () =>
 	assert.match(smallResult, /✓ member0/);
 	assert.doesNotMatch(smallResult, /·.*members/);
 
-	// 6 members: should use summary
+	// 6 members (all completed): collapse into ✓6 (no active members to show)
 	const largeResult = formatMemberChips(largeParty, theme, undefined);
-	assert.match(largeResult, /· 6 members · ✓6/);
+	assert.match(largeResult, /^✓6$/);
+	assert.doesNotMatch(largeResult, /member0/);
+	assert.doesNotMatch(largeResult, /·.*members/);
 });
 
 test("formatMemberChips handles mixed statuses in summary correctly", () => {

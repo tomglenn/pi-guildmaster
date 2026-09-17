@@ -67,8 +67,33 @@ function memberSummary(
 }
 
 /**
- * Format member chips: full individual chips if they fit the budget, otherwise summary.
- * Single member always shows full chip. When budget undefined, uses 6-member threshold.
+ * Collapse ONLY completed members into a single `✓N` count, while keeping every
+ * still-relevant member (running / pending / failed) as a full named chip.
+ *
+ * This is the middle tier between full chips and the counts-only summary: on a
+ * large party the finished members are noise, but the user needs to see WHICH
+ * members are still outstanding — collapsing everything (the old behaviour) hid
+ * exactly that. Format: `✓21  ● runner  ○ scribe`.
+ */
+function collapseDoneChips(
+	members: QuestRecord["members"],
+	theme: { fg: (c: ThemeColor, t: string) => string }
+): string {
+	const doneCount = members.filter((m) => m.status === "done").length;
+	const active = members.filter((m) => m.status !== "done");
+	const parts: string[] = [];
+	if (doneCount > 0) parts.push(theme.fg(MEMBER_COLOR.done, `${MEMBER_GLYPH.done}${doneCount}`));
+	for (const m of active) parts.push(theme.fg(MEMBER_COLOR[m.status], `${MEMBER_GLYPH[m.status]} ${m.name}`));
+	return parts.join("  ");
+}
+
+/**
+ * Format member chips, preferring the most detail that fits:
+ *   1. full named chips for everyone;
+ *   2. else completed collapsed to `✓N` with active members still shown in full;
+ *   3. else the counts-only summary as a last resort.
+ * Single member always shows a full chip. When budget is undefined, tiers are
+ * chosen by member-count heuristics (terminal width unavailable).
  */
 function formatMemberChips(
 	record: QuestRecord,
@@ -89,19 +114,22 @@ function formatMemberChips(
 		.map((m) => theme.fg(MEMBER_COLOR[m.status], `${MEMBER_GLYPH[m.status]} ${m.name}`))
 		.join("  ");
 
-	// Decide: full chips vs summary
+	// Decide: full chips → collapse-completed → counts-only summary
 	if (budget === undefined) {
 		// Fallback when terminal width unavailable (piped output, etc.)
-		// Heuristic: 6+ members won't fit in typical 80-col terminal after prefix overhead
-		return members.length >= 6 ? memberSummary(members, theme) : fullChips;
+		// Heuristic: 6+ members won't fit in typical 80-col terminal after prefix overhead.
+		// Still keep active members visible by collapsing only the completed ones.
+		return members.length >= 6 ? collapseDoneChips(members, theme) : fullChips;
 	}
 
-	// Budget too small: return summary anyway (better than hiding status entirely)
-	if (budget <= 0 || visibleWidth(fullChips) > budget) {
-		return memberSummary(members, theme);
-	}
+	if (budget > 0 && visibleWidth(fullChips) <= budget) return fullChips;
 
-	return fullChips;
+	// Full chips overflow: collapse completed but keep active members in full if that fits.
+	const collapsed = collapseDoneChips(members, theme);
+	if (budget > 0 && visibleWidth(collapsed) <= budget) return collapsed;
+
+	// Even the active chips overflow: counts-only summary as a last resort.
+	return memberSummary(members, theme);
 }
 
 
@@ -322,4 +350,4 @@ export function getStatusSurface(): StatusSurface {
 }
 
 // Exported for testing
-export { visibleWidth, memberSummary, formatMemberChips };
+export { visibleWidth, memberSummary, formatMemberChips, collapseDoneChips };
