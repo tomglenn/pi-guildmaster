@@ -190,7 +190,7 @@ function buildSystemPrompt(basePrompt: string, available: Guildmate[], config: G
 				"  this at TWO review→fix rounds. Do NOT loop on nits or style — record minor items under Unresolved",
 				"  and move on. Finalize only when the review is clean or the two rounds are spent.",
 				"- PR BODY SYNTHESIS: after review passes, dispatch `scribe` to write the pull request description.",
-				"  Scribe uses the simple-english skill to write plain, human-readable prose. Give Scribe: the brief,",
+				"  Scribe writes plain, human-readable prose (its persona defines the style). Give Scribe: the brief,",
 				"  what changed (files and why), what runner tested, and any caveats from inquisitor/warden.",
 				"- The final report IS what Scribe wrote — paste it verbatim between the report markers, do not",
 				"  rewrite it. First line must be a concise PR title as H1 (`# ...`). Then sections: Summary,",
@@ -296,9 +296,6 @@ export async function runParty(opts: {
 						? [createRunnerShellTool({ cwd: context.path })]
 						: undefined;
 
-			// Scribe uses the simple-english skill for human-facing synthesis.
-			const needsSkills = mate.name.toLowerCase() === "scribe";
-
 			// Requirement fidelity: write/exec members act on the code, so they must see the quest's
 			// authoritative constraints, not just the leader's paraphrase of one bounded task. The brief
 			// is appended so smith/runner satisfy EVERY requirement, not only the observable one.
@@ -315,7 +312,6 @@ export async function runParty(opts: {
 				signal,
 				customTools: shellTools,
 				extraTools: shellTools ? ["shell"] : undefined,
-				enableSkills: needsSkills,
 			});
 
 			memberCost += res.usage.cost;

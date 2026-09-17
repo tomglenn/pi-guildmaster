@@ -115,8 +115,6 @@ export interface RunSessionSpec {
 	signal?: AbortSignal;
 	/** Called on each turn/tool/message event with the live message list. */
 	onEvent?: (messages: AgentMessage[]) => void;
-	/** When true, load Pi skills for this session (default: false, skills are stripped). */
-	enableSkills?: boolean;
 }
 
 export interface RunSessionResult {
@@ -152,7 +150,7 @@ export async function runSession(spec: RunSessionSpec): Promise<RunSessionResult
 		cwd: spec.cwd,
 		agentDir: getAgentDir(),
 		noExtensions: true,
-		noSkills: !spec.enableSkills,
+		noSkills: true,
 		noPromptTemplates: true,
 		noThemes: true,
 		noContextFiles: true,
@@ -228,8 +226,6 @@ export interface RunChildOptions {
 	customTools?: ToolDefinition[];
 	/** Extra tool NAMES to allow alongside the tier's built-ins (the custom tools' names). */
 	extraTools?: string[];
-	/** When true, enable Pi skills for this Guildmate (e.g. for Scribe to use simple-english). */
-	enableSkills?: boolean;
 }
 
 /** Run a single Guildmate (tier-derived tools + system prompt) and shape a result. */
@@ -254,7 +250,6 @@ export async function runChildAgent(options: RunChildOptions): Promise<ChildAgen
 		tools: [...toolsForTier(guildmate.tier), ...(options.extraTools ?? [])],
 		customTools: options.customTools,
 		promptText: `Task: ${task}`,
-		enableSkills: options.enableSkills,
 		signal,
 		onEvent: onUpdate ? (messages) => onUpdate(shape({ messages, modelSpec })) : undefined,
 	});

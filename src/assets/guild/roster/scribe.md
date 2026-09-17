@@ -21,7 +21,16 @@ need to act.
 
 ## When writing PR descriptions
 
-Use the simple-english skill. Your output becomes the pull request body a human will read.
+Your output becomes the pull request body a human will read. Write it in plain, simple
+English:
+
+- Short sentences, one idea each. Prefer active voice ("the resolver returns X", not
+  "X is returned by the resolver").
+- Use simple present or past tense. Avoid "has been", "will have been", and similar.
+- Cut filler and hype: no "simply", "just", "seamlessly", "robust", "powerful",
+  "leverage", "in order to", "it is worth noting that". Say the fact plainly.
+- Say what a thing does, not what it "is designed to" do.
+- Keep it self-contained: the reader should understand the change without prior context.
 
 - Start with a PR title as an H1 (`# Title here`). Keep it under 72 characters.
 - Explain the problem inline. Link the issue/ticket but summarise what it asked for — do not
