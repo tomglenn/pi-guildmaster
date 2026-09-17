@@ -144,7 +144,33 @@ export async function raisePr(record: QuestRecord, deps: PrDeps): Promise<RaiseR
 			pr.url = sourcePr.url;
 			pr.number = sourcePr.number;
 			pr.draft = false;
-			results.push({ repo: pr.repo, raised: true, url: sourcePr.url, reason: `Updated existing PR #${sourcePr.number}.` });
+
+			// Best-effort: reply to each addressed review thread and resolve it, so the
+			// PR conversation reflects what was done. Never fails the raise.
+			let closed = 0;
+			const threads = sourcePr.threads ?? [];
+			if (threads.length && sourcePr.slug) {
+				const replyBody = `Addressed in the update just pushed to this PR (via Guildmaster).`;
+				const resolveMutation = `mutation($threadId:ID!){resolveReviewThread(input:{threadId:$threadId}){thread{isResolved}}}`;
+				for (const th of threads) {
+					try {
+						if (th.commentId) {
+							await runGh(
+								["api", "--method", "POST", `repos/${sourcePr.slug}/pulls/${sourcePr.number}/comments/${th.commentId}/replies`, "-f", `body=${replyBody}`],
+								worktreePath,
+							);
+						}
+						if (th.threadId) {
+							await runGh(["api", "graphql", "-f", `query=${resolveMutation}`, "-f", `threadId=${th.threadId}`], worktreePath);
+						}
+						closed++;
+					} catch {
+						/* best effort — a failed reply/resolve must not fail the push */
+					}
+				}
+			}
+			const threadNote = threads.length ? ` Replied to/resolved ${closed}/${threads.length} thread(s).` : "";
+			results.push({ repo: pr.repo, raised: true, url: sourcePr.url, reason: `Updated existing PR #${sourcePr.number}.${threadNote}` });
 			continue;
 		}
 

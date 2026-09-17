@@ -76,6 +76,10 @@ export interface FeedbackComment {
 	line?: number;
 	/** For top-level reviews: APPROVED | CHANGES_REQUESTED | COMMENTED. */
 	reviewState?: string;
+	/** GraphQL review-thread node id (for resolving the thread after addressing it). */
+	threadId?: string;
+	/** REST id of the thread's first comment (for posting a reply). */
+	commentId?: number;
 }
 
 export interface FailingCheck {
@@ -130,9 +134,10 @@ const REVIEW_THREADS_QUERY = `query($owner:String!,$repo:String!,$number:Int!){
     pullRequest(number:$number){
       reviewThreads(first:100){
         nodes{
+          id
           isResolved
           isOutdated
-          comments(first:1){ nodes{ author{login} body path line originalLine } }
+          comments(first:1){ nodes{ databaseId author{login} body path line originalLine } }
         }
       }
       reviews(first:50){ nodes{ author{login} state body } }
@@ -141,6 +146,7 @@ const REVIEW_THREADS_QUERY = `query($owner:String!,$repo:String!,$number:Int!){
 }`;
 
 interface GraphQlThreadComment {
+	databaseId?: number | null;
 	author?: { login?: string } | null;
 	body?: string;
 	path?: string;
@@ -148,6 +154,7 @@ interface GraphQlThreadComment {
 	originalLine?: number | null;
 }
 interface GraphQlReviewThread {
+	id: string;
 	isResolved: boolean;
 	isOutdated: boolean;
 	comments: { nodes: GraphQlThreadComment[] };
@@ -230,6 +237,8 @@ export function fetchReviewThreads(
 			body: (c.body ?? "").trim(),
 			path: c.path,
 			line: c.line ?? c.originalLine ?? undefined,
+			threadId: t.id,
+			commentId: c.databaseId ?? undefined,
 		};
 		(item.isBot ? botThreads : humanThreads).push(item);
 	}

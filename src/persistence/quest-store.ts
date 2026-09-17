@@ -87,7 +87,16 @@ export interface QuestRecord {
 	 * iterating on. When present, raising pushes commits to `headBranch` to UPDATE
 	 * this PR (fast-forward only) instead of opening a new one.
 	 */
-	sourcePr?: { number: number; url: string; headBranch: string; slug?: string; repo?: string; isCrossRepository?: boolean };
+	sourcePr?: {
+		number: number;
+		url: string;
+		headBranch: string;
+		slug?: string;
+		repo?: string;
+		isCrossRepository?: boolean;
+		/** Unresolved review threads this Quest set out to address, so raising can reply + resolve them. */
+		threads?: { threadId?: string; commentId?: number; author: string }[];
+	};
 	/** Set when the user "turns in" a finished Quest: it leaves the board but stays in history. */
 	acknowledgedAt?: number;
 	/** The Quest this one was chained from (fromQuest) — multi-step lineage. */

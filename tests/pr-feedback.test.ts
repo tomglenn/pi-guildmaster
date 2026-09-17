@@ -29,9 +29,9 @@ const GRAPHQL = JSON.stringify({
 			pullRequest: {
 				reviewThreads: {
 					nodes: [
-						{ isResolved: false, isOutdated: false, comments: { nodes: [{ author: { login: "Jayclifford345" }, body: "please rename this", path: "a.ts", line: 10 }] } },
-						{ isResolved: true, isOutdated: false, comments: { nodes: [{ author: { login: "Jayclifford345" }, body: "RESOLVED already", path: "a.ts", line: 1 }] } },
-						{ isResolved: false, isOutdated: false, comments: { nodes: [{ author: { login: "cursor[bot]" }, body: "<!--meta-->bug here<div>x</div>", path: "b.ts", line: 5 }] } },
+						{ id: "T_human", isResolved: false, isOutdated: false, comments: { nodes: [{ databaseId: 111, author: { login: "Jayclifford345" }, body: "please rename this", path: "a.ts", line: 10 }] } },
+						{ id: "T_resolved", isResolved: true, isOutdated: false, comments: { nodes: [{ databaseId: 222, author: { login: "Jayclifford345" }, body: "RESOLVED already", path: "a.ts", line: 1 }] } },
+						{ id: "T_bot", isResolved: false, isOutdated: false, comments: { nodes: [{ databaseId: 333, author: { login: "cursor[bot]" }, body: "<!--meta-->bug here<div>x</div>", path: "b.ts", line: 5 }] } },
 					],
 				},
 				reviews: {
@@ -80,6 +80,10 @@ test("gatherPrFeedback splits human/bot, drops resolved threads, counts actionab
 	assert.equal(fb.humanThreads.length, 1);
 	assert.equal(fb.humanThreads[0].author, "Jayclifford345");
 	assert.ok(fb.humanThreads.every((t) => !t.body.includes("RESOLVED")));
+	// Thread + comment ids are captured for later reply/resolve.
+	assert.equal(fb.humanThreads[0].threadId, "T_human");
+	assert.equal(fb.humanThreads[0].commentId, 111);
+	assert.equal(fb.botThreads[0].threadId, "T_bot");
 
 	// One unresolved bot thread.
 	assert.equal(fb.botThreads.length, 1);

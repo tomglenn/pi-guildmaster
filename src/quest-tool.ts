@@ -26,7 +26,7 @@ import { formatFeedbackBrief, gatherPrFeedback } from "./orchestration/pr-feedba
 import type { ApprovalManager } from "./orchestration/approvals.ts";
 import { getApprovalManager, getQuestManager } from "./orchestration/manager.ts";
 import { runParty } from "./orchestration/party-leader.ts";
-import { readonlyContexts, resolveProjectQuery } from "./orchestration/resolve.ts";
+import { pickRepoBySlug, readonlyContexts, resolveProjectQuery } from "./orchestration/resolve.ts";
 import { ProjectStore, type RepoContext } from "./persistence/project-store.ts";
 import type { QuestRecord } from "./persistence/quest-store.ts";
 import { guildmasterHome, questsDir } from "./paths.ts";
@@ -345,15 +345,14 @@ export function registerQuestTool(pi: ExtensionAPI): void {
 				let repoPath: string;
 				let repoName: string;
 				if (project) {
-					const r = params.repo
-						? project.repos.find((x) => x.name === params.repo)
-						: project.repos.length === 1
-							? project.repos[0]
-							: undefined;
+					let r = params.repo ? project.repos.find((x) => x.name === params.repo) : undefined;
 					if (params.repo && !r) throw new Error(`Project "${project.id}" has no repo "${params.repo}".`);
+					// No repo named: use the sole repo, else infer it from the PR's owner/repo slug.
+					if (!r && project.repos.length === 1) r = project.repos[0];
+					if (!r) r = pickRepoBySlug(project, target.slug);
 					if (!r)
 						throw new Error(
-							`Project "${project.id}" has multiple repos (${project.repos.map((x) => x.name).join(", ")}). Specify which with \`repo\`.`,
+							`Project "${project.id}" has multiple repos (${project.repos.map((x) => x.name).join(", ")}) and I couldn't infer which from the PR. Pass a full PR URL (so I can match owner/repo) or set \`repo\`.`,
 						);
 					repoPath = r.path;
 					repoName = r.name;
@@ -406,6 +405,9 @@ export function registerQuestTool(pi: ExtensionAPI): void {
 					slug: meta.slug,
 					repo: repoName,
 					isCrossRepository: meta.isCrossRepository,
+					threads: [...feedback.humanThreads, ...feedback.botThreads]
+						.filter((t) => t.threadId)
+						.map((t) => ({ threadId: t.threadId, commentId: t.commentId, author: t.author })),
 				};
 				const iso = attachToExistingBranch(repoPath, record.id, { number: meta.number, slug: meta.slug, repoName });
 				record.isolations = [iso];

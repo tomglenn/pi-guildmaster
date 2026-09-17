@@ -61,6 +61,57 @@ test("update path fast-forward pushes to the existing PR and opens no new PR", a
 	assert.equal(record.prs?.[0].number, 1942);
 });
 
+test("update path replies to and resolves addressed threads, best-effort", async () => {
+	const ghCalls: string[][] = [];
+	const runGit: CommandRunner = async () => "";
+	const runGh: CommandRunner = async (args) => {
+		ghCalls.push(args);
+		return "";
+	};
+	const record = baseRecord({
+		sourcePr: {
+			number: 1942,
+			url: "https://github.com/grafana/grafana-pathfinder-app/pull/1942",
+			headBranch: "guildmaster/fix-x",
+			slug: "grafana/grafana-pathfinder-app",
+			repo: "app",
+			threads: [
+				{ threadId: "T_human", commentId: 111, author: "Jayclifford345" },
+				{ threadId: "T_bot", commentId: 333, author: "cursor[bot]" },
+			],
+		},
+	});
+
+	const result = await raisePr(record, { approvals: approveAll, runGit, runGh });
+	assert.equal(result.raised, 1);
+	assert.match(result.results[0].reason, /Replied to\/resolved 2\/2 thread/);
+	// A reply POST + a resolve mutation per thread.
+	assert.ok(ghCalls.some((a) => a.join(" ").includes("pulls/1942/comments/111/replies")), "expected reply to human comment");
+	assert.ok(ghCalls.some((a) => a.join(" ").includes("resolveReviewThread")), "expected a resolveReviewThread mutation");
+});
+
+test("a failing reply/resolve never fails the push", async () => {
+	const runGit: CommandRunner = async () => "";
+	const runGh: CommandRunner = async (args) => {
+		if (args.includes("graphql") || args.join(" ").includes("replies")) throw new Error("boom");
+		return "";
+	};
+	const record = baseRecord({
+		sourcePr: {
+			number: 1942,
+			url: "u",
+			headBranch: "guildmaster/fix-x",
+			slug: "grafana/grafana-pathfinder-app",
+			repo: "app",
+			threads: [{ threadId: "T_human", commentId: 111, author: "Jayclifford345" }],
+		},
+	});
+	const result = await raisePr(record, { approvals: approveAll, runGit, runGh });
+	assert.equal(result.raised, 1); // push still succeeded
+	assert.match(result.results[0].reason, /Updated existing PR #1942/);
+	assert.match(result.results[0].reason, /0\/1 thread/);
+});
+
 test("update path refuses (does not force) when push is rejected as non-fast-forward", async () => {
 	const runGit: CommandRunner = async (args) => {
 		if (args.join(" ") === "push") throw new Error("! [rejected] (non-fast-forward)");

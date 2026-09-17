@@ -7,8 +7,10 @@
  * than guessing.
  */
 
+import { execFileSync } from "node:child_process";
 import type { Project, ProjectRepo, RepoContext } from "../persistence/project-store.ts";
 import type { ProjectStore } from "../persistence/project-store.ts";
+import { repoSlugFromRemote } from "../execution/policy.ts";
 
 export interface ProjectResolution {
 	project?: Project;
@@ -64,4 +66,29 @@ export function pickRepo(project: Project, repo?: string): RepoPick {
 /** All of a project's repos as read-only contexts (for investigation across repos). */
 export function readonlyContexts(project: Project): RepoContext[] {
 	return project.repos.map((r) => ({ name: r.name, path: r.path, writable: false }));
+}
+
+/** The GitHub owner/repo slug of a checkout's origin remote, if any. */
+export function repoOriginSlug(repoPath: string): string | undefined {
+	try {
+		const url = execFileSync("git", ["remote", "get-url", "origin"], {
+			cwd: repoPath,
+			encoding: "utf-8",
+			stdio: ["ignore", "pipe", "pipe"],
+		});
+		return repoSlugFromRemote(url);
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Pick the project repo whose origin remote matches a GitHub owner/repo slug
+ * (case-insensitive). Lets an "address-feedback" quest infer the repo straight
+ * from a PR URL instead of the user naming it.
+ */
+export function pickRepoBySlug(project: Project, slug: string | undefined): ProjectRepo | undefined {
+	if (!slug) return undefined;
+	const want = slug.toLowerCase();
+	return project.repos.find((r) => repoOriginSlug(r.path)?.toLowerCase() === want);
 }
