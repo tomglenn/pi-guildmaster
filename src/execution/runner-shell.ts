@@ -137,18 +137,60 @@ export function createRunnerShellTool(opts: { cwd: string; inactivityMs?: number
 
 				let out = "";
 				let terminationReason: TerminationReason = null;
+				let exitCode: number | null = null;
+				let settled = false;
 				let inactivityTimer: ReturnType<typeof setTimeout> | undefined;
 				let totalTimer: ReturnType<typeof setTimeout> | undefined;
 				let graceTimer: ReturnType<typeof setTimeout> | undefined;
+				let drainTimer: ReturnType<typeof setTimeout> | undefined;
+				let forceResolveTimer: ReturnType<typeof setTimeout> | undefined;
 
-				/** Centralized cleanup for all timers and listeners. */
+				/** Clear every timer and stdio listener. Safe to call repeatedly. */
 				const cleanup = () => {
 					if (inactivityTimer) clearTimeout(inactivityTimer);
 					if (totalTimer) clearTimeout(totalTimer);
 					if (graceTimer) clearTimeout(graceTimer);
+					if (drainTimer) clearTimeout(drainTimer);
+					if (forceResolveTimer) clearTimeout(forceResolveTimer);
 					signal?.removeEventListener("abort", onAbort);
 					child.stdout?.removeAllListeners("data");
 					child.stderr?.removeAllListeners("data");
+				};
+
+				/**
+				 * Resolve exactly once and stop caring about the child's stdio.
+				 *
+				 * Crucially this does NOT wait for the stdout/stderr pipes to reach EOF.
+				 * A descendant that escaped our process group (called setsid / was spawned
+				 * detached — e.g. an esbuild or vitest worker, or one of this repo's own
+				 * runner-shell test fixtures) inherits and can hold the write end of the
+				 * pipe open indefinitely. A `close`-gated resolve therefore hangs the
+				 * Runner forever, and a process-group kill can never reach the escapee.
+				 * We finalize on the direct child's `exit` (or a watchdog) and forcibly
+				 * destroy the pipes so a leaked descendant cannot wedge the Quest.
+				 */
+				const finalize = () => {
+					if (settled) return;
+					settled = true;
+					cleanup();
+					try {
+						child.stdout?.destroy();
+						child.stderr?.destroy();
+					} catch {
+						// stream already gone
+					}
+					const body = out.slice(0, maxOutputBytes) || "(no output)";
+					const killedForTotal = terminationReason === "totalTimeout";
+					const killedForHang = terminationReason === "inactivity";
+					const note = killedForTotal
+						? `\n\n[KILLED: exceeded ${Math.round(maxTotalMs / 60000)}m total runtime — treated as non-terminating]`
+						: killedForHang
+							? `\n\n[KILLED: no output for ${Math.round(inactivityMs / 1000)}s — treated as hung/non-terminating]`
+							: `\n\n[exit ${exitCode ?? "?"}]`;
+					resolve({
+						content: [{ type: "text", text: body + note }],
+						details: { exitCode, killedForHang, killedForTotal, terminationReason },
+					});
 				};
 
 				/** Graceful kill with SIGTERM → SIGKILL escalation. Idempotent. */
@@ -156,25 +198,27 @@ export function createRunnerShellTool(opts: { cwd: string; inactivityMs?: number
 					if (terminationReason !== null) return; // Already terminating
 					terminationReason = reason;
 
-					if (!child.pid) {
-						return; // Process hasn't started yet
+					if (child.pid) {
+						if (process.platform === "win32") {
+							// Windows: best-effort tree kill
+							killProcessTree(child.pid, "SIGKILL");
+						} else if (reason === "abort") {
+							// Unix abort: immediate SIGKILL to process group
+							killProcessTree(child.pid, "SIGKILL");
+						} else {
+							// Unix timeout: SIGTERM → grace period → SIGKILL
+							killProcessTree(child.pid, "SIGTERM");
+							graceTimer = setTimeout(() => {
+								if (child.pid) killProcessTree(child.pid, "SIGKILL");
+							}, GRACE_PERIOD_MS);
+						}
 					}
 
-					if (process.platform === "win32") {
-						// Windows: best-effort tree kill
-						killProcessTree(child.pid, "SIGKILL");
-					} else if (reason === "abort") {
-						// Unix abort: immediate SIGKILL to process group
-						killProcessTree(child.pid, "SIGKILL");
-					} else {
-						// Unix timeout: SIGTERM → grace period → SIGKILL
-						killProcessTree(child.pid, "SIGTERM");
-						graceTimer = setTimeout(() => {
-							if (child.pid) {
-								killProcessTree(child.pid, "SIGKILL");
-							}
-						}, GRACE_PERIOD_MS);
-					}
+					// GUARANTEE resolution even if neither `exit` nor `close` ever fires:
+					// a process-group kill cannot reach a descendant that left the group
+					// (setsid/detached) and is holding the stdio pipe open. Without this the
+					// Runner would wait on the child forever. This is the last line of defence.
+					forceResolveTimer = setTimeout(finalize, GRACE_PERIOD_MS + 1000);
 				};
 
 				// Absolute backstop for a command that keeps streaming output but never exits.
@@ -201,33 +245,27 @@ export function createRunnerShellTool(opts: { cwd: string; inactivityMs?: number
 
 				bumpInactivity();
 
-				let resolved = false;
+				// Resolve on the direct child's termination, NOT on stdio EOF. Once the
+				// process we spawned has exited, briefly drain buffered output, then
+				// finalize regardless of whether inherited pipes are still open.
+				child.on("exit", (code: number | null) => {
+					if (exitCode === null) exitCode = code;
+					if (drainTimer) clearTimeout(drainTimer);
+					drainTimer = setTimeout(finalize, 200);
+				});
 
+				// When the pipes DO close cleanly (the normal case) finalize immediately
+				// with the full output rather than waiting out the drain delay.
 				child.on("close", (code: number | null) => {
-					cleanup();
-					if (!resolved) {
-						resolved = true;
-						const body = out.slice(0, maxOutputBytes) || "(no output)";
-						const killedForTotal = terminationReason === "totalTimeout";
-						const killedForHang = terminationReason === "inactivity";
-						const note = killedForTotal
-							? `\n\n[KILLED: exceeded ${Math.round(maxTotalMs / 60000)}m total runtime — treated as non-terminating]`
-							: killedForHang
-								? `\n\n[KILLED: no output for ${Math.round(inactivityMs / 1000)}s — treated as hung/non-terminating]`
-								: `\n\n[exit ${code ?? "?"}]`;
-						resolve({
-							content: [{ type: "text", text: body + note }],
-							details: { exitCode: code, killedForHang, killedForTotal, terminationReason },
-						});
-					}
+					if (exitCode === null) exitCode = code;
+					finalize();
 				});
 
 				child.on("error", (err: Error) => {
+					if (settled) return;
+					settled = true;
 					cleanup();
-					if (!resolved) {
-						resolved = true;
-						resolve({ content: [{ type: "text", text: `Command failed to start: ${err.message}` }], details: { error: true } });
-					}
+					resolve({ content: [{ type: "text", text: `Command failed to start: ${err.message}` }], details: { error: true } });
 				});
 			});
 		},

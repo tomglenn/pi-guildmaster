@@ -144,6 +144,32 @@ test("CI environment is forced to true", { timeout: 10_000 }, async () => {
 	}
 });
 
+// Regression: the direct child exits, but a DETACHED grandchild (setsid/its own
+// process group) inherits and holds the stdout pipe open. Resolving on stdio EOF
+// (`close`) would wedge the Runner until the grandchild dies; resolving on the
+// child's `exit` must return promptly. Mirrors the real hang seen when `npm test`
+// spawned a detached fixture that outlived the pipeline.
+test("resolves on child exit even when a detached grandchild holds the pipe", { timeout: 8_000 }, async () => {
+	const tmpDir = mkdtempSync(join(tmpdir(), "runner-shell-test-"));
+	try {
+		const tool = createRunnerShellTool({ cwd: tmpDir, inactivityMs: 60_000, maxTotalMs: 60_000 });
+		// Parent spawns a detached child that inherits stdout and sleeps 15s, then the
+		// parent exits 0. The inherited pipe stays open long after the parent is gone.
+		const command =
+			"node -e \"const c=require('child_process').spawn(process.execPath,['-e','setTimeout(()=>{},15000)'],{detached:true,stdio:'inherit'});c.unref();console.log('parent done');\"";
+		const start = Date.now();
+		const result = await tool.execute("test-7", { command }, undefined, undefined, mockCtx);
+		const elapsed = Date.now() - start;
+		assert.ok(elapsed < 5000, `expected prompt resolution on child exit, got ${elapsed}ms (pipe-EOF deadlock?)`);
+		assert.equal((result.details as any).exitCode, 0, "expected exit code 0");
+		assert.ok(!(result.details as any).killedForHang, "expected not killed for hang");
+		assert.ok(!(result.details as any).killedForTotal, "expected not killed for total");
+		assert.ok((result.content[0] as any).text.includes("parent done"), "expected parent output captured");
+	} finally {
+		rmSync(tmpDir, { recursive: true, force: true });
+	}
+});
+
 test("abort terminates immediately", { timeout: 10_000 }, async () => {
 	const tmpDir = mkdtempSync(join(tmpdir(), "runner-shell-test-"));
 	try {
