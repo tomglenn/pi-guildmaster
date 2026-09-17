@@ -21,6 +21,10 @@ import { Type } from "typebox";
 
 /** Default: kill after this long with NO output at all (not a total-runtime cap). */
 const DEFAULT_INACTIVITY_MS = 300_000;
+/** Generous absolute backstop: catches a command that STREAMS output forever (e.g. a
+ * server that logs continuously), which the inactivity watchdog alone never reaps.
+ * Set high enough not to kill legitimate long builds/tests. */
+const DEFAULT_MAX_TOTAL_MS = 1_800_000;
 const DEFAULT_MAX_OUTPUT_BYTES = 200_000;
 
 /**
@@ -48,8 +52,9 @@ interface RunnerShellResult {
 	details: Record<string, unknown>;
 }
 
-export function createRunnerShellTool(opts: { cwd: string; inactivityMs?: number; maxOutputBytes?: number }): ToolDefinition {
+export function createRunnerShellTool(opts: { cwd: string; inactivityMs?: number; maxTotalMs?: number; maxOutputBytes?: number }): ToolDefinition {
 	const inactivityMs = opts.inactivityMs ?? DEFAULT_INACTIVITY_MS;
+	const maxTotalMs = opts.maxTotalMs ?? DEFAULT_MAX_TOTAL_MS;
 	const maxOutputBytes = opts.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
 	return defineTool({
 		name: "shell",
@@ -73,7 +78,14 @@ export function createRunnerShellTool(opts: { cwd: string; inactivityMs?: number
 				const child = spawn(params.command, { cwd: opts.cwd, shell: true, stdio: ["ignore", "pipe", "pipe"] });
 				let out = "";
 				let killedForHang = false;
+				let killedForTotal = false;
 				let timer: ReturnType<typeof setTimeout> | undefined;
+
+				// Absolute backstop for a command that keeps streaming output but never exits.
+				const totalTimer = setTimeout(() => {
+					killedForTotal = true;
+					child.kill("SIGKILL");
+				}, maxTotalMs);
 
 				const bump = () => {
 					if (timer) clearTimeout(timer);
@@ -95,15 +107,19 @@ export function createRunnerShellTool(opts: { cwd: string; inactivityMs?: number
 				bump();
 				child.on("close", (code) => {
 					if (timer) clearTimeout(timer);
+					clearTimeout(totalTimer);
 					signal?.removeEventListener("abort", onAbort);
 					const body = out.slice(0, maxOutputBytes) || "(no output)";
-					const note = killedForHang
-						? `\n\n[KILLED: no output for ${Math.round(inactivityMs / 1000)}s — treated as hung/non-terminating]`
-						: `\n\n[exit ${code ?? "?"}]`;
-					resolve({ content: [{ type: "text", text: body + note }], details: { exitCode: code, killedForHang } });
+					const note = killedForTotal
+						? `\n\n[KILLED: exceeded ${Math.round(maxTotalMs / 60000)}m total runtime — treated as non-terminating]`
+						: killedForHang
+							? `\n\n[KILLED: no output for ${Math.round(inactivityMs / 1000)}s — treated as hung/non-terminating]`
+							: `\n\n[exit ${code ?? "?"}]`;
+					resolve({ content: [{ type: "text", text: body + note }], details: { exitCode: code, killedForHang, killedForTotal } });
 				});
 				child.on("error", (err) => {
 					if (timer) clearTimeout(timer);
+					clearTimeout(totalTimer);
 					signal?.removeEventListener("abort", onAbort);
 					resolve({ content: [{ type: "text", text: `Command failed to start: ${err.message}` }], details: { error: true } });
 				});

@@ -23,9 +23,20 @@ test("extractReport extracts the marked body and reports finalized=true", () => 
 	assert.equal(r.body, "# Title\nbody text");
 });
 
-test("extractReport takes the LAST marker when several appear", () => {
-	const r = extractReport("<<<REPORT>>>\nfirst\n<<<END>>>\n<<<REPORT>>>\nsecond\n<<<END>>>");
-	assert.equal(r.body, "second");
+test("extractReport is robust to delimiter tokens quoted inside the body", () => {
+	// The regression: a report ABOUT this machinery quotes the tokens; first-open/
+	// last-close pairing keeps the outermost wrapper so the body is preserved whole.
+	const text = "thinking\n<<<REPORT>>>\nThe extractor matches `<<<REPORT>>>` and `<<<END>>>` tokens.\n<<<END>>>";
+	const r = extractReport(text);
+	assert.equal(r.finalized, true);
+	assert.equal(r.body, "The extractor matches `<<<REPORT>>>` and `<<<END>>>` tokens.");
+});
+
+test("extractReport with a per-run tag ignores generic token mentions before it", () => {
+	const text = "junk <<<REPORT>>> not real\n<<<REPORT:abcd1234>>>\nreal body mentioning <<<REPORT>>>\n<<<END:abcd1234>>>";
+	const r = extractReport(text, "<<<REPORT:abcd1234>>>", "<<<END:abcd1234>>>");
+	assert.equal(r.finalized, true);
+	assert.equal(r.body, "real body mentioning <<<REPORT>>>");
 });
 
 // The incident itself: mid-stream reasoning, run cut off (aborted). Must NOT complete.
@@ -39,7 +50,7 @@ test("incident: mid-stream reasoning + aborted is a failure, not a report", () =
 test("natural stop but no marker still fails (no report is trusted unmarked)", () => {
 	const out = finalizePartyOutcome({ lastText: "I think I'm done but forgot the marker.", stopReason: "endTurn" });
 	assert.equal(out.report, "");
-	assert.match(out.error ?? "", /no <<<REPORT>>> marker/);
+	assert.match(out.error ?? "", /no report delimiter/);
 });
 
 test("a deliberately finalized report completes", () => {

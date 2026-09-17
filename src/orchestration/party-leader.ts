@@ -12,6 +12,7 @@
  * and is deliberately withheld until then, so a Party cannot touch the working tree.
  */
 
+import { randomUUID } from "node:crypto";
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { type GuildmasterConfig, resolveModelSpec } from "../config.ts";
@@ -30,11 +31,17 @@ const DISPATCHABLE_REVIEW: ReadonlySet<string> = new Set(["read-only", "write", 
 
 export interface PartyResult {
 	report: string;
+	/** The leader's RAW final message, before delimiter extraction. Persisted for
+	 * forensics/recovery so a bad extraction is never lossy-without-recovery. */
+	rawFinal: string;
 	members: QuestMember[];
 	usage: { cost: number; turns: number };
 	stopReason?: string;
 	error?: string;
 }
+
+const DEFAULT_OPEN_TAG = "<<<REPORT>>>";
+const DEFAULT_END_TAG = "<<<END>>>";
 
 export interface ExtractedReport {
 	/** The report body: marker-delimited when the leader finalized, else the full text. */
@@ -44,19 +51,21 @@ export interface ExtractedReport {
 }
 
 /**
- * Extract the clean report from the Party Leader's final message. The leader is
- * asked to wrap it in explicit markers; we take what follows the last <<<REPORT>>>
- * (up to <<<END>>>), which strips any preamble/thinking structurally rather than
- * relying on the model to omit it. Crucially it also reports WHETHER the marker was
- * present (`finalized`), so a run that stopped before finalizing is never mistaken
- * for a real report.
+ * Extract the clean report from the Party Leader's final message, wrapped between
+ * `openTag`...`endTag`. Robust to a report whose CONTENT quotes the delimiter
+ * tokens (a report about this very machinery once truncated itself): we pair the
+ * FIRST open with the LAST close, so the outermost wrapper wins and any quoted
+ * mention inside the body is preserved rather than mistaken for the boundary.
+ * Callers pass a per-run unique tag (see runParty), making accidental collision
+ * effectively impossible. Also reports WHETHER the open marker was present
+ * (`finalized`), so a run that stopped before finalizing is never mistaken for a
+ * real report.
  */
-export function extractReport(text: string): ExtractedReport {
-	const startTag = "<<<REPORT>>>";
-	const start = text.lastIndexOf(startTag);
+export function extractReport(text: string, openTag: string = DEFAULT_OPEN_TAG, endTag: string = DEFAULT_END_TAG): ExtractedReport {
+	const start = text.indexOf(openTag);
 	if (start === -1) return { body: text.trim(), finalized: false };
-	let body = text.slice(start + startTag.length);
-	const end = body.indexOf("<<<END>>>");
+	let body = text.slice(start + openTag.length);
+	const end = body.lastIndexOf(endTag);
 	if (end !== -1) body = body.slice(0, end);
 	return { body: body.trim(), finalized: true };
 }
@@ -68,6 +77,9 @@ export interface PartyOutcomeInput {
 	stopReason?: string;
 	/** A transport/model error from the session, if any. */
 	error?: string;
+	/** Per-run report delimiters (default to the plain tokens for tests). */
+	openTag?: string;
+	endTag?: string;
 }
 
 /**
@@ -78,7 +90,7 @@ export interface PartyOutcomeInput {
  * promoted to a "completed" Quest (the failure mode this guards against).
  */
 export function finalizePartyOutcome(input: PartyOutcomeInput): { report: string; error?: string } {
-	const extracted = extractReport(input.lastText);
+	const extracted = extractReport(input.lastText, input.openTag ?? DEFAULT_OPEN_TAG, input.endTag ?? DEFAULT_END_TAG);
 	const failedSignal = /^FAILED:/i.test(extracted.body.trim());
 	const abnormalStop = input.stopReason === "error" || input.stopReason === "aborted";
 	if (input.error || abnormalStop) {
@@ -88,7 +100,7 @@ export function finalizePartyOutcome(input: PartyOutcomeInput): { report: string
 		return { report: "", error: extracted.body.trim().replace(/^FAILED:\s*/i, "") || "Party reported failure without a reason." };
 	}
 	if (!extracted.finalized) {
-		return { report: "", error: "Party stopped before emitting a final report (no <<<REPORT>>> marker)." };
+		return { report: "", error: "Party stopped before emitting a final report (no report delimiter)." };
 	}
 	if (!extracted.body.trim()) {
 		return { report: "", error: "Party emitted an empty report." };
@@ -113,7 +125,7 @@ function buildRepoBlock(contexts: RepoContext[]): string[] {
 	];
 }
 
-function buildSystemPrompt(basePrompt: string, available: Guildmate[], config: GuildmasterConfig, write: boolean, contexts: RepoContext[], instructions?: string, reviewMode = false): string {
+function buildSystemPrompt(basePrompt: string, available: Guildmate[], config: GuildmasterConfig, write: boolean, contexts: RepoContext[], instructions: string | undefined, reviewMode: boolean, openTag: string, endTag: string): string {
 	const roster = available
 		.map((m) => `- ${m.name} [${m.tier}] (model: ${resolveModelSpec(config, m.model) ?? "default"}): ${m.tagline ?? m.description}`)
 		.join("\n");
@@ -184,9 +196,11 @@ function buildSystemPrompt(basePrompt: string, available: Guildmate[], config: G
 			];
 
 	const finalize = [
-		"- Produce the final report as your last message, wrapped EXACTLY between the markers",
-		"  `<<<REPORT>>>` and `<<<END>>>`, with nothing after `<<<END>>>`. Any thinking/preamble must come",
-		"  BEFORE `<<<REPORT>>>`. Note any point Inquisitor left unresolved.",
+		`- Produce the final report as your last message, wrapped EXACTLY between the markers \`${openTag}\``,
+		`  and \`${endTag}\`, with nothing after \`${endTag}\`. Any thinking/preamble must come BEFORE`,
+		`  \`${openTag}\`. These markers are UNIQUE to this run — reproduce them verbatim, exactly once each.`,
+		`  If your report needs to show a report delimiter as an example, write a GENERIC form without the run`,
+		`  id (e.g. <<<REPORT>>>), never these exact run-tagged tokens. Note any point Inquisitor left unresolved.`,
 		"- HONEST FAILURE: if you could not actually complete the task (e.g. the PR could not be acquired),",
 		"  do NOT write a normal report. Instead make the content between the markers begin with `FAILED:`",
 		"  followed by the reason. This records the Quest as failed rather than a false success.",
@@ -307,10 +321,16 @@ export async function runParty(opts: {
 		},
 	});
 
+	// Per-run report delimiters: a random id makes the tokens unique to this run, so a
+	// report that discusses the delimiter machinery cannot collide with its own wrapper.
+	const nonce = randomUUID().slice(0, 8);
+	const openTag = `<<<REPORT:${nonce}>>>`;
+	const endTag = `<<<END:${nonce}>>>`;
+
 	const run = await runSession({
 		// The leader has no file tools; it just needs a valid cwd for session setup.
 		cwd: contexts[0]?.path ?? process.cwd(),
-		systemPrompt: buildSystemPrompt(loadPartyLeaderPrompt() ?? DEFAULT_LEADER_PROMPT, available, opts.config, write, contexts, opts.instructions, reviewMode),
+		systemPrompt: buildSystemPrompt(loadPartyLeaderPrompt() ?? DEFAULT_LEADER_PROMPT, available, opts.config, write, contexts, opts.instructions, reviewMode, openTag, endTag),
 		modelSpec: resolveModelSpec(opts.config, opts.config.partyLeaderModel),
 		tools: ["dispatch"],
 		customTools: [dispatch],
@@ -320,10 +340,13 @@ export async function runParty(opts: {
 
 	const leaderUsage = collectUsage(run.messages);
 	const usage = { cost: memberCost + leaderUsage.cost, turns: leaderUsage.turns };
+	const rawFinal = lastAssistantText(run.messages);
 	const { report, error } = finalizePartyOutcome({
-		lastText: lastAssistantText(run.messages),
+		lastText: rawFinal,
 		stopReason: run.stopReason,
 		error: run.error,
+		openTag,
+		endTag,
 	});
-	return { report, members, usage, stopReason: run.stopReason, error };
+	return { report, rawFinal, members, usage, stopReason: run.stopReason, error };
 }

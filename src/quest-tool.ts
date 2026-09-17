@@ -128,6 +128,15 @@ async function runQuestInBackground(
 			// Persist how the party's run ended, for forensics, before anything can throw.
 			record.stopReason = party.stopReason;
 
+			// Persist the leader's RAW final message before anything can throw. This is the
+			// recovery artifact: even if delimiter extraction truncates or the run failed,
+			// the full report source is on disk (the one lossy-without-recovery gap we hit).
+			try {
+				fs.writeFileSync(path.join(questsDir(), `${record.id}.leader.md`), party.rawFinal ?? "", { mode: 0o600 });
+			} catch {
+				/* best effort */
+			}
+
 			// A party that did not finalize has no trustworthy report: fail honestly rather
 			// than promoting partial/aborted output to a "completed" Quest.
 			if (!party.report?.trim()) {

@@ -18,6 +18,9 @@ import type { ApprovalManager } from "./approvals.ts";
 
 const execFileAsync = promisify(execFile);
 
+/** Network ops (git push, gh pr create) must not hang forever: bound them. */
+const NETWORK_TIMEOUT_MS = 120_000;
+
 export type CommandRunner = (args: string[], cwd: string) => Promise<string>;
 
 export interface PrDeps {
@@ -43,8 +46,8 @@ export interface RaiseResult {
 	results: RaisedRepo[];
 }
 
-const realGit: CommandRunner = async (args, cwd) => (await execFileAsync("git", args, { cwd })).stdout;
-const realGh: CommandRunner = async (args, cwd) => (await execFileAsync("gh", args, { cwd })).stdout;
+const realGit: CommandRunner = async (args, cwd) => (await execFileAsync("git", args, { cwd, timeout: NETWORK_TIMEOUT_MS })).stdout;
+const realGh: CommandRunner = async (args, cwd) => (await execFileAsync("gh", args, { cwd, timeout: NETWORK_TIMEOUT_MS })).stdout;
 
 /**
  * Raise every un-raised repo PR for a (possibly cross-repo) write-Quest. Each repo
