@@ -284,7 +284,7 @@ export async function runParty(opts: {
 							}),
 						]
 					: mate.tier === "exec"
-						? [createRunnerShellTool({ cwd: context.path })]
+						? [createRunnerShellTool({ cwd: context.path, ...opts.config.shell })]
 						: undefined;
 
 			// Requirement fidelity: write/exec members act on the code, so they must see the quest's

@@ -7,5 +7,10 @@
     "coding": "anthropic/claude-sonnet-4-5"
   },
   "guildmasterModel": "capable",
-  "partyLeaderModel": "reasoning"
+  "partyLeaderModel": "reasoning",
+  "shell": {
+    "inactivityMs": 300000,
+    "maxTotalMs": 1800000,
+    "maxOutputBytes": 200000
+  }
 }

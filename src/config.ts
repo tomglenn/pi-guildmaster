@@ -23,6 +23,15 @@ export interface GuildmasterConfig {
 	guildmasterModel: string;
 	/** Model used by the Party Leader. Alias or explicit. */
 	partyLeaderModel: string;
+	/** Shell execution timeouts for the runner (in milliseconds). */
+	shell?: {
+		/** Maximum time without output before killing (default: 300000 = 5 minutes). */
+		inactivityMs?: number;
+		/** Maximum total runtime before killing (default: 1800000 = 30 minutes). */
+		maxTotalMs?: number;
+		/** Maximum output bytes to capture (default: 200000). */
+		maxOutputBytes?: number;
+	};
 }
 
 /**
@@ -48,6 +57,11 @@ export interface ProjectConfigOverride {
 	models?: Record<string, string>;
 	guildmasterModel?: string;
 	partyLeaderModel?: string;
+	shell?: {
+		inactivityMs?: number;
+		maxTotalMs?: number;
+		maxOutputBytes?: number;
+	};
 }
 
 /** Merge a project's overrides over the global config. Returns a new config. */
@@ -57,6 +71,7 @@ export function effectiveConfig(base: GuildmasterConfig, overrides?: ProjectConf
 		models: { ...base.models, ...(overrides.models ?? {}) },
 		guildmasterModel: overrides.guildmasterModel ?? base.guildmasterModel,
 		partyLeaderModel: overrides.partyLeaderModel ?? base.partyLeaderModel,
+		shell: overrides.shell ? { ...base.shell, ...overrides.shell } : base.shell,
 	};
 }
 
@@ -69,9 +84,10 @@ export function loadConfig(): GuildmasterConfig {
 			models: { ...DEFAULT_CONFIG.models, ...(parsed.models ?? {}) },
 			guildmasterModel: parsed.guildmasterModel ?? DEFAULT_CONFIG.guildmasterModel,
 			partyLeaderModel: parsed.partyLeaderModel ?? DEFAULT_CONFIG.partyLeaderModel,
+			shell: parsed.shell ? { ...parsed.shell } : undefined,
 		};
 	} catch {
-		return { ...DEFAULT_CONFIG, models: { ...DEFAULT_CONFIG.models } };
+		return { ...DEFAULT_CONFIG, models: { ...DEFAULT_CONFIG.models }, shell: undefined };
 	}
 }
 

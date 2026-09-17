@@ -15,7 +15,7 @@
  *      stretch. A build streaming progress survives; a silently hung process does not.
  */
 
-import { spawn } from "node:child_process";
+import { spawn, execSync } from "node:child_process";
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
@@ -26,6 +26,59 @@ const DEFAULT_INACTIVITY_MS = 300_000;
  * Set high enough not to kill legitimate long builds/tests. */
 const DEFAULT_MAX_TOTAL_MS = 1_800_000;
 const DEFAULT_MAX_OUTPUT_BYTES = 200_000;
+/** Grace period for SIGTERM → SIGKILL escalation on Unix. */
+const GRACE_PERIOD_MS = 5000;
+/** Minimum inactivity timeout (10 seconds). */
+const MIN_INACTIVITY_MS = 10_000;
+/** Minimum total timeout (30 seconds). */
+const MIN_MAX_TOTAL_MS = 30_000;
+
+type TerminationReason = "inactivity" | "totalTimeout" | "abort" | null;
+
+/**
+ * Clamp shell config values to safe minimums.
+ */
+function clampShellConfig(config: { inactivityMs?: number; maxTotalMs?: number; maxOutputBytes?: number }): {
+	inactivityMs: number;
+	maxTotalMs: number;
+	maxOutputBytes: number;
+} {
+	return {
+		inactivityMs: Math.max(config.inactivityMs ?? DEFAULT_INACTIVITY_MS, MIN_INACTIVITY_MS),
+		maxTotalMs: Math.max(config.maxTotalMs ?? DEFAULT_MAX_TOTAL_MS, MIN_MAX_TOTAL_MS),
+		maxOutputBytes: config.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES,
+	};
+}
+
+/**
+ * Kill a process tree. On Unix, sends signal to process group. On Windows, uses taskkill.
+ */
+function killProcessTree(pid: number, signal: NodeJS.Signals): void {
+	try {
+		if (process.platform === "win32") {
+			// Best-effort tree kill on Windows
+			if (signal === "SIGKILL") {
+				try {
+					execSync(`taskkill /PID ${pid} /T /F`, { stdio: "ignore" });
+				} catch {
+					// Fallback to simple kill
+					process.kill(pid, signal);
+				}
+			} else {
+				process.kill(pid, signal);
+			}
+		} else {
+			// Unix: kill the process group (negative pid)
+			process.kill(-pid, signal);
+		}
+	} catch (err: unknown) {
+		// Silently ignore ESRCH (process not found) and EPERM (permission denied)
+		const code = (err as { code?: string }).code;
+		if (code !== "ESRCH" && code !== "EPERM") {
+			// Unexpected error, but don't crash
+		}
+	}
+}
 
 /**
  * Classify a command as non-terminating. Returns a one-shot hint if it must be
@@ -53,9 +106,7 @@ interface RunnerShellResult {
 }
 
 export function createRunnerShellTool(opts: { cwd: string; inactivityMs?: number; maxTotalMs?: number; maxOutputBytes?: number }): ToolDefinition {
-	const inactivityMs = opts.inactivityMs ?? DEFAULT_INACTIVITY_MS;
-	const maxTotalMs = opts.maxTotalMs ?? DEFAULT_MAX_TOTAL_MS;
-	const maxOutputBytes = opts.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
+	const { inactivityMs, maxTotalMs, maxOutputBytes } = clampShellConfig(opts);
 	return defineTool({
 		name: "shell",
 		label: "Shell (bounded)",
@@ -66,7 +117,7 @@ export function createRunnerShellTool(opts: { cwd: string; inactivityMs?: number
 		parameters: Type.Object({
 			command: Type.String({ description: "The shell command to run. Must terminate on its own." }),
 		}),
-		execute: async (_toolCallId, params, signal) => {
+		execute: async (_toolCallId, params, signal, _onUpdate, _ctx) => {
 			const hint = nonTerminatingHint(params.command);
 			if (hint) {
 				return {
@@ -75,53 +126,108 @@ export function createRunnerShellTool(opts: { cwd: string; inactivityMs?: number
 				};
 			}
 			return await new Promise<RunnerShellResult>((resolve) => {
-				const child = spawn(params.command, { cwd: opts.cwd, shell: true, stdio: ["ignore", "pipe", "pipe"] });
+				const spawnOpts = {
+					cwd: opts.cwd,
+					shell: true,
+					stdio: ["ignore", "pipe", "pipe"] as ["ignore", "pipe", "pipe"],
+					detached: process.platform !== "win32",
+					env: { ...process.env, CI: "true" },
+				};
+				const child = spawn(params.command, [], spawnOpts);
+
 				let out = "";
-				let killedForHang = false;
-				let killedForTotal = false;
-				let timer: ReturnType<typeof setTimeout> | undefined;
+				let terminationReason: TerminationReason = null;
+				let inactivityTimer: ReturnType<typeof setTimeout> | undefined;
+				let totalTimer: ReturnType<typeof setTimeout> | undefined;
+				let graceTimer: ReturnType<typeof setTimeout> | undefined;
+
+				/** Centralized cleanup for all timers and listeners. */
+				const cleanup = () => {
+					if (inactivityTimer) clearTimeout(inactivityTimer);
+					if (totalTimer) clearTimeout(totalTimer);
+					if (graceTimer) clearTimeout(graceTimer);
+					signal?.removeEventListener("abort", onAbort);
+					child.stdout?.removeAllListeners("data");
+					child.stderr?.removeAllListeners("data");
+				};
+
+				/** Graceful kill with SIGTERM → SIGKILL escalation. Idempotent. */
+				const killGracefully = (reason: TerminationReason) => {
+					if (terminationReason !== null) return; // Already terminating
+					terminationReason = reason;
+
+					if (!child.pid) {
+						return; // Process hasn't started yet
+					}
+
+					if (process.platform === "win32") {
+						// Windows: best-effort tree kill
+						killProcessTree(child.pid, "SIGKILL");
+					} else if (reason === "abort") {
+						// Unix abort: immediate SIGKILL to process group
+						killProcessTree(child.pid, "SIGKILL");
+					} else {
+						// Unix timeout: SIGTERM → grace period → SIGKILL
+						killProcessTree(child.pid, "SIGTERM");
+						graceTimer = setTimeout(() => {
+							if (child.pid) {
+								killProcessTree(child.pid, "SIGKILL");
+							}
+						}, GRACE_PERIOD_MS);
+					}
+				};
 
 				// Absolute backstop for a command that keeps streaming output but never exits.
-				const totalTimer = setTimeout(() => {
-					killedForTotal = true;
-					child.kill("SIGKILL");
+				totalTimer = setTimeout(() => {
+					killGracefully("totalTimeout");
 				}, maxTotalMs);
 
-				const bump = () => {
-					if (timer) clearTimeout(timer);
-					timer = setTimeout(() => {
-						killedForHang = true;
-						child.kill("SIGKILL");
+				const bumpInactivity = () => {
+					if (inactivityTimer) clearTimeout(inactivityTimer);
+					inactivityTimer = setTimeout(() => {
+						killGracefully("inactivity");
 					}, inactivityMs);
 				};
+
 				const onData = (d: Buffer) => {
 					if (out.length < maxOutputBytes) out += d.toString();
-					bump();
+					bumpInactivity();
 				};
 				child.stdout?.on("data", onData);
 				child.stderr?.on("data", onData);
 
-				const onAbort = () => child.kill("SIGKILL");
+				const onAbort = () => killGracefully("abort");
 				signal?.addEventListener("abort", onAbort, { once: true });
 
-				bump();
-				child.on("close", (code) => {
-					if (timer) clearTimeout(timer);
-					clearTimeout(totalTimer);
-					signal?.removeEventListener("abort", onAbort);
-					const body = out.slice(0, maxOutputBytes) || "(no output)";
-					const note = killedForTotal
-						? `\n\n[KILLED: exceeded ${Math.round(maxTotalMs / 60000)}m total runtime — treated as non-terminating]`
-						: killedForHang
-							? `\n\n[KILLED: no output for ${Math.round(inactivityMs / 1000)}s — treated as hung/non-terminating]`
-							: `\n\n[exit ${code ?? "?"}]`;
-					resolve({ content: [{ type: "text", text: body + note }], details: { exitCode: code, killedForHang, killedForTotal } });
+				bumpInactivity();
+
+				let resolved = false;
+
+				child.on("close", (code: number | null) => {
+					cleanup();
+					if (!resolved) {
+						resolved = true;
+						const body = out.slice(0, maxOutputBytes) || "(no output)";
+						const killedForTotal = terminationReason === "totalTimeout";
+						const killedForHang = terminationReason === "inactivity";
+						const note = killedForTotal
+							? `\n\n[KILLED: exceeded ${Math.round(maxTotalMs / 60000)}m total runtime — treated as non-terminating]`
+							: killedForHang
+								? `\n\n[KILLED: no output for ${Math.round(inactivityMs / 1000)}s — treated as hung/non-terminating]`
+								: `\n\n[exit ${code ?? "?"}]`;
+						resolve({
+							content: [{ type: "text", text: body + note }],
+							details: { exitCode: code, killedForHang, killedForTotal, terminationReason },
+						});
+					}
 				});
-				child.on("error", (err) => {
-					if (timer) clearTimeout(timer);
-					clearTimeout(totalTimer);
-					signal?.removeEventListener("abort", onAbort);
-					resolve({ content: [{ type: "text", text: `Command failed to start: ${err.message}` }], details: { error: true } });
+
+				child.on("error", (err: Error) => {
+					cleanup();
+					if (!resolved) {
+						resolved = true;
+						resolve({ content: [{ type: "text", text: `Command failed to start: ${err.message}` }], details: { error: true } });
+					}
 				});
 			});
 		},
