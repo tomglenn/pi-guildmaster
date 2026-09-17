@@ -103,15 +103,18 @@ function assertValid(record: QuestRecord): void {
 
 export class QuestStore {
 	private readonly dir: string;
-	private saveListener: ((record: QuestRecord) => void) | undefined;
+	private readonly saveListeners = new Set<(record: QuestRecord) => void>();
 
 	constructor(dir: string = questsDir()) {
 		this.dir = dir;
 	}
 
-	/** Register a listener that fires after each successful save. */
-	onSave(listener: (record: QuestRecord) => void): void {
-		this.saveListener = listener;
+	/** Register a listener that fires after each successful save. Returns an unsubscribe function. */
+	onSave(listener: (record: QuestRecord) => void): () => void {
+		this.saveListeners.add(listener);
+		return () => {
+			this.saveListeners.delete(listener);
+		};
 	}
 
 	private filePath(id: string): string {
@@ -126,7 +129,9 @@ export class QuestStore {
 		const tmp = this.filePath(`.${record.id}.tmp`);
 		fs.writeFileSync(tmp, JSON.stringify(record, null, 2), { encoding: "utf-8", mode: 0o600 });
 		fs.renameSync(tmp, this.filePath(record.id));
-		this.saveListener?.(record);
+		for (const listener of this.saveListeners) {
+			listener(record);
+		}
 		return record;
 	}
 

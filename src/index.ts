@@ -30,43 +30,7 @@ import { ensureGuildSeeded, loadGuildmasterPrompt } from "./roster.ts";
 import { getStatusSurface } from "./status.ts";
 import { registerInfoCard } from "./ui.ts";
 
-/**
- * In-memory cache for persona + projects. Eliminates synchronous filesystem
- * I/O on every turn's before_agent_start hook. Cache expires after TTL.
- */
-interface PromptCache {
-	persona?: string;
-	projects: Project[];
-	timestamp: number;
-}
 
-let promptCache: PromptCache | undefined;
-const PROMPT_CACHE_TTL = 60_000; // 1 minute
-
-function getCachedPromptData(): PromptCache {
-	const now = Date.now();
-	if (promptCache && (now - promptCache.timestamp) < PROMPT_CACHE_TTL) {
-		return promptCache;
-	}
-	
-	// Load fresh data
-	let persona: string | undefined;
-	try {
-		persona = loadGuildmasterPrompt();
-	} catch (err) {
-		console.error("[guildmaster] Failed to load persona:", err);
-	}
-
-	let projects: Project[] = [];
-	try {
-		projects = new ProjectStore().list();
-	} catch (err) {
-		console.error("[guildmaster] Failed to load projects:", err);
-	}
-
-	promptCache = { persona, projects, timestamp: now };
-	return promptCache;
-}
 
 export default function guildmaster(pi: ExtensionAPI): void {
 	// Seed the durable user-owned guild directory once. Filesystem-only and
@@ -90,18 +54,25 @@ export default function guildmaster(pi: ExtensionAPI): void {
 	// Uses in-memory cache to avoid synchronous disk I/O on the turn-start path.
 	pi.on("before_agent_start", async (event) => {
 		try {
-			// Build prompt from cached data, never reject or hang
+			// Build prompt from cached persona + ProjectStore's cached projects
 			const parts: string[] = [];
-			const cached = getCachedPromptData();
 
-			// Add persona if available
-			if (cached.persona) {
-				parts.push(cached.persona);
+			// Add persona if available (uses roster.ts cache)
+			const persona = loadGuildmasterPrompt();
+			if (persona) {
+				parts.push(persona);
 			}
 
-			// Add projects block
-			const projectBlock = cached.projects.length > 0
-				? `## Registered projects\n${cached.projects
+			// Add projects block (ProjectStore.list() uses its own cache)
+			let projects: Project[] = [];
+			try {
+				projects = new ProjectStore().list();
+			} catch (err) {
+				console.error("[guildmaster] Failed to load projects:", err);
+			}
+
+			const projectBlock = projects.length > 0
+				? `## Registered projects\n${projects
 						.map(
 							(p) =>
 								`- ${p.id}${p.aliases?.length ? ` (aka ${p.aliases.join(", ")})` : ""}: ${p.description ?? p.name} — repos: ${p.repos.map((r) => r.name).join(", ")}`,

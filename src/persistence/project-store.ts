@@ -105,7 +105,8 @@ export class ProjectStore {
 		if (isDefault && defaultDirCache && defaultDirCache.dir === defaultDir) {
 			const age = Date.now() - defaultDirCache.timestamp;
 			if (age < CACHE_TTL) {
-				return [...defaultDirCache.projects]; // Return a copy to prevent mutation
+				// Return a deep clone to prevent cache corruption
+				return JSON.parse(JSON.stringify(defaultDirCache.projects)) as Project[];
 			}
 		}
 
@@ -123,12 +124,13 @@ export class ProjectStore {
 		}
 		const result = out.sort((a, b) => a.name.localeCompare(b.name));
 
-		// Cache if this is the default directory
+		// Cache if this is the default directory - store a clone
 		if (isDefault) {
-			defaultDirCache = { dir: defaultDir, projects: [...result], timestamp: Date.now() };
+			defaultDirCache = { dir: defaultDir, projects: result, timestamp: Date.now() };
 		}
 
-		return result;
+		// Always return a deep clone to prevent cache corruption from caller mutations
+		return JSON.parse(JSON.stringify(result)) as Project[];
 	}
 
 	remove(id: string): void {

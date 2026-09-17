@@ -54,6 +54,10 @@ interface RosterCache {
 	roster: Guildmate[];
 	guildmasterPrompt?: string;
 	partyLeaderPrompt?: string;
+	/** Flag to track if guildmaster prompt has been loaded (undefined vs not-yet-loaded). */
+	guildmasterLoaded: boolean;
+	/** Flag to track if party leader prompt has been loaded (undefined vs not-yet-loaded). */
+	partyLeaderLoaded: boolean;
 	timestamp: number;
 }
 
@@ -136,7 +140,7 @@ export function loadRoster(): Guildmate[] {
 	
 	// Update cache, preserving prompts if they exist
 	if (!rosterCache) {
-		rosterCache = { roster, timestamp: now };
+		rosterCache = { roster, guildmasterLoaded: false, partyLeaderLoaded: false, timestamp: now };
 	} else {
 		rosterCache.roster = roster;
 		rosterCache.timestamp = now;
@@ -162,7 +166,7 @@ function loadPromptBody(filePath: string): string | undefined {
 /** Load Guildmaster prompt, using cache if available and fresh. */
 export function loadGuildmasterPrompt(): string | undefined {
 	const now = Date.now();
-	if (rosterCache && rosterCache.guildmasterPrompt !== undefined && (now - rosterCache.timestamp) < ROSTER_CACHE_TTL) {
+	if (rosterCache && rosterCache.guildmasterLoaded && (now - rosterCache.timestamp) < ROSTER_CACHE_TTL) {
 		return rosterCache.guildmasterPrompt;
 	}
 	
@@ -170,9 +174,11 @@ export function loadGuildmasterPrompt(): string | undefined {
 	
 	// Update cache
 	if (!rosterCache) {
-		rosterCache = { roster: [], guildmasterPrompt: prompt, timestamp: now };
+		rosterCache = { roster: [], guildmasterPrompt: prompt, guildmasterLoaded: true, partyLeaderLoaded: false, timestamp: now };
 	} else {
 		rosterCache.guildmasterPrompt = prompt;
+		rosterCache.guildmasterLoaded = true;
+		rosterCache.timestamp = Date.now();
 	}
 	
 	return prompt;
@@ -181,7 +187,7 @@ export function loadGuildmasterPrompt(): string | undefined {
 /** Load Party Leader prompt, using cache if available and fresh. */
 export function loadPartyLeaderPrompt(): string | undefined {
 	const now = Date.now();
-	if (rosterCache && rosterCache.partyLeaderPrompt !== undefined && (now - rosterCache.timestamp) < ROSTER_CACHE_TTL) {
+	if (rosterCache && rosterCache.partyLeaderLoaded && (now - rosterCache.timestamp) < ROSTER_CACHE_TTL) {
 		return rosterCache.partyLeaderPrompt;
 	}
 	
@@ -189,9 +195,11 @@ export function loadPartyLeaderPrompt(): string | undefined {
 	
 	// Update cache
 	if (!rosterCache) {
-		rosterCache = { roster: [], partyLeaderPrompt: prompt, timestamp: now };
+		rosterCache = { roster: [], partyLeaderPrompt: prompt, guildmasterLoaded: false, partyLeaderLoaded: true, timestamp: now };
 	} else {
 		rosterCache.partyLeaderPrompt = prompt;
+		rosterCache.partyLeaderLoaded = true;
+		rosterCache.timestamp = Date.now();
 	}
 	
 	return prompt;

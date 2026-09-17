@@ -153,12 +153,11 @@ export class StatusSurface {
 	private scheduleRepaint(): void {
 		if (this.repaintScheduled) return;
 		this.repaintScheduled = true;
-		// Use setImmediate for next-tick coalescing (faster than setTimeout)
 		this.repaintTimer = setTimeout(() => {
 			this.repaintScheduled = false;
 			this.repaintTimer = undefined;
 			this.doRepaint();
-		}, 0);
+		}, 16);
 	}
 
 	private onQuestChange(record: QuestRecord): void {
