@@ -5,6 +5,10 @@
  * shape Pi's own `subagent` example uses), so they are user-editable and durable
  * (§2, §14). The two non-roster agents (Guildmaster, Party Leader) live alongside
  * the roster as guildmaster.md / party-leader.md.
+ *
+ * PERFORMANCE FIX: Added in-memory caching for roster and prompts to avoid
+ * synchronous filesystem I/O on every turn. Cache invalidated on /reload or
+ * when TTL expires.
  */
 
 import * as fs from "node:fs";
@@ -45,6 +49,22 @@ function asString(value: unknown): string | undefined {
 	return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
+/** In-memory cache for roster and prompts to avoid repeated synchronous disk reads. */
+interface RosterCache {
+	roster: Guildmate[];
+	guildmasterPrompt?: string;
+	partyLeaderPrompt?: string;
+	timestamp: number;
+}
+
+let rosterCache: RosterCache | undefined;
+const ROSTER_CACHE_TTL = 60_000; // 1 minute
+
+/** Invalidate the roster cache (called on /reload). */
+export function invalidateRosterCache(): void {
+	rosterCache = undefined;
+}
+
 /**
  * Seed the durable user-owned guild directory from bundled defaults on first
  * use. Never overwrites existing files, so user customization survives upgrades.
@@ -56,6 +76,8 @@ export function ensureGuildSeeded(): boolean {
 	const src = path.join(ASSETS_DIR, "guild");
 	fs.mkdirSync(path.dirname(dest), { recursive: true });
 	fs.cpSync(src, dest, { recursive: true });
+	// Invalidate cache since we just wrote new files
+	invalidateRosterCache();
 	return true;
 }
 
@@ -83,7 +105,7 @@ function loadGuildmateFile(filePath: string): Guildmate | null {
 }
 
 /** Load the full roster of Guildmates from <guildHome>/guild/roster/*.md. */
-export function loadRoster(): Guildmate[] {
+function loadRosterUncached(): Guildmate[] {
 	const dir = rosterDir();
 	let entries: fs.Dirent[];
 	try {
@@ -102,6 +124,27 @@ export function loadRoster(): Guildmate[] {
 	return roster;
 }
 
+/** Load the full roster of Guildmates, using cache if available and fresh. */
+export function loadRoster(): Guildmate[] {
+	const now = Date.now();
+	if (rosterCache && (now - rosterCache.timestamp) < ROSTER_CACHE_TTL) {
+		return [...rosterCache.roster]; // Return a copy to prevent mutation
+	}
+	
+	// Load fresh data
+	const roster = loadRosterUncached();
+	
+	// Update cache, preserving prompts if they exist
+	if (!rosterCache) {
+		rosterCache = { roster, timestamp: now };
+	} else {
+		rosterCache.roster = roster;
+		rosterCache.timestamp = now;
+	}
+	
+	return [...roster];
+}
+
 export function findGuildmate(roster: Guildmate[], name: string): Guildmate | undefined {
 	return roster.find((m) => m.name.toLowerCase() === name.toLowerCase());
 }
@@ -116,10 +159,40 @@ function loadPromptBody(filePath: string): string | undefined {
 	}
 }
 
+/** Load Guildmaster prompt, using cache if available and fresh. */
 export function loadGuildmasterPrompt(): string | undefined {
-	return loadPromptBody(guildmasterPromptPath());
+	const now = Date.now();
+	if (rosterCache && rosterCache.guildmasterPrompt !== undefined && (now - rosterCache.timestamp) < ROSTER_CACHE_TTL) {
+		return rosterCache.guildmasterPrompt;
+	}
+	
+	const prompt = loadPromptBody(guildmasterPromptPath());
+	
+	// Update cache
+	if (!rosterCache) {
+		rosterCache = { roster: [], guildmasterPrompt: prompt, timestamp: now };
+	} else {
+		rosterCache.guildmasterPrompt = prompt;
+	}
+	
+	return prompt;
 }
 
+/** Load Party Leader prompt, using cache if available and fresh. */
 export function loadPartyLeaderPrompt(): string | undefined {
-	return loadPromptBody(partyLeaderPromptPath());
+	const now = Date.now();
+	if (rosterCache && rosterCache.partyLeaderPrompt !== undefined && (now - rosterCache.timestamp) < ROSTER_CACHE_TTL) {
+		return rosterCache.partyLeaderPrompt;
+	}
+	
+	const prompt = loadPromptBody(partyLeaderPromptPath());
+	
+	// Update cache
+	if (!rosterCache) {
+		rosterCache = { roster: [], partyLeaderPrompt: prompt, timestamp: now };
+	} else {
+		rosterCache.partyLeaderPrompt = prompt;
+	}
+	
+	return prompt;
 }

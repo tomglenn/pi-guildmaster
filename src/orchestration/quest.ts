@@ -44,9 +44,12 @@ export class QuestManager {
 	readonly store: QuestStore;
 	private readonly active = new Map<string, ActiveQuest>();
 	private readonly listeners = new Set<(record: QuestRecord) => void>();
+	private readonly recordCache = new Map<string, QuestRecord>();
+	private cacheHydrated = false;
 
 	constructor(store: QuestStore = new QuestStore()) {
 		this.store = store;
+		this.store.onSave((record) => this.updateCache(record));
 	}
 
 	/** Subscribe to any quest change (create + every persisted transition). */
@@ -57,6 +60,30 @@ export class QuestManager {
 
 	private emit(record: QuestRecord): void {
 		for (const l of this.listeners) l(record);
+	}
+
+	private updateCache(record: QuestRecord): void {
+		if (record.acknowledgedAt) {
+			this.recordCache.delete(record.id);
+		} else {
+			this.recordCache.set(record.id, record);
+		}
+	}
+
+	private hydrateCache(): void {
+		if (this.cacheHydrated) return;
+		this.cacheHydrated = true;
+		for (const rec of this.store.list()) {
+			if (this.active.has(rec.id) || (isTerminal(rec.state) && !rec.acknowledgedAt)) {
+				this.recordCache.set(rec.id, rec);
+			}
+		}
+	}
+
+	/** Get all records that should appear on the Guild board (active + unacknowledged terminal). */
+	getBoardRecords(): QuestRecord[] {
+		this.hydrateCache();
+		return [...this.recordCache.values()];
 	}
 
 	create(input: { cwd: string; title: string; brief: string; project?: string }): QuestRecord {
@@ -78,7 +105,9 @@ export class QuestManager {
 	}
 
 	getActive(): QuestRecord[] {
-		return [...this.active.keys()].map((id) => this.store.load(id)).filter((r): r is QuestRecord => Boolean(r));
+		return [...this.active.keys()]
+			.map((id) => this.recordCache.get(id))
+			.filter((r): r is QuestRecord => Boolean(r));
 	}
 
 	cancel(id: string): boolean {
@@ -119,6 +148,7 @@ export class QuestManager {
 			/* ignore */
 		}
 		this.store.delete(id);
+		this.recordCache.delete(id); // Remove from cache since it's deleted
 		record.state = "cancelled";
 		this.emit(record); // listeners recompute from store (now empty of this id) and repaint
 		return { record, cancelledRunning: false, tornDown, inPlaceKept };

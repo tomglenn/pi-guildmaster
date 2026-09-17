@@ -10,6 +10,11 @@
  *
  * Toasts fire only on the moments that need the user or are done (needs-approval,
  * completed, failed) — live churn stays in the widget, never as toast spam.
+ *
+ * PERFORMANCE FIX: This module previously re-read the entire quest store from
+ * disk on every member status change via repaint() → QuestStore.list(). Now it
+ * renders from the QuestManager's in-memory recordCache, and coalesces bursts
+ * of repaints via scheduleRepaint() to avoid synchronous disk I/O storms.
  */
 
 import { type ExtensionAPI, type ExtensionContext, getMarkdownTheme, type ThemeColor } from "@earendil-works/pi-coding-agent";
@@ -115,6 +120,8 @@ export class StatusSurface {
 	private readonly questStates = new Map<string, string>();
 	private knownApprovals = new Set<string>();
 	private initialized = false;
+	private repaintScheduled = false;
+	private repaintTimer: ReturnType<typeof setTimeout> | undefined;
 
 	/** Wire subscriptions once. The quest card renderer is registered here too. */
 	init(pi: ExtensionAPI): void {
@@ -138,6 +145,22 @@ export class StatusSurface {
 		this.repaint();
 	}
 
+	/**
+	 * Schedule a debounced repaint. Collapses bursts of changes (e.g. multiple
+	 * party members finishing in quick succession) into a single repaint to avoid
+	 * synchronous I/O storms on the event loop.
+	 */
+	private scheduleRepaint(): void {
+		if (this.repaintScheduled) return;
+		this.repaintScheduled = true;
+		// Use setImmediate for next-tick coalescing (faster than setTimeout)
+		this.repaintTimer = setTimeout(() => {
+			this.repaintScheduled = false;
+			this.repaintTimer = undefined;
+			this.doRepaint();
+		}, 0);
+	}
+
 	private onQuestChange(record: QuestRecord): void {
 		const prev = this.questStates.get(record.id);
 		if (prev !== record.state) {
@@ -152,7 +175,7 @@ export class StatusSurface {
 				this.notify(`Quest "${record.title}" is awaiting approval.`, "warning");
 			}
 		}
-		this.repaint();
+		this.scheduleRepaint();
 	}
 
 	private onApprovalChange(): void {
@@ -161,7 +184,7 @@ export class StatusSurface {
 			if (!this.knownApprovals.has(a.id)) this.notify(`Approval needed — /approve ${a.id}  (${a.title})`, "warning");
 		}
 		this.knownApprovals = new Set(current.map((a) => a.id));
-		this.repaint();
+		this.scheduleRepaint();
 	}
 
 	private notify(text: string, level: "info" | "warning" | "error"): void {
@@ -174,15 +197,30 @@ export class StatusSurface {
 
 	/** Recompute and repaint the board + footer. Safe to call anytime. */
 	repaint(): void {
+		if (this.repaintTimer) {
+			clearTimeout(this.repaintTimer);
+			this.repaintTimer = undefined;
+			this.repaintScheduled = false;
+		}
+		this.doRepaint();
+	}
+
+	/**
+	 * Perform the actual repaint. Uses QuestManager's in-memory recordCache
+	 * instead of reading from disk to avoid synchronous I/O on the event loop.
+	 */
+	private doRepaint(): void {
 		if (!this.ctx) return;
 		const quests = getQuestManager();
 		const active = quests.getActive();
 		const pending = getApprovalManager().list();
 		// Finished Quests persist on the board until the user turns them in (§ turn-in),
 		// so a completion (or a cancellation from a reload) is never missed while multitasking.
-		const done = quests.store
-			.list()
-			.filter((q) => (q.state === "completed" || q.state === "failed" || q.state === "cancelled") && !q.acknowledgedAt);
+		// Use getBoardRecords() which reads from the manager's in-memory cache, not disk.
+		const boardRecords = quests.getBoardRecords();
+		const done = boardRecords.filter(
+			(q) => (q.state === "completed" || q.state === "failed" || q.state === "cancelled") && !q.acknowledgedAt
+		);
 
 		if (active.length === 0 && pending.length === 0 && done.length === 0) {
 			this.ctx.ui.setWidget(WIDGET, undefined);
@@ -194,7 +232,7 @@ export class StatusSurface {
 		const lineage: Record<string, string> = {};
 		for (const q of [...active, ...done]) {
 			if (q.parentId) {
-				const p = quests.store.load(q.parentId);
+				const p = boardRecords.find((r) => r.id === q.parentId);
 				if (p) lineage[q.id] = p.title;
 			}
 		}

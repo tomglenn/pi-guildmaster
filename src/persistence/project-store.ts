@@ -12,6 +12,15 @@ import type { ProjectConfigOverride } from "../config.ts";
 import { projectsDir } from "../paths.ts";
 import { slugify } from "../execution/isolation.ts";
 
+/** Cache for the default projects directory to avoid repeated synchronous fs reads. */
+let defaultDirCache: { dir: string; projects: Project[]; timestamp: number } | undefined;
+const CACHE_TTL = 60_000; // 1 minute
+
+/** Invalidate the project cache (used by reload command). */
+export function invalidateProjectCache(): void {
+	defaultDirCache = undefined;
+}
+
 export interface ProjectRepo {
 	name: string;
 	path: string;
@@ -73,6 +82,10 @@ export class ProjectStore {
 		const tmp = this.filePath(`.${project.id}.tmp`);
 		fs.writeFileSync(tmp, JSON.stringify(project, null, 2), { encoding: "utf-8", mode: 0o600 });
 		fs.renameSync(tmp, this.filePath(project.id));
+		// Invalidate cache if this is the default directory
+		if (this.dir === projectsDir()) {
+			invalidateProjectCache();
+		}
 		return project;
 	}
 
@@ -85,6 +98,17 @@ export class ProjectStore {
 	}
 
 	list(): Project[] {
+		const defaultDir = projectsDir();
+		const isDefault = this.dir === defaultDir;
+
+		// Check cache if this is the default directory
+		if (isDefault && defaultDirCache && defaultDirCache.dir === defaultDir) {
+			const age = Date.now() - defaultDirCache.timestamp;
+			if (age < CACHE_TTL) {
+				return [...defaultDirCache.projects]; // Return a copy to prevent mutation
+			}
+		}
+
 		let names: string[];
 		try {
 			names = fs.readdirSync(this.dir);
@@ -97,12 +121,23 @@ export class ProjectStore {
 			const p = this.load(n.slice(0, -".json".length));
 			if (p) out.push(p);
 		}
-		return out.sort((a, b) => a.name.localeCompare(b.name));
+		const result = out.sort((a, b) => a.name.localeCompare(b.name));
+
+		// Cache if this is the default directory
+		if (isDefault) {
+			defaultDirCache = { dir: defaultDir, projects: [...result], timestamp: Date.now() };
+		}
+
+		return result;
 	}
 
 	remove(id: string): void {
 		try {
 			fs.rmSync(this.filePath(id), { force: true });
+			// Invalidate cache if this is the default directory
+			if (this.dir === projectsDir()) {
+				invalidateProjectCache();
+			}
 		} catch {
 			/* ignore */
 		}
