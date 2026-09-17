@@ -12,6 +12,10 @@
  *   - status commands and native TUI card rendering.
  *
  * Delegation (Consult / Quest / Party) is added in later milestones.
+ *
+ * PERFORMANCE FIX: The before_agent_start hook now uses in-memory caches for
+ * roster, prompts, and projects to eliminate synchronous filesystem I/O on
+ * every turn. Caches expire after TTL and are invalidated by write operations.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -19,12 +23,14 @@ import { registerApprovals } from "./approvals-ui.ts";
 import { registerCommands } from "./commands.ts";
 import { registerConsultTool } from "./consult.ts";
 import { getApprovalManager, getQuestManager } from "./orchestration/manager.ts";
-import { ProjectStore } from "./persistence/project-store.ts";
+import { type Project, ProjectStore } from "./persistence/project-store.ts";
 import { registerProjects } from "./projects-ui.ts";
 import { registerQuestTool } from "./quest-tool.ts";
 import { ensureGuildSeeded, loadGuildmasterPrompt } from "./roster.ts";
 import { getStatusSurface } from "./status.ts";
 import { registerInfoCard } from "./ui.ts";
+
+
 
 export default function guildmaster(pi: ExtensionAPI): void {
 	// Seed the durable user-owned guild directory once. Filesystem-only and
@@ -45,11 +51,27 @@ export default function guildmaster(pi: ExtensionAPI): void {
 
 	// Make the main agent actually BE the Guildmaster, and aware of the user's projects,
 	// every turn. Project resolution is name-based (location-independent), not cwd-based.
+	// Uses in-memory cache to avoid synchronous disk I/O on the turn-start path.
 	pi.on("before_agent_start", async (event) => {
-		const persona = loadGuildmasterPrompt();
-		const projects = new ProjectStore().list();
-		const projectBlock =
-			projects.length > 0
+		try {
+			// Build prompt from cached persona + ProjectStore's cached projects
+			const parts: string[] = [];
+
+			// Add persona if available (uses roster.ts cache)
+			const persona = loadGuildmasterPrompt();
+			if (persona) {
+				parts.push(persona);
+			}
+
+			// Add projects block (ProjectStore.list() uses its own cache)
+			let projects: Project[] = [];
+			try {
+				projects = new ProjectStore().list();
+			} catch (err) {
+				console.error("[guildmaster] Failed to load projects:", err);
+			}
+
+			const projectBlock = projects.length > 0
 				? `## Registered projects\n${projects
 						.map(
 							(p) =>
@@ -57,10 +79,20 @@ export default function guildmaster(pi: ExtensionAPI): void {
 						)
 						.join("\n")}`
 				: "## Registered projects\n(none yet — if the user names a project you don't know, ask where it lives and offer to register it with register_project.)";
-		const guidance =
-			"When the user refers to a project by name, resolve it to a registered project id and pass it as the `project` argument to consult/quest — do not rely on the current working directory. If the name is unknown or ambiguous, ask the user rather than guessing.";
-		const addition = [persona, projectBlock, guidance].filter(Boolean).join("\n\n");
-		return { systemPrompt: `${event.systemPrompt}\n\n${addition}` };
+			parts.push(projectBlock);
+
+			// Always include guidance
+			const guidance =
+				"When the user refers to a project by name, resolve it to a registered project id and pass it as the `project` argument to consult/quest — do not rely on the current working directory. If the name is unknown or ambiguous, ask the user rather than guessing.";
+			parts.push(guidance);
+
+			const addition = parts.join("\n\n");
+			return { systemPrompt: `${event.systemPrompt}\n\n${addition}` };
+		} catch (err) {
+			// Never let this hook reject or hang: fall back to base systemPrompt
+			console.error("[guildmaster] before_agent_start hook error:", err);
+			return { systemPrompt: event.systemPrompt };
+		}
 	});
 
 	// Ambient status board: subscribes to the Quest + Approval managers and repaints
