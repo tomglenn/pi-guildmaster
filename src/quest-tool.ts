@@ -106,6 +106,7 @@ async function runQuestInBackground(
 		inPlace?: boolean;
 		contexts: RepoContext[];
 		config: GuildmasterConfig;
+		globalInstructions?: string;
 		instructions?: string;
 		review?: { prText?: string; approvals: ApprovalManager; number: string; slug?: string; repoName?: string; label: string };
 	},
@@ -121,6 +122,7 @@ async function runQuestInBackground(
 				config: opts.config,
 				signal: api.signal,
 				write: opts.write,
+				globalInstructions: opts.globalInstructions,
 				instructions: opts.instructions,
 				review: opts.review ? { prText: opts.review.prText, approvals: opts.review.approvals, questId: record.id } : undefined,
 				onProgress: (members) => api.setMembers(members),
@@ -393,6 +395,7 @@ export function registerQuestTool(pi: ExtensionAPI): void {
 					write: false,
 					contexts,
 					config,
+					globalInstructions: config.globalInstructions,
 					instructions,
 					review: { prText, approvals, number: target.number, slug: target.slug, repoName, label: prLabel },
 				});
@@ -442,7 +445,7 @@ export function registerQuestTool(pi: ExtensionAPI): void {
 				if (project) {
 					for (const r of project.repos) if (!targets.some((t) => t.name === r.name)) contexts.push({ name: r.name, path: r.path, writable: false });
 				}
-				void runQuestInBackground(record, { write: true, inPlace, contexts, config, instructions });
+				void runQuestInBackground(record, { write: true, inPlace, contexts, config, globalInstructions: config.globalInstructions, instructions });
 				return started(record, project?.id, targets.map((t) => t.name).join("+"), true, inPlace);
 			}
 
@@ -459,7 +462,7 @@ export function registerQuestTool(pi: ExtensionAPI): void {
 				record.parentId = parent.id;
 				manager.store.save(record);
 			}
-			void runQuestInBackground(record, { write: false, contexts, config, instructions });
+			void runQuestInBackground(record, { write: false, contexts, config, globalInstructions: config.globalInstructions, instructions });
 			return started(record, project?.id, undefined, false);
 		},
 

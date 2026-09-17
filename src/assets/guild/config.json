@@ -12,5 +12,6 @@
     "inactivityMs": 300000,
     "maxTotalMs": 1800000,
     "maxOutputBytes": 200000
-  }
+  },
+  "globalInstructions": ""
 }
