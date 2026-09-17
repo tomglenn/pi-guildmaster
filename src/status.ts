@@ -25,10 +25,81 @@ const MEMBER_GLYPH: Record<QuestMemberStatus, string> = { pending: "○", runnin
 /** Per-status colour for a party member's glyph + name. */
 const MEMBER_COLOR: Record<QuestMemberStatus, ThemeColor> = { pending: "muted", running: "accent", done: "success", failed: "error" };
 
-/** Colour-coded member glyphs with a space between icon and name, e.g. "✓ scout". */
-function memberGlyphs(record: QuestRecord, theme: { fg: (c: ThemeColor, t: string) => string }): string {
-	return record.members.map((m) => theme.fg(MEMBER_COLOR[m.status], `${MEMBER_GLYPH[m.status]} ${m.name}`)).join("  ");
+/**
+ * Calculate the visible display width of a string, stripping ANSI escape codes.
+ * Approximate for CJK/emoji; accurate for typical ASCII member names.
+ */
+function visibleWidth(s: string): number {
+	// Strip ANSI escape codes (SGR sequences used by theme.fg/bold)
+	const stripped = s.replace(/\x1b\[[0-9;]*m/g, "");
+	// Simple char count - sufficient for ASCII names/glyphs used in member chips
+	// Note: For full CJK/emoji support, would need get-east-asian-width library
+	return stripped.length;
 }
+
+/**
+ * Build a compact summary of party member statuses: · 3 members · ✓2 ●1
+ * Shows non-zero status counts with glyphs; omits zero-count statuses.
+ */
+function memberSummary(
+	members: QuestRecord["members"],
+	theme: { fg: (c: ThemeColor, t: string) => string }
+): string {
+	const counts: Record<QuestMemberStatus, number> = { done: 0, running: 0, pending: 0, failed: 0 };
+	for (const m of members) counts[m.status]++;
+
+	const parts: string[] = [];
+	// Order: done, running, pending, failed
+	if (counts.done > 0) parts.push(theme.fg(MEMBER_COLOR.done, `${MEMBER_GLYPH.done}${counts.done}`));
+	if (counts.running > 0) parts.push(theme.fg(MEMBER_COLOR.running, `${MEMBER_GLYPH.running}${counts.running}`));
+	if (counts.pending > 0) parts.push(theme.fg(MEMBER_COLOR.pending, `${MEMBER_GLYPH.pending}${counts.pending}`));
+	if (counts.failed > 0) parts.push(theme.fg(MEMBER_COLOR.failed, `${MEMBER_GLYPH.failed}${counts.failed}`));
+
+	const total = members.length;
+	const noun = total === 1 ? "member" : "members";
+	// Format: · 13 members · ✓11 ●2
+	return `· ${total} ${noun} · ${parts.join(" ")}`;
+}
+
+/**
+ * Format member chips: full individual chips if they fit the budget, otherwise summary.
+ * Single member always shows full chip. When budget undefined, uses 6-member threshold.
+ */
+function formatMemberChips(
+	record: QuestRecord,
+	theme: { fg: (c: ThemeColor, t: string) => string },
+	budget: number | undefined
+): string {
+	const members = record.members;
+	if (members.length === 0) return "";
+
+	// Single member: always show full chip
+	if (members.length === 1) {
+		const m = members[0];
+		return theme.fg(MEMBER_COLOR[m.status], `${MEMBER_GLYPH[m.status]} ${m.name}`);
+	}
+
+	// Build full chips string
+	const fullChips = members
+		.map((m) => theme.fg(MEMBER_COLOR[m.status], `${MEMBER_GLYPH[m.status]} ${m.name}`))
+		.join("  ");
+
+	// Decide: full chips vs summary
+	if (budget === undefined) {
+		// Fallback when terminal width unavailable (piped output, etc.)
+		// Heuristic: 6+ members won't fit in typical 80-col terminal after prefix overhead
+		return members.length >= 6 ? memberSummary(members, theme) : fullChips;
+	}
+
+	// Budget too small: return summary anyway (better than hiding status entirely)
+	if (budget <= 0 || visibleWidth(fullChips) > budget) {
+		return memberSummary(members, theme);
+	}
+
+	return fullChips;
+}
+
+
 
 /** Overall party status colour: failed → awaiting-approval → all-done → in-flight. */
 function partyColor(record: QuestRecord): ThemeColor {
@@ -136,7 +207,22 @@ export class StatusSurface {
 			for (const q of snapshot.active) {
 				const label = q.project ? fg("muted", `[${q.project}] `) : "";
 				const end = q.state === "awaiting-approval" ? `  ${fg("warning", "⏸ awaiting approval")}` : "";
-				box.addChild(new Text(`  ${fg(partyColor(q), "●")} ${label}${fg("toolTitle", q.title)}  ${memberGlyphs(q, theme)}${end}`, 0, 0));
+				
+				// Calculate width budget for member chips
+				// Use process.stdout.columns as terminal width (may differ from widget width, but acceptable approximation)
+				const termWidth = process.stdout.columns;
+				let chips: string;
+				if (termWidth !== undefined) {
+					// Build prefix/suffix to measure overhead
+					const prefix = `  ● ${q.project ? `[${q.project}] ` : ""}${q.title}  `;
+					const suffix = q.state === "awaiting-approval" ? "  ⏸ awaiting approval" : "";
+					const budget = termWidth - visibleWidth(prefix) - visibleWidth(suffix);
+					chips = formatMemberChips(q, theme, budget);
+				} else {
+					chips = formatMemberChips(q, theme, undefined);
+				}
+				
+				box.addChild(new Text(`  ${fg(partyColor(q), "●")} ${label}${fg("toolTitle", q.title)}  ${chips}${end}`, 0, 0));
 				if (snapshot.lineage[q.id]) box.addChild(new Text(`      ${fg("muted", `↳ from ${snapshot.lineage[q.id]}`)}`, 0, 0));
 			}
 			for (const a of snapshot.pending) {
@@ -197,3 +283,6 @@ export function getStatusSurface(): StatusSurface {
 	surface ??= new StatusSurface();
 	return surface;
 }
+
+// Exported for testing
+export { visibleWidth, memberSummary, formatMemberChips };
