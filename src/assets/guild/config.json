@@ -7,5 +7,6 @@
     "coding": "anthropic/claude-sonnet-4-5"
   },
   "guildmasterModel": "capable",
-  "partyLeaderModel": "reasoning"
+  "partyLeaderModel": "reasoning",
+  "globalInstructions": ""
 }
