@@ -1,5 +1,6 @@
 /**
- * Regression tests for the runner's non-terminating-command classifier.
+ * Regression tests for the runner's non-terminating-command classifier and
+ * integration tests for the bounded shell execution (timeout, inactivity, abort).
  *
  * The runner (exec tier) gets a bounded shell instead of raw bash. A watch mode
  * or dev server would wedge the whole Quest, so these must be refused; ordinary
@@ -8,8 +9,14 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { nonTerminatingHint } from "../src/execution/runner-shell.ts";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { nonTerminatingHint, createRunnerShellTool } from "../src/execution/runner-shell.ts";
 
+
+// Mock context for testing
+const mockCtx: any = { cwd: process.cwd() };
 const REFUSED = [
 	"jest --watch",
 	"jest --watch tests/foo.spec.ts",
@@ -55,3 +62,103 @@ for (const cmd of ALLOWED) {
 		assert.equal(nonTerminatingHint(cmd), undefined, `expected no refusal for: ${cmd}`);
 	});
 }
+
+// Integration tests for shell execution hardening
+test("hard timeout terminates with killedForTotal", { timeout: 45_000 }, async () => {
+	const tmpDir = mkdtempSync(join(tmpdir(), "runner-shell-test-"));
+	try {
+		const tool = createRunnerShellTool({ cwd: tmpDir, maxTotalMs: 31_000, inactivityMs: 60_000 });
+		const result = await tool.execute("test-1", { command: 'node -e "setTimeout(() => {}, 60000)"' }, undefined, undefined, mockCtx);
+		assert.ok((result.details as any).killedForTotal, "expected killedForTotal=true");
+		assert.ok(!(result.details as any).killedForHang, "expected killedForHang=false");
+		assert.ok((result.content[0] as any).text.includes("KILLED"), "expected KILLED message");
+	} finally {
+		rmSync(tmpDir, { recursive: true, force: true });
+	}
+});
+
+test("inactivity timeout terminates with killedForHang", { timeout: 25_000 }, async () => {
+	const tmpDir = mkdtempSync(join(tmpdir(), "runner-shell-test-"));
+	try {
+		const tool = createRunnerShellTool({ cwd: tmpDir, inactivityMs: 11_000, maxTotalMs: 60_000 });
+		const result = await tool.execute("test-2", { command: 'node -e "setTimeout(() => {}, 60000)"' }, undefined, undefined, mockCtx);
+		assert.ok((result.details as any).killedForHang, "expected killedForHang=true");
+		assert.ok(!(result.details as any).killedForTotal, "expected killedForTotal=false");
+		assert.ok((result.content[0] as any).text.includes("KILLED"), "expected KILLED message");
+	} finally {
+		rmSync(tmpDir, { recursive: true, force: true });
+	}
+});
+
+test("output resets inactivity timer", { timeout: 25_000 }, async () => {
+	const tmpDir = mkdtempSync(join(tmpdir(), "runner-shell-test-"));
+	try {
+		const tool = createRunnerShellTool({ cwd: tmpDir, inactivityMs: 11_000, maxTotalMs: 60_000 });
+		const result = await tool.execute(
+			"test-3",
+			{ command: 'node -e "let i=0; const iv=setInterval(() => { if(i++<5) console.log(i); else { clearInterval(iv); process.exit(0); } }, 300)"' },
+			undefined,
+			undefined,
+			mockCtx,
+		);
+		assert.ok(!(result.details as any).killedForHang, "expected command to complete normally");
+		assert.ok(!(result.details as any).killedForTotal, "expected command to complete normally");
+		assert.equal((result.details as any).exitCode, 0, "expected exit code 0");
+		assert.ok((result.content[0] as any).text.includes("exit 0"), "expected normal exit");
+	} finally {
+		rmSync(tmpDir, { recursive: true, force: true });
+	}
+});
+
+test("normal command completes with exit code", { timeout: 10_000 }, async () => {
+	const tmpDir = mkdtempSync(join(tmpdir(), "runner-shell-test-"));
+	try {
+		const tool = createRunnerShellTool({ cwd: tmpDir });
+		const result = await tool.execute("test-4", { command: 'node -e "console.log(\'hello\')"' }, undefined, undefined, mockCtx);
+		assert.equal((result.details as any).exitCode, 0, "expected exit code 0");
+		assert.ok(!(result.details as any).killedForHang, "expected killedForHang=false");
+		assert.ok(!(result.details as any).killedForTotal, "expected killedForTotal=false");
+		assert.ok((result.content[0] as any).text.includes("hello"), "expected 'hello' in output");
+		assert.ok((result.content[0] as any).text.includes("exit 0"), "expected 'exit 0' in output");
+	} finally {
+		rmSync(tmpDir, { recursive: true, force: true });
+	}
+});
+
+test("CI environment is forced to true", { timeout: 10_000 }, async () => {
+	const tmpDir = mkdtempSync(join(tmpdir(), "runner-shell-test-"));
+	try {
+		// Save and set CI to a different value
+		const oldCI = process.env.CI;
+		process.env.CI = "false";
+		try {
+			const tool = createRunnerShellTool({ cwd: tmpDir });
+			const result = await tool.execute("test-5", { command: 'node -e "console.log(process.env.CI)"' }, undefined, undefined, mockCtx);
+			assert.ok((result.content[0] as any).text.includes("true"), "expected CI=true in output even when process.env.CI is false");
+		} finally {
+			if (oldCI !== undefined) process.env.CI = oldCI;
+			else delete process.env.CI;
+		}
+	} finally {
+		rmSync(tmpDir, { recursive: true, force: true });
+	}
+});
+
+test("abort terminates immediately", { timeout: 10_000 }, async () => {
+	const tmpDir = mkdtempSync(join(tmpdir(), "runner-shell-test-"));
+	try {
+		const controller = new AbortController();
+		const tool = createRunnerShellTool({ cwd: tmpDir, inactivityMs: 60_000, maxTotalMs: 60_000 });
+		const promise = tool.execute("test-6", { command: 'node -e "setTimeout(() => {}, 60000)"' }, controller.signal, undefined, mockCtx);
+		const startTime = Date.now();
+		// Abort after 500ms
+		setTimeout(() => controller.abort(), 500);
+		const result = await promise;
+		const elapsed = Date.now() - startTime;
+		// Should terminate quickly (well under the 5s grace period)
+		assert.ok(elapsed < 3000, `expected quick termination, got ${elapsed}ms`);
+		assert.equal((result.details as any).terminationReason, "abort", "expected terminationReason=abort");
+	} finally {
+		rmSync(tmpDir, { recursive: true, force: true });
+	}
+});
