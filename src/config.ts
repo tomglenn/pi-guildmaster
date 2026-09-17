@@ -23,6 +23,8 @@ export interface GuildmasterConfig {
 	guildmasterModel: string;
 	/** Model used by the Party Leader. Alias or explicit. */
 	partyLeaderModel: string;
+	/** Guild-wide standing instructions prepended to every Party Leader prompt. */
+	globalInstructions?: string;
 }
 
 /**
@@ -41,6 +43,7 @@ export const DEFAULT_CONFIG: GuildmasterConfig = {
 	},
 	guildmasterModel: "capable",
 	partyLeaderModel: "capable",
+	globalInstructions: "",
 };
 
 /** Per-project overrides layered over the global config (§14, project-scoped). */
@@ -57,6 +60,7 @@ export function effectiveConfig(base: GuildmasterConfig, overrides?: ProjectConf
 		models: { ...base.models, ...(overrides.models ?? {}) },
 		guildmasterModel: overrides.guildmasterModel ?? base.guildmasterModel,
 		partyLeaderModel: overrides.partyLeaderModel ?? base.partyLeaderModel,
+		globalInstructions: base.globalInstructions,
 	};
 }
 
@@ -69,6 +73,7 @@ export function loadConfig(): GuildmasterConfig {
 			models: { ...DEFAULT_CONFIG.models, ...(parsed.models ?? {}) },
 			guildmasterModel: parsed.guildmasterModel ?? DEFAULT_CONFIG.guildmasterModel,
 			partyLeaderModel: parsed.partyLeaderModel ?? DEFAULT_CONFIG.partyLeaderModel,
+			globalInstructions: parsed.globalInstructions ?? DEFAULT_CONFIG.globalInstructions,
 		};
 	} catch {
 		return { ...DEFAULT_CONFIG, models: { ...DEFAULT_CONFIG.models } };

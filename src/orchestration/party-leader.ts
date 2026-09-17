@@ -125,14 +125,18 @@ function buildRepoBlock(contexts: RepoContext[]): string[] {
 	];
 }
 
-function buildSystemPrompt(basePrompt: string, available: Guildmate[], config: GuildmasterConfig, write: boolean, contexts: RepoContext[], instructions: string | undefined, reviewMode: boolean, openTag: string, endTag: string): string {
+function buildSystemPrompt(basePrompt: string, available: Guildmate[], config: GuildmasterConfig, write: boolean, contexts: RepoContext[], globalInstructions: string | undefined, instructions: string | undefined, reviewMode: boolean, openTag: string, endTag: string): string {
 	const roster = available
 		.map((m) => `- ${m.name} [${m.tier}] (model: ${resolveModelSpec(config, m.model) ?? "default"}): ${m.tagline ?? m.description}`)
 		.join("\n");
 
+	const globalBlock = globalInstructions?.trim()
+		? ["## Guild-wide instructions", globalInstructions.trim(), ""]
+		: [];
 	const projectBlock = instructions?.trim() ? ["## Project context", instructions.trim(), ""] : [];
 
 	const common = [
+		...globalBlock,
 		...projectBlock,
 		...buildRepoBlock(contexts),
 		basePrompt,
@@ -185,10 +189,13 @@ function buildSystemPrompt(basePrompt: string, available: Guildmate[], config: G
 				"  missing test, or a brief requirement not met, dispatch `smith` to fix it and then re-review. Cap",
 				"  this at TWO review→fix rounds. Do NOT loop on nits or style — record minor items under Unresolved",
 				"  and move on. Finalize only when the review is clean or the two rounds are spent.",
-				"- The final report is a PULL REQUEST DESCRIPTION. First line: a concise PR title as an H1",
-				"  (`# ...`). Then sections: Summary, Changes (with file references), Testing (what runner ran and",
-				"  observed), and Risks / Unresolved (including anything inquisitor/warden flagged). Do not claim",
-				"  tests passed unless runner actually reported it.",
+				"- PR BODY SYNTHESIS: after review passes, dispatch `scribe` to write the pull request description.",
+				"  Scribe writes plain, human-readable prose (its persona defines the style). Give Scribe: the brief,",
+				"  what changed (files and why), what runner tested, and any caveats from inquisitor/warden.",
+				"- The final report IS what Scribe wrote — paste it verbatim between the report markers, do not",
+				"  rewrite it. First line must be a concise PR title as H1 (`# ...`). Then sections: Summary,",
+				"  Changes (with file references), Testing (what was verified), and Risks / Unresolved (if any).",
+				"  Do not claim tests passed unless runner actually reported it.",
 			]
 		: [
 				"- When you have enough, STOP dispatching and produce the FINAL REPORT: clean human-facing markdown",
@@ -221,6 +228,8 @@ export async function runParty(opts: {
 	write?: boolean;
 	/** Standing project context to fold into the Party Leader's prompt. */
 	instructions?: string;
+	/** Guild-wide standing instructions prepended to every Party Leader prompt. */
+	globalInstructions?: string;
 	/** When set, this is a PR-review party: envoy becomes dispatchable with a gated shell. */
 	review?: { prText?: string; approvals: ApprovalManager; questId?: string };
 }): Promise<PartyResult> {
@@ -330,7 +339,7 @@ export async function runParty(opts: {
 	const run = await runSession({
 		// The leader has no file tools; it just needs a valid cwd for session setup.
 		cwd: contexts[0]?.path ?? process.cwd(),
-		systemPrompt: buildSystemPrompt(loadPartyLeaderPrompt() ?? DEFAULT_LEADER_PROMPT, available, opts.config, write, contexts, opts.instructions, reviewMode, openTag, endTag),
+		systemPrompt: buildSystemPrompt(loadPartyLeaderPrompt() ?? DEFAULT_LEADER_PROMPT, available, opts.config, write, contexts, opts.globalInstructions, opts.instructions, reviewMode, openTag, endTag),
 		modelSpec: resolveModelSpec(opts.config, opts.config.partyLeaderModel),
 		tools: ["dispatch"],
 		customTools: [dispatch],
