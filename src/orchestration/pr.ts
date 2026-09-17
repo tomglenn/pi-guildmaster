@@ -79,10 +79,12 @@ export async function raisePr(record: QuestRecord, deps: PrDeps): Promise<RaiseR
 		}
 		const worktreePath = iso.worktreePath;
 
+		// Is this repo updating an existing PR (address-feedback) rather than creating one?
+		const sourcePr = record.sourcePr && (!record.sourcePr.repo || record.sourcePr.repo === pr.repo) ? record.sourcePr : undefined;
+
 		// Operation-aware guard.
-		const forbidden = [`git push -u origin ${pr.branch}`, "gh pr create --draft"]
-			.map(classifyCommand)
-			.find((d) => d.klass === "forbidden");
+		const guardCmds = sourcePr ? ["git push"] : [`git push -u origin ${pr.branch}`, "gh pr create --draft"];
+		const forbidden = guardCmds.map(classifyCommand).find((d) => d.klass === "forbidden");
 		if (forbidden) {
 			results.push({ repo: pr.repo, raised: false, refused: true, reason: forbidden.reason });
 			continue;
@@ -116,12 +118,33 @@ export async function raisePr(record: QuestRecord, deps: PrDeps): Promise<RaiseR
 		deps.onAwaitingApproval?.();
 		const approved = await deps.approvals.request({
 			questId: record.id,
-			title: `Raise draft PR (${pr.repo}): ${pr.title}`,
-			description: `git push -u origin ${pr.branch}; gh pr create --draft`,
+			title: sourcePr ? `Update PR #${sourcePr.number} (${pr.repo}): push to ${sourcePr.headBranch}` : `Raise draft PR (${pr.repo}): ${pr.title}`,
+			description: sourcePr ? `git push (fast-forward) → ${sourcePr.headBranch} of PR #${sourcePr.number}` : `git push -u origin ${pr.branch}; gh pr create --draft`,
 			operation: "pr-raise",
 		});
 		if (!approved) {
 			results.push({ repo: pr.repo, raised: false, reason: `Denied; branch \`${pr.branch}\` remains committed locally.` });
+			continue;
+		}
+
+		if (sourcePr) {
+			// UPDATE an existing PR: fast-forward push to its head branch via the upstream
+			// `gh pr checkout` configured (handles fork remotes). NEVER force-push — if the
+			// branch diverged (someone pushed after we attached), refuse and let the user rebase.
+			try {
+				await runGit(["push"], worktreePath);
+			} catch (e) {
+				results.push({
+					repo: pr.repo,
+					raised: false,
+					reason: `Push to PR #${sourcePr.number} rejected (branch likely diverged / non-fast-forward). Not force-pushed. Pull or rebase \`${sourcePr.headBranch}\` and retry. (${(e as Error).message.split("\n")[0]})`,
+				});
+				continue;
+			}
+			pr.url = sourcePr.url;
+			pr.number = sourcePr.number;
+			pr.draft = false;
+			results.push({ repo: pr.repo, raised: true, url: sourcePr.url, reason: `Updated existing PR #${sourcePr.number}.` });
 			continue;
 		}
 

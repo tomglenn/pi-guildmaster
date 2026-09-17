@@ -37,6 +37,10 @@ function git(args: string[], cwd: string): string {
 	return execFileSync("git", args, { cwd, encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] });
 }
 
+function gh(args: string[], cwd: string): string {
+	return execFileSync("gh", args, { cwd, encoding: "utf-8", timeout: 120_000, stdio: ["ignore", "pipe", "pipe"] });
+}
+
 export function isGitRepo(cwd: string): boolean {
 	try {
 		return git(["rev-parse", "--is-inside-work-tree"], cwd).trim() === "true";
@@ -109,6 +113,38 @@ export function createWorktree(cwd: string, questId: string, title: string, repo
 	// Branch off the resolved base by SHA (stable even if refs move mid-Quest).
 	git(["worktree", "add", "-b", branch, worktreePath, base.sha], repoRoot);
 	return { repo, branch, worktreePath, baseRef: base.sha, baseLabel: base.ref, repoRoot };
+}
+
+/**
+ * Attach a worktree to an EXISTING PR's head branch, so a write-Quest iterates on
+ * a PR we already raised (addressing review feedback) instead of cutting a fresh
+ * branch off main.
+ *
+ * It creates a detached worktree (never touching the user's real checkout) and
+ * uses `gh pr checkout` inside it to fetch the PR head into a quest-scoped local
+ * branch — which also sets up the correct upstream tracking, including for PRs
+ * from forks. The base ref is the PR head tip at attach time, so the committed
+ * diff shows only what this Quest adds on top of the existing PR.
+ */
+export function attachToExistingBranch(
+	cwd: string,
+	questId: string,
+	opts: { number: number; slug?: string; repoName?: string },
+): Isolation {
+	const repoRoot = git(["rev-parse", "--show-toplevel"], cwd).trim();
+	const repo = opts.repoName ?? path.basename(repoRoot);
+	const worktreePath = path.join(guildmasterHome(), "worktrees", questId, repo);
+	fs.mkdirSync(path.dirname(worktreePath), { recursive: true });
+	// Quest-scoped local branch name avoids colliding with any branch already
+	// checked out in the user's real repo or another worktree.
+	const localBranch = `guildmaster/pr-${opts.number}-${questId.slice(-4)}`;
+	// Detached worktree first (uses HEAD; we immediately replace its contents).
+	git(["worktree", "add", "--detach", worktreePath], repoRoot);
+	const repoFlag = opts.slug ? ["--repo", opts.slug] : [];
+	// Fetch + checkout the PR head into the worktree, naming the local branch.
+	gh(["pr", "checkout", String(opts.number), ...repoFlag, "--branch", localBranch], worktreePath);
+	const baseRef = git(["rev-parse", "HEAD"], worktreePath).trim();
+	return { repo, branch: localBranch, worktreePath, baseRef, baseLabel: `PR #${opts.number}`, repoRoot };
 }
 
 /**

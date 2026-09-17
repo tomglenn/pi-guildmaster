@@ -21,7 +21,8 @@ import { Type } from "typebox";
 import { effectiveConfig, loadConfig } from "./config.ts";
 import type { GuildmasterConfig } from "./config.ts";
 import { postReview, type ReviewVerdict } from "./execution/gh-tool.ts";
-import { commitAndDiff, createWorktree, inPlaceIsolation, isGitRepo, isWorkingTreeClean } from "./execution/isolation.ts";
+import { attachToExistingBranch, commitAndDiff, createWorktree, inPlaceIsolation, isGitRepo, isWorkingTreeClean } from "./execution/isolation.ts";
+import { formatFeedbackBrief, gatherPrFeedback } from "./orchestration/pr-feedback.ts";
 import type { ApprovalManager } from "./orchestration/approvals.ts";
 import { getApprovalManager, getQuestManager } from "./orchestration/manager.ts";
 import { runParty } from "./orchestration/party-leader.ts";
@@ -291,9 +292,18 @@ export function registerQuestTool(pi: ExtensionAPI): void {
 			pr: Type.Optional(
 				Type.String({
 					description:
-						"Review a pull request: a PR number, `owner/repo#number`, or a full GitHub PR URL. Runs a review " +
-						"party (envoy fetches → specialists review → Scribe writes it up → posting needs your /approve). Pass " +
+						"A pull request: a PR number, `owner/repo#number`, or a full GitHub PR URL. By default runs a review " +
+						"party (envoy fetches → specialists review → Scribe writes it up → posting needs your /approve). With " +
+						"`mode:\"address-feedback\"` instead iterates on the PR to action its review comments. Pass " +
 						"`project`/`repo` when the PR's repo is registered so it can be checked out locally.",
+				}),
+			),
+			mode: Type.Optional(
+				Type.Union([Type.Literal("review"), Type.Literal("address-feedback")], {
+					description:
+						"With `pr`: 'review' (default) drafts a review to post; 'address-feedback' checks out the PR's OWN " +
+						"branch, ingests its unresolved review comments + failing CI, has the party fix them, and updates " +
+						"the SAME PR via raise_pr (fast-forward push) — no new PR.",
 				}),
 			),
 		}),
@@ -323,6 +333,97 @@ export function registerQuestTool(pi: ExtensionAPI): void {
 
 			let contexts: RepoContext[];
 			let baseCwd: string;
+
+			// ADDRESS-FEEDBACK: iterate on an existing PR of ours (action its review
+			// comments / failing CI) on the PR's OWN branch, then update the same PR.
+			if (params.mode === "address-feedback") {
+				if (!params.pr) throw new Error("mode 'address-feedback' requires a `pr` (the PR to iterate on).");
+				if (params.repos?.length) throw new Error("address-feedback works on a single PR/repo; use `repo`, not `repos`.");
+				const target = parsePrTarget(params.pr as string);
+
+				// Need a local git checkout of the PR's repo to attach a worktree to.
+				let repoPath: string;
+				let repoName: string;
+				if (project) {
+					const r = params.repo
+						? project.repos.find((x) => x.name === params.repo)
+						: project.repos.length === 1
+							? project.repos[0]
+							: undefined;
+					if (params.repo && !r) throw new Error(`Project "${project.id}" has no repo "${params.repo}".`);
+					if (!r)
+						throw new Error(
+							`Project "${project.id}" has multiple repos (${project.repos.map((x) => x.name).join(", ")}). Specify which with \`repo\`.`,
+						);
+					repoPath = r.path;
+					repoName = r.name;
+				} else {
+					repoPath = ctx.cwd;
+					repoName = ctx.cwd.split("/").filter(Boolean).pop() ?? "repo";
+				}
+				if (!isGitRepo(repoPath)) throw new Error(`address-feedback needs a local git checkout; "${repoName}" is not one.`);
+
+				// Fetch metadata + feedback (read-only) up front.
+				let feedback;
+				try {
+					feedback = gatherPrFeedback(target, repoPath);
+				} catch (e) {
+					throw new Error(
+						`Could not fetch PR ${params.pr}: ${(e as Error).message.split("\n")[0]}. Is gh authenticated and the PR reachable?`,
+					);
+				}
+				const meta = feedback.metadata;
+				if (meta.state === "MERGED") throw new Error(`PR #${meta.number} is already MERGED — nothing to iterate on.`);
+				if (!meta.headRefName) throw new Error(`Could not resolve the head branch of PR #${meta.number}.`);
+
+				// Honest stop: nothing actionable → do not start a Quest or invent work.
+				if (feedback.actionableCount === 0) {
+					return {
+						content: [
+							{
+								type: "text" as const,
+								text: `No actionable feedback on PR #${meta.number} (${meta.url}): no unresolved review threads, no change-requests, and no failing CI checks. Not starting a Quest — there's nothing to address right now.`,
+							},
+						],
+						details: { pr: `#${meta.number}`, actionable: 0 },
+					};
+				}
+
+				const combinedBrief = [formatFeedbackBrief(feedback), "---", "## Additional instructions", params.brief]
+					.filter(Boolean)
+					.join("\n\n");
+				const record = manager.create({
+					cwd: repoPath,
+					title: params.title,
+					brief: parent ? briefWithUpstream(combinedBrief, parent) : combinedBrief,
+					project: project?.id,
+				});
+				if (parent) record.parentId = parent.id;
+				record.sourcePr = {
+					number: meta.number,
+					url: meta.url,
+					headBranch: meta.headRefName,
+					slug: meta.slug,
+					repo: repoName,
+					isCrossRepository: meta.isCrossRepository,
+				};
+				const iso = attachToExistingBranch(repoPath, record.id, { number: meta.number, slug: meta.slug, repoName });
+				record.isolations = [iso];
+				manager.store.save(record);
+				contexts = [{ name: iso.repo, path: iso.worktreePath, writable: true }];
+				if (project) for (const r of project.repos) if (r.name !== repoName) contexts.push({ name: r.name, path: r.path, writable: false });
+				void runQuestInBackground(record, { write: true, contexts, config, globalInstructions: config.globalInstructions, instructions });
+				const counts = `${feedback.humanThreads.length} human, ${feedback.botThreads.length} bot, ${feedback.failingChecks.length} failing check(s)`;
+				return {
+					content: [
+						{
+							type: "text" as const,
+							text: `Started address-feedback Quest "${record.title}" (id ${record.id}) on PR #${meta.number} (${counts}). The party actions the feedback on the PR's own branch (${meta.headRefName}); when done, raise_pr PUSHES the update to PR #${meta.number} (fast-forward, needs your /approve) — no new PR.`,
+						},
+					],
+					details: { id: record.id, project: project?.id, pr: `#${meta.number}` },
+				};
+			}
 
 			if (reviewMode) {
 				const approvals = getApprovalManager();

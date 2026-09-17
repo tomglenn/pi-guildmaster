@@ -82,6 +82,12 @@ export interface QuestRecord {
 	prs?: QuestPr[];
 	/** Review-Quest: the review produced and its post status (approval-gated). */
 	review?: QuestReview;
+	/**
+	 * Set for an "address-feedback" write-Quest: the existing PR this Quest is
+	 * iterating on. When present, raising pushes commits to `headBranch` to UPDATE
+	 * this PR (fast-forward only) instead of opening a new one.
+	 */
+	sourcePr?: { number: number; url: string; headBranch: string; slug?: string; repo?: string; isCrossRepository?: boolean };
 	/** Set when the user "turns in" a finished Quest: it leaves the board but stays in history. */
 	acknowledgedAt?: number;
 	/** The Quest this one was chained from (fromQuest) — multi-step lineage. */
