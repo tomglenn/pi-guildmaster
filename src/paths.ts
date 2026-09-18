@@ -32,6 +32,16 @@ export function rosterDir(): string {
 	return path.join(guildDir(), "roster");
 }
 
+/** User-owned recipe directory (markdown-authored Quest recipes). */
+export function recipesDir(): string {
+	return path.join(guildDir(), "recipes");
+}
+
+/** Bundled default recipes shipped with the package (fallback for older installs). */
+export function bundledRecipesDir(): string {
+	return path.join(ASSETS_DIR, "guild", "recipes");
+}
+
 /**
  * Durable Quest state, deliberately OUTSIDE Pi's session storage so Quests are
  * process-independent and inspectable by external tooling (§5, §16).

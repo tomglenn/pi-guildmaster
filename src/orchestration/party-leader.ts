@@ -25,6 +25,9 @@ import type { RepoContext } from "../persistence/project-store.ts";
 import type { ApprovalManager } from "./approvals.ts";
 
 const DISPATCHABLE_READONLY: ReadonlySet<string> = new Set(["read-only"]);
+// Read-only investigation that also needs GitHub context: the read-only specialists
+// plus the envoy, whose shell is read-only (it can fetch a PR but cannot post/mutate).
+const DISPATCHABLE_READONLY_GH: ReadonlySet<string> = new Set(["read-only", "envoy"]);
 const DISPATCHABLE_WRITE: ReadonlySet<string> = new Set(["read-only", "write", "exec"]);
 // Review: read-only specialists judge, scribe (write) composes, envoy talks to GitHub.
 const DISPATCHABLE_REVIEW: ReadonlySet<string> = new Set(["read-only", "write", "envoy"]);
@@ -125,7 +128,7 @@ function buildRepoBlock(contexts: RepoContext[]): string[] {
 	];
 }
 
-function buildSystemPrompt(basePrompt: string, available: Guildmate[], config: GuildmasterConfig, write: boolean, contexts: RepoContext[], globalInstructions: string | undefined, instructions: string | undefined, reviewMode: boolean, openTag: string, endTag: string): string {
+function buildSystemPrompt(basePrompt: string, available: Guildmate[], config: GuildmasterConfig, write: boolean, contexts: RepoContext[], globalInstructions: string | undefined, instructions: string | undefined, reviewMode: boolean, acquire: boolean, openTag: string, endTag: string, partyHint?: string[]): string {
 	const roster = available
 		.map((m) => `- ${m.name} [${m.tier}] (model: ${resolveModelSpec(config, m.model) ?? "default"}): ${m.tagline ?? m.description}`)
 		.join("\n");
@@ -141,16 +144,21 @@ function buildSystemPrompt(basePrompt: string, available: Guildmate[], config: G
 		...buildRepoBlock(contexts),
 		basePrompt,
 		"",
-		`## Available Guildmates${reviewMode ? " (PR review)" : write ? "" : " (read-only specialists)"}`,
+		`## Available Guildmates${reviewMode ? " (PR review)" : acquire ? " (investigation + GitHub)" : write ? "" : " (read-only specialists)"}`,
 		reviewMode
 			? "Dispatch via the `dispatch` tool; you have NO tools of your own. `envoy` is the party's ONLY contact with GitHub (a gated shell): it fetches the PR and, with the user's approval, posts the review. All other members work read-only on the fetched PR."
-			: write
-				? "You are running in an ISOLATED git worktree on a dedicated branch. Writes by `smith` and commands by `runner` happen ONLY in this worktree and never touch the user's checkout. Dispatch via the `dispatch` tool; you have NO tools of your own."
-				: "Dispatch these via the `dispatch` tool. You have NO file tools yourself — you MUST delegate all investigation.",
+			: acquire
+				? "Dispatch via the `dispatch` tool; you have NO tools of your own. `envoy` is the party's contact with GitHub but is READ-ONLY here: it can fetch (gh pr view/diff, gh api reads) but CANNOT post, comment or mutate — this Quest only produces a report. All other members work read-only."
+				: write
+					? "You are running in an ISOLATED git worktree on a dedicated branch. Writes by `smith` and commands by `runner` happen ONLY in this worktree and never touch the user's checkout. Dispatch via the `dispatch` tool; you have NO tools of your own."
+					: "Dispatch these via the `dispatch` tool. You have NO file tools yourself — you MUST delegate all investigation.",
 		"",
 		roster,
 		"",
 		"## Running this Quest",
+		...(partyHint?.length
+			? [`- This recipe PREFERS these Guildmates: ${partyHint.join(", ")}. Favour them, but dispatch others (e.g. inquisitor, scribe) when the task needs them.`]
+			: []),
 		"- Choose only the Guildmates the task needs. There is no fixed pipeline.",
 		"- Emit multiple `dispatch` calls in one turn to run independent work in parallel.",
 		"- Feed useful findings from one Guildmate into the next one's task.",
@@ -172,8 +180,20 @@ function buildSystemPrompt(basePrompt: string, available: Guildmate[], config: G
 		"- End with an explicit verdict line, e.g. `Verdict: Request changes`, so the post step knows what to submit.",
 	];
 
+	const acquireWorkflow = [
+		"- ACQUIRE-THEN-ANALYSE WORKFLOW: first dispatch `envoy` to FETCH the GitHub context the brief needs",
+		"  (e.g. `gh pr view <n> --json ...`, `gh pr diff <n>`, and `gh api .../comments` for review threads).",
+		"  If the envoy cannot fetch it, do not fabricate — emit the FAILED signal (see finalize).",
+		"- Then dispatch read-only specialists (scout/delver for code, architect for planning) against the",
+		"  fetched material and the codebase. Use inquisitor to attack any conclusion or plan.",
+		"- The envoy here is READ-ONLY: never ask it to post, comment, review or merge. This Quest DELIVERS A",
+		"  REPORT ONLY. When you have enough, STOP and produce the final report.",
+	];
+
 	const workflow = reviewMode
 		? reviewWorkflow
+		: acquire
+		? acquireWorkflow
 		: write
 		? [
 				"- IMPLEMENTATION WORKFLOW: understand the code (scout/delver), get a plan (architect), and have",
@@ -232,11 +252,23 @@ export async function runParty(opts: {
 	globalInstructions?: string;
 	/** When set, this is a PR-review party: envoy becomes dispatchable with a gated shell. */
 	review?: { prText?: string; approvals: ApprovalManager; questId?: string };
+	/** When true (and not a review), grant a READ-ONLY envoy so the party can fetch
+	 * GitHub context (a PR, its diff and comments) without any ability to post/mutate. */
+	acquire?: boolean;
+	/** Advisory list of preferred Guildmates for this recipe (does not hard-restrict). */
+	partyHint?: string[];
 }): Promise<PartyResult> {
 	const write = opts.write ?? false;
 	const reviewMode = Boolean(opts.review);
+	const acquire = Boolean(opts.acquire) && !reviewMode && !write;
 	const contexts = opts.contexts;
-	const dispatchable = reviewMode ? DISPATCHABLE_REVIEW : write ? DISPATCHABLE_WRITE : DISPATCHABLE_READONLY;
+	const dispatchable = reviewMode
+		? DISPATCHABLE_REVIEW
+		: write
+			? DISPATCHABLE_WRITE
+			: acquire
+				? DISPATCHABLE_READONLY_GH
+				: DISPATCHABLE_READONLY;
 	const available = opts.roster.filter((m) => dispatchable.has(m.tier));
 	const members: QuestMember[] = [];
 	let memberCost = 0;
@@ -292,9 +324,13 @@ export async function runParty(opts: {
 								questId: opts.review.questId,
 							}),
 						]
-					: mate.tier === "exec"
-						? [createRunnerShellTool({ cwd: context.path, ...opts.config.shell })]
-						: undefined;
+					: mate.tier === "envoy" && acquire
+						? // Read-only envoy: reviewMode:false makes policy REFUSE every mutation
+							// outright (no approval path), so this shell can only fetch.
+							[createEnvoyShellTool({ cwd: context.path, reviewMode: false })]
+						: mate.tier === "exec"
+							? [createRunnerShellTool({ cwd: context.path, ...opts.config.shell })]
+							: undefined;
 
 			// Requirement fidelity: write/exec members act on the code, so they must see the quest's
 			// authoritative constraints, not just the leader's paraphrase of one bounded task. The brief
@@ -339,7 +375,7 @@ export async function runParty(opts: {
 	const run = await runSession({
 		// The leader has no file tools; it just needs a valid cwd for session setup.
 		cwd: contexts[0]?.path ?? process.cwd(),
-		systemPrompt: buildSystemPrompt(loadPartyLeaderPrompt() ?? DEFAULT_LEADER_PROMPT, available, opts.config, write, contexts, opts.globalInstructions, opts.instructions, reviewMode, openTag, endTag),
+		systemPrompt: buildSystemPrompt(loadPartyLeaderPrompt() ?? DEFAULT_LEADER_PROMPT, available, opts.config, write, contexts, opts.globalInstructions, opts.instructions, reviewMode, acquire, openTag, endTag, opts.partyHint),
 		modelSpec: resolveModelSpec(opts.config, opts.config.partyLeaderModel),
 		tools: ["dispatch"],
 		customTools: [dispatch],

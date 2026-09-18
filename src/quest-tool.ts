@@ -26,6 +26,8 @@ import { formatFeedbackBrief, gatherPrFeedback } from "./orchestration/pr-feedba
 import type { ApprovalManager } from "./orchestration/approvals.ts";
 import { getApprovalManager, getQuestManager } from "./orchestration/manager.ts";
 import { runParty } from "./orchestration/party-leader.ts";
+import { loadRecipeRegistry } from "./orchestration/recipe-loader.ts";
+import { executionShape, preflightRecipe, resolveRecipe } from "./orchestration/recipes.ts";
 import { pickRepoBySlug, readonlyContexts, resolveProjectQuery } from "./orchestration/resolve.ts";
 import { ProjectStore, type RepoContext } from "./persistence/project-store.ts";
 import type { QuestRecord } from "./persistence/quest-store.ts";
@@ -110,6 +112,10 @@ async function runQuestInBackground(
 		globalInstructions?: string;
 		instructions?: string;
 		review?: { prText?: string; approvals: ApprovalManager; number: string; slug?: string; repoName?: string; label: string };
+		/** Read-only GitHub acquisition (investigate mode): envoy can fetch but not post. */
+		acquire?: boolean;
+		/** Advisory preferred party (from the recipe). */
+		partyHint?: string[];
 	},
 ): Promise<void> {
 	const manager = getQuestManager();
@@ -126,6 +132,8 @@ async function runQuestInBackground(
 				globalInstructions: opts.globalInstructions,
 				instructions: opts.instructions,
 				review: opts.review ? { prText: opts.review.prText, approvals: opts.review.approvals, questId: record.id } : undefined,
+				acquire: opts.acquire,
+				partyHint: opts.partyHint,
 				onProgress: (members) => api.setMembers(members),
 			});
 			// Persist how the party's run ended, for forensics, before anything can throw.
@@ -256,6 +264,13 @@ export function registerQuestTool(pi: ExtensionAPI): void {
 		parameters: Type.Object({
 			title: Type.String({ description: "Short title for the Quest (a few words)" }),
 			brief: Type.String({ description: "The task brief for the Party Leader: the goal and any constraints." }),
+			recipe: Type.Optional(
+				Type.String({
+					description:
+						"Explicit recipe name to shape the Quest (built-in or a markdown-authored one). Overrides the " +
+						"pr/mode/write classification. Omit to let the parameters classify the shape.",
+				}),
+			),
 			project: Type.Optional(
 				Type.String({ description: "Registered project id/name to scope the Quest to. Omit to use the current directory." }),
 			),
@@ -293,26 +308,27 @@ export function registerQuestTool(pi: ExtensionAPI): void {
 				Type.String({
 					description:
 						"A pull request: a PR number, `owner/repo#number`, or a full GitHub PR URL. By default runs a review " +
-						"party (envoy fetches → specialists review → Scribe writes it up → posting needs your /approve). With " +
-						"`mode:\"address-feedback\"` instead iterates on the PR to action its review comments. Pass " +
-						"`project`/`repo` when the PR's repo is registered so it can be checked out locally.",
+						"party (envoy fetches → specialists review → Scribe writes it up → posting needs your /approve). Use " +
+						"`mode:\"investigate\"` to fetch the PR read-only and produce a REPORT (e.g. assess a reviewer's " +
+						"feedback and draft a plan) with NO posting or code changes. Use `mode:\"address-feedback\"` to " +
+						"iterate on the PR and action its review comments. Pass `project`/`repo` when the PR's repo is " +
+						"registered so it can be checked out locally.",
 				}),
 			),
 			mode: Type.Optional(
-				Type.Union([Type.Literal("review"), Type.Literal("address-feedback")], {
+				Type.Union([Type.Literal("review"), Type.Literal("address-feedback"), Type.Literal("investigate")], {
 					description:
 						"With `pr`: 'review' (default) drafts a review to post; 'address-feedback' checks out the PR's OWN " +
 						"branch, ingests its unresolved review comments + failing CI, has the party fix them, and updates " +
-						"the SAME PR via raise_pr (fast-forward push) — no new PR.",
+						"the SAME PR via raise_pr (fast-forward push) — no new PR; 'investigate' fetches the PR read-only " +
+						"and produces a REPORT (e.g. assess a reviewer's feedback and draft an implementation plan) — it " +
+						"never posts, comments or changes code.",
 				}),
 			),
 		}),
 
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const manager = getQuestManager();
-			const write = params.write ?? false;
-			const inPlace = (params.inPlace ?? false) && write;
-			const reviewMode = Boolean(params.pr);
 
 			// Resolve the named project (if any). cwd is only a fallback.
 			const projectStore = new ProjectStore();
@@ -322,22 +338,57 @@ export function registerQuestTool(pi: ExtensionAPI): void {
 				return r.project;
 			})() : undefined;
 
+			// SHAPE THE QUEST: one recipe decides the four capability axes (github / write /
+			// isolation / delivery). Markdown recipes overlay the built-ins; an explicit
+			// `recipe` name wins, else the pr/mode/write params classify the shape.
+			const { registry: recipeRegistry } = loadRecipeRegistry();
+			const recipe = resolveRecipe(
+				{ recipe: params.recipe, pr: params.pr, mode: params.mode, write: params.write, inPlace: params.inPlace },
+				recipeRegistry,
+			);
+			const shape = executionShape(recipe);
+			const write = recipe.write;
+			const inPlace = recipe.isolation === "in-place";
+			const acquire = recipe.github === "read";
+
+			// PREFLIGHT: fail fast if the resolved recipe cannot be executed with what we
+			// have (e.g. a PR-context recipe with no way to reach GitHub) — BEFORE any
+			// specialist runs. This is the capability-vs-goal check the envoy-less run lacked.
+			const preTarget = params.pr ? parsePrTarget(params.pr as string) : undefined;
+			const preRepoPath = project
+				? (params.repo
+						? project.repos.find((x) => x.name === params.repo)?.path
+						: project.repos.length === 1
+							? project.repos[0].path
+							: pickRepoBySlug(project, preTarget?.slug)?.path)
+				: ctx.cwd;
+			const pre = preflightRecipe(recipe, {
+				hasPr: Boolean(params.pr),
+				hasLocalRepo: Boolean(preRepoPath),
+				hasSlug: Boolean(preTarget?.slug),
+				isGitRepo: preRepoPath ? isGitRepo(preRepoPath) : false,
+			});
+			if (!pre.ok) throw new Error(pre.error);
+
 			// Effective config = global merged with this project's overrides (Phase 2).
 			const config = effectiveConfig(loadConfig(), project?.config);
 			const instructions = project?.instructions;
 
-			// Chain off a prior Quest: fold its report (+ any draft-PR branch/diff) into the brief.
+			// Fold any recipe guidance into the brief, then chain off a prior Quest.
+			const questBrief = recipe.guidance
+				? `${params.brief}\n\n## Recipe guidance (${recipe.id})\n${recipe.guidance}`
+				: params.brief;
 			const parent = params.fromQuest ? manager.store.load(params.fromQuest) : undefined;
 			if (params.fromQuest && !parent) throw new Error(`fromQuest: no Quest with id ${params.fromQuest}.`);
-			const brief = parent ? briefWithUpstream(params.brief, parent) : params.brief;
+			const brief = parent ? briefWithUpstream(questBrief, parent) : questBrief;
 
 			let contexts: RepoContext[];
 			let baseCwd: string;
 
 			// ADDRESS-FEEDBACK: iterate on an existing PR of ours (action its review
 			// comments / failing CI) on the PR's OWN branch, then update the same PR.
-			if (params.mode === "address-feedback") {
-				if (!params.pr) throw new Error("mode 'address-feedback' requires a `pr` (the PR to iterate on).");
+			if (shape === "address-feedback") {
+				if (!params.pr) throw new Error("address-feedback requires a `pr` (the PR to iterate on).");
 				if (params.repos?.length) throw new Error("address-feedback works on a single PR/repo; use `repo`, not `repos`.");
 				const target = parsePrTarget(params.pr as string);
 
@@ -388,7 +439,7 @@ export function registerQuestTool(pi: ExtensionAPI): void {
 					};
 				}
 
-				const combinedBrief = [formatFeedbackBrief(feedback), "---", "## Additional instructions", params.brief]
+				const combinedBrief = [formatFeedbackBrief(feedback), "---", "## Additional instructions", questBrief]
 					.filter(Boolean)
 					.join("\n\n");
 				const record = manager.create({
@@ -414,7 +465,7 @@ export function registerQuestTool(pi: ExtensionAPI): void {
 				manager.store.save(record);
 				contexts = [{ name: iso.repo, path: iso.worktreePath, writable: true }];
 				if (project) for (const r of project.repos) if (r.name !== repoName) contexts.push({ name: r.name, path: r.path, writable: false });
-				void runQuestInBackground(record, { write: true, contexts, config, globalInstructions: config.globalInstructions, instructions });
+				void runQuestInBackground(record, { write: true, contexts, config, globalInstructions: config.globalInstructions, instructions, partyHint: recipe.party });
 				const counts = `${feedback.humanThreads.length} human, ${feedback.botThreads.length} bot, ${feedback.failingChecks.length} failing check(s)`;
 				return {
 					content: [
@@ -427,7 +478,75 @@ export function registerQuestTool(pi: ExtensionAPI): void {
 				};
 			}
 
-			if (reviewMode) {
+			// INVESTIGATE: fetch a PR read-only and produce a REPORT (e.g. assess a
+			// reviewer's feedback and draft a plan). The party gets a read-only envoy —
+			// it can fetch but cannot post/comment/merge, and no code is changed.
+			if (shape === "pr-investigate") {
+				if (!params.pr) throw new Error("investigate requires a `pr` to fetch.");
+				const target = parsePrTarget(params.pr as string);
+
+				// A local checkout gives the envoy a cwd for `gh pr diff <n>`; otherwise it
+				// fetches by `--repo <slug>`. Read-only: we run in the checkout directly, no worktree.
+				let repoPath: string | undefined;
+				let repoName: string | undefined;
+				if (project) {
+					const r = params.repo
+						? project.repos.find((x) => x.name === params.repo)
+						: project.repos.length === 1
+							? project.repos[0]
+							: pickRepoBySlug(project, target.slug);
+					if (params.repo && !r) throw new Error(`Project "${project.id}" has no repo "${params.repo}".`);
+					if (r) {
+						repoPath = r.path;
+						repoName = r.name;
+					}
+				}
+
+				const prLabel = target.slug ? `${target.slug}#${target.number}` : `#${target.number}`;
+				const investigateBrief = [
+					`Investigate pull request ${prLabel} and produce a REPORT. Do NOT post, comment, review, or change code.`,
+					target.slug ? `Repo: ${target.slug}.` : "",
+					repoPath
+						? `A checkout of the repo is your cwd; have the envoy run \`gh pr view ${target.number} --json title,body,files,reviews\`, \`gh pr diff ${target.number}\`, and \`gh api repos/{owner}/{repo}/pulls/${target.number}/comments\` for inline review threads.`
+						: `No local checkout; have the envoy run \`gh pr view ${target.number}${target.slug ? ` --repo ${target.slug}` : ""} --json title,body,files,reviews\` and \`gh pr diff ${target.number}${target.slug ? ` --repo ${target.slug}` : ""}\`.`,
+					"",
+					questBrief,
+				]
+					.filter(Boolean)
+					.join("\n");
+
+				const baseDir = repoPath ?? ctx.cwd;
+				const record = manager.create({
+					cwd: baseDir,
+					title: params.title,
+					brief: parent ? briefWithUpstream(investigateBrief, parent) : investigateBrief,
+					project: project?.id,
+				});
+				if (parent) record.parentId = parent.id;
+				manager.store.save(record);
+				contexts = [{ name: repoName ?? "cwd", path: baseDir, writable: false }];
+				if (project) for (const r of project.repos) if (r.name !== repoName) contexts.push({ name: r.name, path: r.path, writable: false });
+				void runQuestInBackground(record, {
+					write: false,
+					acquire,
+					contexts,
+					config,
+					globalInstructions: config.globalInstructions,
+					instructions,
+					partyHint: recipe.party,
+				});
+				return {
+					content: [
+						{
+							type: "text" as const,
+							text: `Started investigate Quest "${record.title}" (id ${record.id})${project ? ` for ${project.id}` : ""} on ${prLabel}. The party fetches the PR read-only (envoy can fetch but CANNOT post or change anything) and produces a report. Nothing is posted; no code is changed.`,
+						},
+					],
+					details: { id: record.id, project: project?.id, pr: prLabel },
+				};
+			}
+
+			if (shape === "pr-review") {
 				const approvals = getApprovalManager();
 				const target = parsePrTarget(params.pr as string);
 
@@ -471,7 +590,7 @@ export function registerQuestTool(pi: ExtensionAPI): void {
 						? `A git worktree of the repo is your cwd; have the envoy run \`gh pr checkout ${target.number}\` to get the code, plus \`gh pr diff ${target.number}\`.`
 						: `No local checkout; have the envoy run \`gh pr diff ${target.number}${target.slug ? ` --repo ${target.slug}` : ""}\` and \`gh pr view\` to gather the PR.`,
 					"",
-					params.brief,
+					questBrief,
 				]
 					.filter(Boolean)
 					.join("\n");
@@ -501,6 +620,7 @@ export function registerQuestTool(pi: ExtensionAPI): void {
 					globalInstructions: config.globalInstructions,
 					instructions,
 					review: { prText, approvals, number: target.number, slug: target.slug, repoName, label: prLabel },
+					partyHint: recipe.party,
 				});
 				return {
 					content: [
@@ -513,7 +633,7 @@ export function registerQuestTool(pi: ExtensionAPI): void {
 				};
 			}
 
-			if (write) {
+			if (shape === "write") {
 				// A write Quest targets one OR MORE repos (each worktree writable); any other
 				// project repos are available read-only for context.
 				let targets: { name: string; path: string }[];
@@ -548,7 +668,7 @@ export function registerQuestTool(pi: ExtensionAPI): void {
 				if (project) {
 					for (const r of project.repos) if (!targets.some((t) => t.name === r.name)) contexts.push({ name: r.name, path: r.path, writable: false });
 				}
-				void runQuestInBackground(record, { write: true, inPlace, contexts, config, globalInstructions: config.globalInstructions, instructions });
+				void runQuestInBackground(record, { write: true, inPlace, contexts, config, globalInstructions: config.globalInstructions, instructions, partyHint: recipe.party });
 				return started(record, project?.id, targets.map((t) => t.name).join("+"), true, inPlace);
 			}
 
@@ -565,7 +685,7 @@ export function registerQuestTool(pi: ExtensionAPI): void {
 				record.parentId = parent.id;
 				manager.store.save(record);
 			}
-			void runQuestInBackground(record, { write: false, contexts, config, globalInstructions: config.globalInstructions, instructions });
+			void runQuestInBackground(record, { write: false, acquire, contexts, config, globalInstructions: config.globalInstructions, instructions, partyHint: recipe.party });
 			return started(record, project?.id, undefined, false);
 		},
 

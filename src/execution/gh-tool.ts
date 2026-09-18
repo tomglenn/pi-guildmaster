@@ -76,7 +76,9 @@ export function createEnvoyShellTool(opts: {
 	cwd: string;
 	reviewMode: boolean;
 	prText?: string;
-	approvals: ApprovalManager;
+	/** Required only in review mode (to gate a post). In read-only acquire mode no
+	 * mutation is ever reachable, so approvals may be omitted. */
+	approvals?: ApprovalManager;
 	questId?: string;
 }): ToolDefinition {
 	return defineTool({
@@ -98,6 +100,12 @@ export function createEnvoyShellTool(opts: {
 				};
 			}
 			if (gate.needsApproval) {
+				if (!opts.approvals) {
+					return {
+						content: [{ type: "text", text: `BLOCKED (${gate.operation}): this envoy is read-only and cannot mutate. Command not run.` }],
+						details: {},
+					};
+				}
 				const approved = await opts.approvals.request({
 					title: `Envoy wants to ${gate.operation}`,
 					description: `The review party is requesting to run:\n\n\`${params.command}\``,
