@@ -112,6 +112,36 @@ test("formatFeedbackBrief renders sections and strips bot HTML noise", () => {
 	assert.doesNotMatch(brief, /<div>/); // HTML tag stripped
 });
 
+test("an approve-with-follow-ups review (no threads, prose body) is actionable", () => {
+	// A COMMENTED/APPROVED review whose asks live in the body, with NO unresolved
+	// threads, no change-request, and no failing checks — the #1950 shape.
+	const gh: GhRunner = (args) => {
+		if (args.includes("graphql")) {
+			return JSON.stringify({
+				data: {
+					repository: {
+						pullRequest: {
+							reviewThreads: { nodes: [] },
+							reviews: { nodes: [{ author: { login: "moxious" }, state: "COMMENTED", body: "No blocking issues.\n\nFollow-ups:\n1. sweep in the docs" }] },
+						},
+					},
+				},
+			});
+		}
+		if (args.includes("statusCheckRollup")) return JSON.stringify({ statusCheckRollup: [{ __typename: "CheckRun", name: "Lint", conclusion: "SUCCESS" }] });
+		return META;
+	};
+	const fb = gatherPrFeedback({ number: "1950", slug: "grafana/grafana-pathfinder-app" }, "/tmp", gh);
+	assert.equal(fb.humanThreads.length, 0);
+	assert.equal(fb.failingChecks.length, 0);
+	assert.equal(fb.humanReviews.length, 1);
+	assert.equal(fb.actionableCount, 1, "the prose follow-ups must register as actionable");
+	const brief = formatFeedbackBrief(fb);
+	assert.match(brief, /Reviewer summaries/);
+	assert.match(brief, /sweep in the docs/);
+	assert.doesNotMatch(brief, /No actionable feedback found/);
+});
+
 test("formatFeedbackBrief is honest when nothing is actionable", () => {
 	const emptyGh: GhRunner = (args) => {
 		if (args.includes("graphql")) return JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { nodes: [] }, reviews: { nodes: [] } } } } });

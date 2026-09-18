@@ -257,8 +257,13 @@ export function gatherPrFeedback(target: PrTarget, cwd: string, gh: GhRunner = d
 	const metadata = fetchPrMetadata(target, cwd, gh);
 	const { humanThreads, botThreads, humanReviews } = fetchReviewThreads(metadata, cwd, gh);
 	const failingChecks = fetchFailingChecks(target, cwd, gh);
-	const changeRequests = humanReviews.filter((r) => r.reviewState === "CHANGES_REQUESTED").length;
-	const actionableCount = humanThreads.length + botThreads.length + failingChecks.length + changeRequests;
+	// `humanReviews` is already filtered (in fetchReviewThreads) to human reviews
+	// that either request changes or carry a substantive body, so every entry is
+	// worth acting on. Counting it here is what makes an "approve with follow-ups"
+	// review — asks stated in prose, not inline threads — register as actionable
+	// instead of being silently skipped (#1950). It mirrors exactly what
+	// formatFeedbackBrief renders under "Reviewer summaries".
+	const actionableCount = humanThreads.length + botThreads.length + failingChecks.length + humanReviews.length;
 	return { metadata, humanThreads, botThreads, humanReviews, failingChecks, actionableCount };
 }
 
