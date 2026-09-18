@@ -51,6 +51,26 @@ export function questsDir(): string {
 	return path.join(guildmasterHome(), "quests");
 }
 
+/**
+ * Validate that a questId contains no path traversal characters.
+ * Quest IDs are system-generated and should only contain alphanumerics, hyphens, and underscores.
+ */
+function validateQuestId(id: string): void {
+	if (id.includes('/') || id.includes('\\') || id.includes('..')) {
+		throw new Error(`Invalid questId: contains path traversal characters`);
+	}
+}
+
+/**
+ * Quest-specific scratch directory for agent work products that should NOT
+ * enter commits: planning docs, verification scripts, intermediate notes.
+ * Lives outside worktrees so git never sees it.
+ */
+export function questScratchDir(questId: string): string {
+	validateQuestId(questId);
+	return path.join(guildmasterHome(), "scratch", questId);
+}
+
 /** Durable pending-approval records (outside Pi, inspectable by external tooling). */
 export function approvalsDir(): string {
 	return path.join(guildmasterHome(), "approvals");

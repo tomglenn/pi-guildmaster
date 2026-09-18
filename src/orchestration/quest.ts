@@ -12,7 +12,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { discardIsolation } from "../execution/isolation.ts";
-import { questsDir } from "../paths.ts";
+import { questScratchDir, questsDir } from "../paths.ts";
 import {
 	isTerminal,
 	newQuestId,
@@ -146,6 +146,15 @@ export class QuestManager {
 			}
 		} catch {
 			/* ignore */
+		}
+		// Clean up scratch directory
+		const scratchDir = questScratchDir(record.id);
+		if (fs.existsSync(scratchDir)) {
+			try {
+				fs.rmSync(scratchDir, { recursive: true, force: true });
+			} catch {
+				// Best effort
+			}
 		}
 		this.store.delete(id);
 		this.recordCache.delete(id); // Remove from cache since it's deleted

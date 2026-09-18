@@ -25,6 +25,7 @@ import { attachToExistingBranch, commitAndDiff, createWorktree, inPlaceIsolation
 import { formatFeedbackBrief, gatherPrFeedback } from "./orchestration/pr-feedback.ts";
 import type { ApprovalManager } from "./orchestration/approvals.ts";
 import { getApprovalManager, getQuestManager } from "./orchestration/manager.ts";
+import { raisePr, type RaiseResult } from "./orchestration/pr.ts";
 import { runParty } from "./orchestration/party-leader.ts";
 import { loadRecipeRegistry } from "./orchestration/recipe-loader.ts";
 import { executionShape, preflightRecipe, resolveRecipe } from "./orchestration/recipes.ts";
@@ -40,7 +41,7 @@ function started(record: QuestRecord, projectId?: string, targetRepo?: string, w
 	const tail = write
 		? inPlace
 			? `It is working IN-PLACE in your real checkout${branch ? ` on branch ${branch}` : ""} — changes are committed there for you to review directly. No worktree, no PR.`
-			: "When it finishes it will produce a draft PR you can raise with raise_pr."
+			: "When it finishes it will automatically push and open a draft PR (unless it looks like a security fix)."
 		: "Ask me to show the results when it's done, or check /quests.";
 	return {
 		content: [
@@ -185,6 +186,30 @@ async function runQuestInBackground(
 				}
 				record.prs = prs;
 
+				// Auto-raise: push and open draft PRs on completion — no approval (a draft is
+				// the human's review artifact). Security guard still applies: Grafana first-party
+				// security fixes stay local, and with no confirmSecurity callback any other
+				// security-looking change is refused by default (safe). raise_pr can retry.
+				let raiseResult: RaiseResult | undefined;
+				if (prs.length > 0) {
+					try {
+						raiseResult = await raisePr(record, {
+							confirmSecurity: undefined, // refuses security-looking changes by default
+						});
+						// Check for per-repo failures and record them
+						const failures = raiseResult.results.filter((r) => !r.raised);
+						if (failures.length > 0) {
+							record.raiseError = failures.map((f) => `${f.repo}: ${f.reason}`).join("; ");
+						}
+						// Save immediately so raised URLs are persisted even if something fails later
+						manager.store.save(record);
+					} catch (err) {
+						// Unexpected failures (not per-repo network issues) are recorded
+						record.raiseError = err instanceof Error ? err.message : String(err);
+						manager.store.save(record);
+					}
+				}
+
 				// A write-Quest that committed nothing did not do its job. Never present an
 				// empty branch as a success — that is what hid a party that planned but never wrote.
 				if (!committedAny) {
@@ -240,7 +265,12 @@ function describeQuest(q: QuestRecord): string {
 			`Branches: ${q.isolations.map((i) => `${i.repo}→${i.branch}${i.baseLabel ? ` (base ${i.baseLabel})` : ""}`).join(", ")}`,
 		);
 	for (const pr of q.prs ?? []) {
-		lines.push(`PR (${pr.repo}): ${pr.url ?? "draft, not raised — use raise_pr"}${pr.diffStat ? `\n${pr.diffStat}` : ""}`);
+		const status = pr.url
+			? pr.url
+			: q.raiseError
+				? `raise failed — use raise_pr to retry`
+				: "draft, not raised — use raise_pr";
+		lines.push(`PR (${pr.repo}): ${status}${pr.diffStat ? `\n${pr.diffStat}` : ""}`);
 	}
 	if (q.error) lines.push(`Error: ${q.error}${q.stopReason ? ` [stopReason: ${q.stopReason}]` : ""}`);
 	if (q.report) lines.push(`\n${q.report}`);

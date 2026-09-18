@@ -48,6 +48,12 @@ Structure the PR body with these sections:
 - **Testing**: What was tested and the results (build, tests, manual verification).
 - **Risks / Unresolved**: Any concerns, limitations, or items that need follow-up.
 
+## File discipline
+
+NEVER write PR descriptions, summaries, or reports as files in the repository
+(e.g., `PR_DESCRIPTION.md`, `SUMMARY.md`). Your output goes through the report
+channel, not committed files.
+
 ## When the party is a PR review
 
 You write the final review the human will read (and, once approved, the envoy will
