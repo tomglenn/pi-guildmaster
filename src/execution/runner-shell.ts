@@ -37,16 +37,27 @@ const MIN_MAX_TOTAL_MS = 30_000;
 type TerminationReason = "inactivity" | "totalTimeout" | "abort" | null;
 
 /**
- * Clamp shell config values to safe minimums.
+ * Clamp shell config values to safe minimums so a caller cannot set a watchdog
+ * so tight it reaps a legitimate build/test.
+ *
+ * `allowSubMinimumTimeouts` exists ONLY for this module's own tests: it lets them
+ * exercise the timeout/inactivity/kill paths at sub-second durations instead of
+ * waiting out the real 10s/30s floors, which turned the suite into ~40s of pure
+ * sleeping. It must never be set by production callers — hence the ugly name.
  */
-function clampShellConfig(config: { inactivityMs?: number; maxTotalMs?: number; maxOutputBytes?: number }): {
+function clampShellConfig(
+	config: { inactivityMs?: number; maxTotalMs?: number; maxOutputBytes?: number },
+	allowSubMinimumTimeouts = false,
+): {
 	inactivityMs: number;
 	maxTotalMs: number;
 	maxOutputBytes: number;
 } {
+	const minInactivity = allowSubMinimumTimeouts ? 1 : MIN_INACTIVITY_MS;
+	const minTotal = allowSubMinimumTimeouts ? 1 : MIN_MAX_TOTAL_MS;
 	return {
-		inactivityMs: Math.max(config.inactivityMs ?? DEFAULT_INACTIVITY_MS, MIN_INACTIVITY_MS),
-		maxTotalMs: Math.max(config.maxTotalMs ?? DEFAULT_MAX_TOTAL_MS, MIN_MAX_TOTAL_MS),
+		inactivityMs: Math.max(config.inactivityMs ?? DEFAULT_INACTIVITY_MS, minInactivity),
+		maxTotalMs: Math.max(config.maxTotalMs ?? DEFAULT_MAX_TOTAL_MS, minTotal),
 		maxOutputBytes: config.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES,
 	};
 }
@@ -106,8 +117,15 @@ interface RunnerShellResult {
 	details: Record<string, unknown>;
 }
 
-export function createRunnerShellTool(opts: { cwd: string; inactivityMs?: number; maxTotalMs?: number; maxOutputBytes?: number }): ToolDefinition {
-	const { inactivityMs, maxTotalMs, maxOutputBytes } = clampShellConfig(opts);
+export function createRunnerShellTool(opts: {
+	cwd: string;
+	inactivityMs?: number;
+	maxTotalMs?: number;
+	maxOutputBytes?: number;
+	/** TEST ONLY: bypass the 10s/30s watchdog floors so tests run in ~1s. Never set in production. */
+	allowSubMinimumTimeouts?: boolean;
+}): ToolDefinition {
+	const { inactivityMs, maxTotalMs, maxOutputBytes } = clampShellConfig(opts, opts.allowSubMinimumTimeouts);
 	return defineTool({
 		name: "shell",
 		label: "Shell (bounded)",

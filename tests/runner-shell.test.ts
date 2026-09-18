@@ -64,10 +64,13 @@ for (const cmd of ALLOWED) {
 }
 
 // Integration tests for shell execution hardening
-test("hard timeout terminates with killedForTotal", { timeout: 45_000 }, async () => {
+test("hard timeout terminates with killedForTotal", { timeout: 10_000 }, async () => {
 	const tmpDir = mkdtempSync(join(tmpdir(), "runner-shell-test-"));
 	try {
-		const tool = createRunnerShellTool({ cwd: tmpDir, maxTotalMs: 31_000, inactivityMs: 60_000 });
+		// Small real-time budgets: the watchdog behaves identically at 800ms as at
+		// 31s, and burning tens of real seconds here (a) made `npm test` slow and
+		// (b) widened the window for a mis-reaped child to wedge the whole suite.
+		const tool = createRunnerShellTool({ cwd: tmpDir, maxTotalMs: 800, inactivityMs: 5_000, allowSubMinimumTimeouts: true });
 		const result = await tool.execute("test-1", { command: 'node -e "setTimeout(() => {}, 60000)"' }, undefined, undefined, mockCtx);
 		assert.ok((result.details as any).killedForTotal, "expected killedForTotal=true");
 		assert.ok(!(result.details as any).killedForHang, "expected killedForHang=false");
@@ -77,10 +80,10 @@ test("hard timeout terminates with killedForTotal", { timeout: 45_000 }, async (
 	}
 });
 
-test("inactivity timeout terminates with killedForHang", { timeout: 25_000 }, async () => {
+test("inactivity timeout terminates with killedForHang", { timeout: 10_000 }, async () => {
 	const tmpDir = mkdtempSync(join(tmpdir(), "runner-shell-test-"));
 	try {
-		const tool = createRunnerShellTool({ cwd: tmpDir, inactivityMs: 11_000, maxTotalMs: 60_000 });
+		const tool = createRunnerShellTool({ cwd: tmpDir, inactivityMs: 500, maxTotalMs: 5_000, allowSubMinimumTimeouts: true });
 		const result = await tool.execute("test-2", { command: 'node -e "setTimeout(() => {}, 60000)"' }, undefined, undefined, mockCtx);
 		assert.ok((result.details as any).killedForHang, "expected killedForHang=true");
 		assert.ok(!(result.details as any).killedForTotal, "expected killedForTotal=false");
@@ -90,13 +93,15 @@ test("inactivity timeout terminates with killedForHang", { timeout: 25_000 }, as
 	}
 });
 
-test("output resets inactivity timer", { timeout: 25_000 }, async () => {
+test("output resets inactivity timer", { timeout: 10_000 }, async () => {
 	const tmpDir = mkdtempSync(join(tmpdir(), "runner-shell-test-"));
 	try {
-		const tool = createRunnerShellTool({ cwd: tmpDir, inactivityMs: 11_000, maxTotalMs: 60_000 });
+		// Prints every 150ms for ~750ms; each print must reset the 500ms hang timer
+		// so the command completes instead of being killed.
+		const tool = createRunnerShellTool({ cwd: tmpDir, inactivityMs: 500, maxTotalMs: 10_000, allowSubMinimumTimeouts: true });
 		const result = await tool.execute(
 			"test-3",
-			{ command: 'node -e "let i=0; const iv=setInterval(() => { if(i++<5) console.log(i); else { clearInterval(iv); process.exit(0); } }, 300)"' },
+			{ command: 'node -e "let i=0; const iv=setInterval(() => { if(i++<5) console.log(i); else { clearInterval(iv); process.exit(0); } }, 150)"' },
 			undefined,
 			undefined,
 			mockCtx,
@@ -156,15 +161,30 @@ test("resolves on child exit even when a detached grandchild holds the pipe", { 
 		// Parent spawns a detached child that inherits stdout and sleeps 15s, then the
 		// parent exits 0. The inherited pipe stays open long after the parent is gone.
 		const command =
-			"node -e \"const c=require('child_process').spawn(process.execPath,['-e','setTimeout(()=>{},15000)'],{detached:true,stdio:'inherit'});c.unref();console.log('parent done');\"";
+			"node -e \"const c=require('child_process').spawn(process.execPath,['-e','setTimeout(()=>{},4000)'],{detached:true,stdio:'inherit'});c.unref();console.log('parent done');\"";
 		const start = Date.now();
 		const result = await tool.execute("test-7", { command }, undefined, undefined, mockCtx);
 		const elapsed = Date.now() - start;
-		assert.ok(elapsed < 5000, `expected prompt resolution on child exit, got ${elapsed}ms (pipe-EOF deadlock?)`);
+		assert.ok(elapsed < 2000, `expected prompt resolution on child exit, got ${elapsed}ms (pipe-EOF deadlock?)`);
 		assert.equal((result.details as any).exitCode, 0, "expected exit code 0");
 		assert.ok(!(result.details as any).killedForHang, "expected not killed for hang");
 		assert.ok(!(result.details as any).killedForTotal, "expected not killed for total");
 		assert.ok((result.content[0] as any).text.includes("parent done"), "expected parent output captured");
+	} finally {
+		rmSync(tmpDir, { recursive: true, force: true });
+	}
+});
+
+test("production floors still clamp sub-minimum timeouts (no bypass flag)", { timeout: 10_000 }, async () => {
+	const tmpDir = mkdtempSync(join(tmpdir(), "runner-shell-test-"));
+	try {
+		// Without allowSubMinimumTimeouts, a tiny inactivity budget must be clamped up
+		// to the 10s floor — so a command that finishes in ~200ms is NOT killed.
+		const tool = createRunnerShellTool({ cwd: tmpDir, inactivityMs: 50, maxTotalMs: 50 });
+		const result = await tool.execute("test-clamp", { command: 'node -e "setTimeout(() => console.log(\'ok\'), 200)"' }, undefined, undefined, mockCtx);
+		assert.equal((result.details as any).exitCode, 0, "clamped floors must let a fast command finish");
+		assert.ok(!(result.details as any).killedForHang, "must not be killed for hang under the clamped floor");
+		assert.ok(!(result.details as any).killedForTotal, "must not be killed for total under the clamped floor");
 	} finally {
 		rmSync(tmpDir, { recursive: true, force: true });
 	}
