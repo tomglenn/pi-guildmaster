@@ -1,7 +1,7 @@
 /**
  * Approval UX (§9, §12): pending-approvals widget, /approvals · /approve · /deny
- * commands, and the `raise_pr` tool that gates turning a write-Quest's draft into
- * a pushed draft PR.
+ * commands (used by review quests), and the `raise_pr` tool that turns a write-Quest's
+ * draft into a pushed draft PR — no approval; a draft is for the human to review.
  *
  * Non-blocking by design: the widget + commands let the human resolve an approval
  * on their own time. Extension commands run even while a tool call is streaming,
@@ -67,12 +67,13 @@ export function registerApprovals(pi: ExtensionAPI): void {
 		label: "Raise PR",
 		description: [
 			"Raise the draft PR for a completed write-Quest: pushes the branch and opens a DRAFT pull request.",
-			"Requires human approval (parked, not blocking other work) and never merges. If no questId is given,",
-			"the most recent completed write-Quest with an un-raised draft is used.",
+			"Opening a draft needs no approval (a draft is for the human to review and decide whether to mark ready);",
+			"it never merges, and if a PR already exists for the branch it is adopted rather than duplicated. If no",
+			"questId is given, the most recent completed write-Quest with an un-raised draft is used.",
 		].join(" "),
-		promptSnippet: "Raise (push + open draft PR) the branch a write-Quest produced; requires human approval",
+		promptSnippet: "Raise (push + open draft PR) the branch a write-Quest produced; no approval needed for a draft",
 		promptGuidelines: [
-			"Use raise_pr after a write Quest has produced a draft PR and the user wants it raised. It requires the user's approval and only ever opens a DRAFT PR; it never merges.",
+			"Use raise_pr after a write Quest has produced a draft PR and the user wants it raised. Opening a draft PR needs no approval and only ever opens a DRAFT; it never merges. (Updating an existing PR via the address-feedback flow still asks for approval.)",
 		],
 		parameters: Type.Object({
 			questId: Type.Optional(Type.String({ description: "Quest id (defaults to most recent un-raised write-Quest)" })),
@@ -92,12 +93,11 @@ export function registerApprovals(pi: ExtensionAPI): void {
 
 			const repos = record.prs.filter((p) => !p.url).map((p) => p.repo).join(", ");
 			onUpdate?.({
-				content: [{ type: "text", text: `Requesting approval to raise draft PR(s) for "${record.title}" [${repos}]… (/approve each)` }],
+				content: [{ type: "text", text: `Raising draft PR(s) for "${record.title}" [${repos}]…` }],
 				details: {},
 			});
 
 			const result = await raisePr(record, {
-				approvals,
 				confirmSecurity: (message) => ctx.ui.confirm("Possible security fix", message),
 			});
 			manager.store.save(record);

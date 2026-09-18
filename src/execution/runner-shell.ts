@@ -18,6 +18,7 @@
 import { spawn, execSync } from "node:child_process";
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { gateRunnerCommand } from "./policy.ts";
 
 /** Default: kill after this long with NO output at all (not a total-runtime cap). */
 const DEFAULT_INACTIVITY_MS = 300_000;
@@ -118,6 +119,16 @@ export function createRunnerShellTool(opts: { cwd: string; inactivityMs?: number
 			command: Type.String({ description: "The shell command to run. Must terminate on its own." }),
 		}),
 		execute: async (_toolCallId, params, signal, _onUpdate, _ctx) => {
+			// Policy gate first: the runner does local work only. Remote mutations
+			// (git push, gh pr create/api writes) and merges are refused here so a
+			// party can never push or open a PR out of band, bypassing the gated raise.
+			const gate = gateRunnerCommand(params.command);
+			if (gate.blocked) {
+				return {
+					content: [{ type: "text", text: `REFUSED: "${params.command}" — ${gate.reason}. Command not run.` }],
+					details: { refused: true, blocked: true, operation: gate.operation },
+				};
+			}
 			const hint = nonTerminatingHint(params.command);
 			if (hint) {
 				return {

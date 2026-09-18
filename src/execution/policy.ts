@@ -90,6 +90,52 @@ export function gateReviewCommand(command: string, opts: { reviewMode: boolean; 
 	return { ...d, needsApproval: true, blocked: false };
 }
 
+/**
+ * Split a command line into the sub-commands joined by shell operators (&& || ; |),
+ * so a chained line like `npm test && git push` is classified segment-by-segment
+ * and a mutation cannot ride in on the back of an innocent first token.
+ */
+function splitShellSegments(command: string): string[] {
+	return command
+		.split(/&&|\|\||;|\|/)
+		.map((s) => s.trim())
+		.filter(Boolean);
+}
+
+export interface RunnerGate {
+	/** Hard-refused: the runner may not run this command at all. */
+	blocked: boolean;
+	operation?: string;
+	reason?: string;
+}
+
+/**
+ * Gate a shell command for the write-Quest runner (exec tier).
+ *
+ * The runner does LOCAL work only — build, test, lint, and worktree-scoped git
+ * (add/commit/branch/checkout). Every remote mutation is refused: `git push`,
+ * `gh pr create`, mutating `gh api` calls, and (always) `gh pr merge`. Pushing a
+ * branch and opening a draft PR is the job of the dedicated raise path, never a
+ * runner acting mid-Quest — that is exactly the hole that let a party open a PR
+ * out of band. Reads pass freely; so does all local git.
+ */
+export function gateRunnerCommand(command: string): RunnerGate {
+	for (const seg of splitShellSegments(command)) {
+		const d = classifyCommand(seg);
+		if (d.klass === "forbidden") {
+			return { blocked: true, operation: d.operation, reason: d.reason };
+		}
+		if (d.klass === "mutate") {
+			const reason =
+				d.operation === "git push"
+					? "the runner never pushes; a completed write-Quest is pushed and opened as a draft PR via the raise_pr path"
+					: `${d.operation} is a remote mutation and is not allowed from a runner`;
+			return { blocked: true, operation: d.operation, reason };
+		}
+	}
+	return { blocked: false };
+}
+
 // Heuristic only. Errs toward flagging so a security fix is not auto-published (§ org policy).
 const SECURITY_SIGNALS =
 	/\b(cve-\d|vulnerabilit|security fix|security patch|exploit|xss|csrf|\bssrf\b|\brce\b|sql injection|auth(?:entication|orization)?\s+bypass|privilege escalation|path traversal|secret leak|hardcoded (?:secret|password|token))\b/i;

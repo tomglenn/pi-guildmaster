@@ -2,10 +2,13 @@
  * Gated PR raise (§9, §10, §11).
  *
  * Turns a write-Quest's local draft (committed branch from M8) into a real pushed
- * branch + draft PR — but only after asynchronous human approval, and only within
- * policy: mutations are gated, `gh pr merge` is refused (Guildmaster never merges),
- * and a likely security fix is not auto-published (confirmed manually; refused
- * outright for grafana/grafana first-party per org policy).
+ * branch + draft PR — no approval either way. A draft exists for the human to review
+ * and decide whether to mark it ready; and once a PR is up, addressing review
+ * feedback is the delegated work, so the address-feedback update pushes without a
+ * gate too. `gh pr merge` is ALWAYS refused (Guildmaster never merges). A likely
+ * security fix is not auto-published (confirmed manually; refused outright for
+ * grafana/grafana first-party per org policy). Before creating, an existing PR for
+ * the branch is adopted rather than duplicated.
  *
  * git/gh are injected so this is testable without touching the network.
  */
@@ -14,7 +17,6 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { QuestRecord } from "../persistence/quest-store.ts";
 import { classifyCommand, isGrafanaFirstParty, isLikelySecurityFix, repoSlugFromRemote } from "../execution/policy.ts";
-import type { ApprovalManager } from "./approvals.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -24,13 +26,10 @@ const NETWORK_TIMEOUT_MS = 120_000;
 export type CommandRunner = (args: string[], cwd: string) => Promise<string>;
 
 export interface PrDeps {
-	approvals: ApprovalManager;
 	runGit?: CommandRunner;
 	runGh?: CommandRunner;
 	/** Confirm proceeding when the change looks like a security fix. Default: refuse. */
 	confirmSecurity?: (message: string) => Promise<boolean>;
-	/** Called when the raise enters the awaiting-approval state. */
-	onAwaitingApproval?: () => void;
 }
 
 export interface RaisedRepo {
@@ -48,6 +47,20 @@ export interface RaiseResult {
 
 const realGit: CommandRunner = async (args, cwd) => (await execFileAsync("git", args, { cwd, timeout: NETWORK_TIMEOUT_MS })).stdout;
 const realGh: CommandRunner = async (args, cwd) => (await execFileAsync("gh", args, { cwd, timeout: NETWORK_TIMEOUT_MS })).stdout;
+
+/** Look up an OPEN PR for a branch, if any. Best-effort: any error / non-JSON → none. */
+async function findOpenPrForBranch(runGh: CommandRunner, branch: string, cwd: string): Promise<{ url: string; number: number } | undefined> {
+	try {
+		const out = await runGh(["pr", "list", "--head", branch, "--state", "open", "--json", "url,number", "--limit", "1"], cwd);
+		const arr = JSON.parse(out || "[]");
+		if (Array.isArray(arr) && arr.length && typeof arr[0]?.url === "string") {
+			return { url: arr[0].url, number: Number(arr[0].number) };
+		}
+	} catch {
+		/* no PR / not-JSON / gh error → treat as none and fall through to create */
+	}
+	return undefined;
+}
 
 /**
  * Raise every un-raised repo PR for a (possibly cross-repo) write-Quest. Each repo
@@ -114,21 +127,10 @@ export async function raisePr(record: QuestRecord, deps: PrDeps): Promise<RaiseR
 			}
 		}
 
-		// Independent, parked approval for THIS repo's push.
-		deps.onAwaitingApproval?.();
-		const approved = await deps.approvals.request({
-			questId: record.id,
-			title: sourcePr ? `Update PR #${sourcePr.number} (${pr.repo}): push to ${sourcePr.headBranch}` : `Raise draft PR (${pr.repo}): ${pr.title}`,
-			description: sourcePr ? `git push (fast-forward) → ${sourcePr.headBranch} of PR #${sourcePr.number}` : `git push -u origin ${pr.branch}; gh pr create --draft`,
-			operation: "pr-raise",
-		});
-		if (!approved) {
-			results.push({ repo: pr.repo, raised: false, reason: `Denied; branch \`${pr.branch}\` remains committed locally.` });
-			continue;
-		}
-
 		if (sourcePr) {
-			// UPDATE an existing PR: fast-forward push to its head branch via the upstream
+			// UPDATE an existing PR (address-feedback): the PR is already up and the reviewer
+			// just wants their feedback actioned, so this pushes without a gate. Fast-forward
+			// push to its head branch via the upstream
 			// `gh pr checkout` configured (handles fork remotes). NEVER force-push — if the
 			// branch diverged (someone pushed after we attached), refuse and let the user rebase.
 			try {
@@ -174,7 +176,26 @@ export async function raisePr(record: QuestRecord, deps: PrDeps): Promise<RaiseR
 			continue;
 		}
 
+		// Opening a NEW draft PR: no approval needed (a draft is for the human to review
+		// and decide on). Push first, then reconcile against the remote — a PR may already
+		// exist for this branch (e.g. opened out of band); adopt it rather than colliding
+		// on `gh pr create`.
 		await runGit(["push", "-u", "origin", pr.branch], worktreePath);
+
+		const existing = await findOpenPrForBranch(runGh, pr.branch, worktreePath);
+		if (existing?.url) {
+			pr.url = existing.url;
+			pr.number = existing.number;
+			pr.draft = true;
+			results.push({
+				repo: pr.repo,
+				raised: true,
+				url: existing.url,
+				reason: `A PR already existed for \`${pr.branch}\` — adopted PR #${existing.number} and pushed the latest commits (no duplicate created).`,
+			});
+			continue;
+		}
+
 		const out = await runGh(
 			["pr", "create", "--draft", "--title", pr.title, "--body", `${pr.body}${siblingNote}`, "--head", pr.branch],
 			worktreePath,

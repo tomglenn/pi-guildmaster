@@ -8,11 +8,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { raisePr, type CommandRunner } from "../src/orchestration/pr.ts";
-import type { ApprovalManager } from "../src/orchestration/approvals.ts";
 import type { QuestRecord } from "../src/persistence/quest-store.ts";
-
-const approveAll = { request: async () => true } as unknown as ApprovalManager;
-const denyAll = { request: async () => false } as unknown as ApprovalManager;
 
 function baseRecord(overrides: Partial<QuestRecord> = {}): QuestRecord {
 	return {
@@ -46,7 +42,7 @@ test("update path fast-forward pushes to the existing PR and opens no new PR", a
 		sourcePr: { number: 1942, url: "https://github.com/grafana/grafana-pathfinder-app/pull/1942", headBranch: "guildmaster/fix-x", slug: "grafana/grafana-pathfinder-app", repo: "app" },
 	});
 
-	const result = await raisePr(record, { approvals: approveAll, runGit, runGh });
+	const result = await raisePr(record, { runGit, runGh });
 
 	assert.equal(result.raised, 1);
 	assert.match(result.results[0].reason, /Updated existing PR #1942/);
@@ -82,7 +78,7 @@ test("update path replies to and resolves addressed threads, best-effort", async
 		},
 	});
 
-	const result = await raisePr(record, { approvals: approveAll, runGit, runGh });
+	const result = await raisePr(record, { runGit, runGh });
 	assert.equal(result.raised, 1);
 	assert.match(result.results[0].reason, /Replied to\/resolved 2\/2 thread/);
 	// A reply POST + a resolve mutation per thread.
@@ -106,7 +102,7 @@ test("a failing reply/resolve never fails the push", async () => {
 			threads: [{ threadId: "T_human", commentId: 111, author: "Jayclifford345" }],
 		},
 	});
-	const result = await raisePr(record, { approvals: approveAll, runGit, runGh });
+	const result = await raisePr(record, { runGit, runGh });
 	assert.equal(result.raised, 1); // push still succeeded
 	assert.match(result.results[0].reason, /Updated existing PR #1942/);
 	assert.match(result.results[0].reason, /0\/1 thread/);
@@ -122,26 +118,27 @@ test("update path refuses (does not force) when push is rejected as non-fast-for
 		sourcePr: { number: 1942, url: "https://github.com/grafana/grafana-pathfinder-app/pull/1942", headBranch: "guildmaster/fix-x", slug: "grafana/grafana-pathfinder-app", repo: "app" },
 	});
 
-	const result = await raisePr(record, { approvals: approveAll, runGit, runGh });
+	const result = await raisePr(record, { runGit, runGh });
 
 	assert.equal(result.raised, 0);
 	assert.match(result.results[0].reason, /diverged|non-fast-forward|rebase/i);
 	assert.equal(record.prs?.[0].url, undefined); // not marked as raised
 });
 
-test("update path respects denial without pushing", async () => {
+test("update path (address-feedback) pushes WITHOUT asking for approval", async () => {
 	const gitCalls: string[][] = [];
 	const runGit: CommandRunner = async (args) => {
 		gitCalls.push(args);
 		return "";
 	};
 	const record = baseRecord({
-		sourcePr: { number: 1942, url: "u", headBranch: "guildmaster/fix-x", repo: "app" },
+		sourcePr: { number: 1942, url: "https://github.com/grafana/grafana-pathfinder-app/pull/1942", headBranch: "guildmaster/fix-x", slug: "grafana/grafana-pathfinder-app", repo: "app" },
 	});
 
-	const result = await raisePr(record, { approvals: denyAll, runGit, runGh: async () => "" });
-	assert.equal(result.raised, 0);
-	assert.ok(!gitCalls.some((a) => a.join(" ") === "push"), "must not push when denied");
+	// No approvals dep exists any more; the update must push on its own.
+	const result = await raisePr(record, { runGit, runGh: async () => "" });
+	assert.equal(result.raised, 1);
+	assert.ok(gitCalls.some((a) => a.join(" ") === "push"), "address-feedback must push without a gate");
 });
 
 test("create path still opens a new PR when there is no sourcePr", async () => {
@@ -149,13 +146,57 @@ test("create path still opens a new PR when there is no sourcePr", async () => {
 	const runGit: CommandRunner = async () => "";
 	const runGh: CommandRunner = async (args) => {
 		ghCalls.push(args);
+		// No existing PR for the branch → reconciliation finds nothing, create runs.
+		if (args[0] === "pr" && args[1] === "list") return "[]";
 		return "https://github.com/grafana/grafana-pathfinder-app/pull/2000\n";
 	};
 	const record = baseRecord(); // no sourcePr
 
-	const result = await raisePr(record, { approvals: approveAll, runGit, runGh });
+	const result = await raisePr(record, { runGit, runGh });
 	assert.equal(result.raised, 1);
 	assert.match(result.results[0].reason, /Raised as a draft PR/);
 	assert.ok(ghCalls.some((a) => a.includes("create")), "expected gh pr create on the create path");
 	assert.equal(record.prs?.[0].url, "https://github.com/grafana/grafana-pathfinder-app/pull/2000");
+});
+
+test("create path opens a draft WITHOUT asking for approval", async () => {
+	const ghCalls: string[][] = [];
+	const runGit: CommandRunner = async () => "";
+	const runGh: CommandRunner = async (args) => {
+		ghCalls.push(args);
+		if (args[0] === "pr" && args[1] === "list") return "[]";
+		return "https://github.com/grafana/grafana-pathfinder-app/pull/3001\n";
+	};
+	const record = baseRecord(); // no sourcePr
+
+	// There is no approvals dependency at all: a draft is for the human to review.
+	const result = await raisePr(record, { runGit, runGh });
+	assert.equal(result.raised, 1, "a draft PR is opened with no approval gate");
+	assert.ok(ghCalls.some((a) => a.includes("create")), "expected gh pr create");
+	assert.equal(record.prs?.[0].url, "https://github.com/grafana/grafana-pathfinder-app/pull/3001");
+});
+
+test("create path adopts an existing open PR instead of creating a duplicate", async () => {
+	const gitCalls: string[][] = [];
+	const ghCalls: string[][] = [];
+	const runGit: CommandRunner = async (args) => {
+		gitCalls.push(args);
+		return "";
+	};
+	const runGh: CommandRunner = async (args) => {
+		ghCalls.push(args);
+		if (args[0] === "pr" && args[1] === "list") {
+			return JSON.stringify([{ url: "https://github.com/grafana/grafana-pathfinder-app/pull/1950", number: 1950 }]);
+		}
+		return "";
+	};
+	const record = baseRecord(); // no sourcePr
+
+	const result = await raisePr(record, { runGit, runGh });
+	assert.equal(result.raised, 1);
+	assert.match(result.results[0].reason, /adopted PR #1950/i);
+	assert.ok(gitCalls.some((a) => a.join(" ").startsWith("push")), "still pushes the latest commits");
+	assert.ok(!ghCalls.some((a) => a.includes("create")), "must NOT create a duplicate PR");
+	assert.equal(record.prs?.[0].url, "https://github.com/grafana/grafana-pathfinder-app/pull/1950");
+	assert.equal(record.prs?.[0].number, 1950);
 });
