@@ -191,6 +191,11 @@ not by prompting.
 - **Operation-aware GitHub policy** — `gh pr view/diff` is a read; `gh pr review`
   needs approval; `gh pr merge` is refused. Suspected security fixes are held back
   from auto-posting.
+- **Host shell gate** — the main Guildmaster agent's `bash` tool is gated to require
+  approval for destructive operations (`gh pr close --delete-branch`, `git push --force`,
+  `rm -rf`, `git reset --hard`, branch deletion, etc.) and remote mutations
+  (`git push`, `gh pr create`, etc.). Child agents remain structurally sandboxed
+  (no bash tool at all). Read-only commands pass freely.
 
 ---
 
