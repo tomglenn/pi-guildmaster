@@ -16,12 +16,18 @@
  * PERFORMANCE FIX: The before_agent_start hook now uses in-memory caches for
  * roster, prompts, and projects to eliminate synchronous filesystem I/O on
  * every turn. Caches expire after TTL and are invalidated by write operations.
+ *
+ * HOST SHELL GATE: The host Guildmaster agent's bash tool is now gated via a
+ * tool_call event. Destructive operations (gh pr close --delete-branch, git
+ * push --force, rm -rf, etc.) and remote mutations require explicit human approval
+ * before they run. Child agents remain structurally sandboxed (no bash tool at all).
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { BashToolCallEvent, ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { registerApprovals } from "./approvals-ui.ts";
 import { registerCommands } from "./commands.ts";
 import { registerConsultTool } from "./consult.ts";
+import { gateHostCommand } from "./execution/host-gate.ts";
 import { getApprovalManager, getQuestManager } from "./orchestration/manager.ts";
 import { type Project, ProjectStore } from "./persistence/project-store.ts";
 import { registerProjects } from "./projects-ui.ts";
@@ -92,6 +98,75 @@ export default function guildmaster(pi: ExtensionAPI): void {
 			// Never let this hook reject or hang: fall back to base systemPrompt
 			console.error("[guildmaster] before_agent_start hook error:", err);
 			return { systemPrompt: event.systemPrompt };
+		}
+	});
+
+	// Gate the host agent's bash tool. Child agents are structurally sandboxed (no bash),
+	// and the review envoy + runner shells are policy-gated separately. This event handler
+	// ensures the host's own destructive actions require explicit human approval.
+	//
+	// Forbidden operations are blocked outright; destructive/mutating operations park an
+	// approval; reads pass freely. Never throws: on internal error, fail safe by blocking.
+	pi.on("tool_call", async (event, ctx) => {
+		try {
+			// Only gate host shell tools (bash)
+			if (event.toolName !== "bash") {
+				return undefined;
+			}
+
+			// Type narrow to BashToolCallEvent
+			const bashEvent = event as BashToolCallEvent;
+			const command = bashEvent.input.command;
+			if (typeof command !== "string" || !command.trim()) {
+				return undefined; // Empty/invalid command, let it pass (will fail naturally)
+			}
+
+			// Classify and gate
+			const decision = gateHostCommand(command);
+
+			// Forbidden → block
+			if (decision.blocked) {
+				return {
+					block: true,
+					reason: `REFUSED: ${decision.operation} — ${decision.reason}`,
+					terminate: false,
+				};
+			}
+
+			// Destructive or mutate → park approval
+			if (decision.needsApproval) {
+				const approvalMgr = getApprovalManager();
+				const title = `Host shell: ${decision.operation}`;
+				const description = `Command: ${command.length > 100 ? command.slice(0, 97) + "..." : command}`;
+
+				const approved = await approvalMgr.request({
+					title,
+					description,
+					operation: decision.operation,
+				});
+
+				if (!approved) {
+					return {
+						block: true,
+						reason: `DENIED: ${decision.operation} — approval was denied by user`,
+						terminate: false,
+					};
+				}
+
+				// Approved → allow (return undefined)
+				return undefined;
+			}
+
+			// Read → pass
+			return undefined;
+		} catch (err) {
+			console.error("[guildmaster] tool_call handler error:", err);
+			const cmd = event.toolName === "bash" ? (event as BashToolCallEvent).input.command : "";
+			return {
+				block: true,
+				reason: `BLOCKED: internal gate error for "${cmd.slice(0, 50)}..." — failing safe`,
+				terminate: false,
+			};
 		}
 	});
 
