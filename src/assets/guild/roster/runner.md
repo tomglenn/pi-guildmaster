@@ -18,3 +18,10 @@ Report what happened, not what should have happened.
   `jest --watchAll=false`, `vitest run`, `tsc --noEmit`, `docker compose up -d`).
 
 Return a factual account: what you ran, what happened, and whether it passed.
+
+## File discipline
+
+Do NOT create ad-hoc test scripts like `run-test.js`, `verify-fix.sh`, or
+`quick-check.ts` in the repository. These are excluded from commits but clutter
+the worktree. Run verification commands directly or use the Quest scratch
+directory if provided.

@@ -193,7 +193,16 @@ export class StatusSurface {
 		if (prev !== record.state) {
 			this.questStates.set(record.id, record.state);
 			if (record.state === "completed") {
-				this.notify(`Quest "${record.title}" completed${record.prs?.length ? ` — ${record.prs.length} draft PR(s) ready` : ""}.`, "info");
+				const raisedCount = (record.prs ?? []).filter((p) => p.url).length;
+				const totalPrs = (record.prs ?? []).length;
+				const prStatus = raisedCount === totalPrs
+					? `${raisedCount} draft PR(s) opened`
+					: raisedCount > 0
+						? `${raisedCount}/${totalPrs} PR(s) opened (${totalPrs - raisedCount} not raised — use raise_pr)`
+						: `${totalPrs} draft PR(s) ready to raise`;
+				const prUrls = (record.prs ?? []).filter((p) => p.url).map((p) => p.url).join(", ");
+				const completionMsg = `Quest "${record.title}" completed${totalPrs > 0 ? ` — ${prStatus}` : ""}.`;
+				this.notify(completionMsg + (prUrls ? ` ${prUrls}` : ""), "info");
 				this.showQuestCard(record);
 			} else if (record.state === "failed") {
 				this.notify(`Quest "${record.title}" failed: ${record.error ?? "unknown"}.`, "error");
@@ -307,7 +316,16 @@ export class StatusSurface {
 					glyph = "⊘";
 					hint = "cancelled";
 				}
-				if (q.prs?.some((p) => !p.url)) hint = "draft PR ready → raise_pr";
+				if (q.prs && q.prs.length > 0) {
+					const raisedCount = q.prs.filter((p) => p.url).length;
+					if (raisedCount === 0) {
+						hint = "draft PR ready → raise_pr";
+					} else if (raisedCount < q.prs.length) {
+						hint = `${raisedCount}/${q.prs.length} raised → raise_pr for rest`;
+					} else {
+						hint = `${raisedCount} PR(s) opened`;
+					}
+				}
 				const titleColor = q.state === "cancelled" ? "muted" : "toolTitle";
 				box.addChild(new Text(`  ${fg(color, glyph)} ${label}${fg(titleColor, q.title)}  ${fg("muted", hint)}`, 0, 0));
 				if (snapshot.lineage[q.id]) box.addChild(new Text(`      ${fg("muted", `↳ from ${snapshot.lineage[q.id]}`)}`, 0, 0));

@@ -175,11 +175,41 @@ export function inPlaceIsolation(cwd: string, questId: string, title: string, re
  */
 const SCRATCH_PATTERNS: RegExp[] = [
 	/(^|\/)\.?temp[_-]?commit[^/]*\.sh$/i, // e.g. a runner's .temp_commit.sh used to self-commit
-	/(^|\/)\.guildmaster[-_][^/]*$/i, // stray guildmaster-* scratch files
+	/(^|\/)\.?guildmaster[-_][^/]*$/i, // stray guildmaster-* scratch files
 ];
 
 function isScratch(p: string): boolean {
 	return SCRATCH_PATTERNS.some((re) => re.test(p));
+}
+
+/**
+ * Additional repo-root junk patterns: agent-generated planning docs and ad-hoc
+ * scripts that should not enter commits. Only applied to files at repo root
+ * (no "/" in path) to avoid filtering legitimate nested files.
+ */
+const REPO_ROOT_JUNK_PATTERNS: RegExp[] = [
+	// Planning/summary docs agents write for themselves
+	/^(IMPLEMENTATION|VERIFICATION|PR_DESCRIPTION|CHANGES|BUGFIX)[-_]?\w*\.md$/i,
+	/^\w*[-_]?(SUMMARY|NOTES|PLAN|TODO|CHECKLIST)\.md$/i,
+	// Ad-hoc verification/test scripts (NOT test-utils.ts or src/test-*.ts)
+	/^(run|verify|test|check|quick|repro)[-_][\w-]*\.(js|ts|sh)$/i,
+];
+
+/**
+ * Classify paths as agent junk that should be excluded from commits.
+ * Returns the subset of paths that match junk patterns.
+ * 
+ * Existing SCRATCH_PATTERNS apply at any depth (tooling litter).
+ * REPO_ROOT_JUNK_PATTERNS apply only at repo root (planning docs, ad-hoc scripts).
+ */
+export function classifyWorktreeJunk(paths: string[]): string[] {
+	return paths.filter((p) => {
+		// Existing scratch patterns apply anywhere
+		if (isScratch(p)) return true;
+		// Repo-root junk: only top-level files (no "/" in path)
+		if (!p.includes("/") && REPO_ROOT_JUNK_PATTERNS.some((re) => re.test(p))) return true;
+		return false;
+	});
 }
 
 /**
@@ -198,7 +228,11 @@ export function commitAndDiff(iso: Isolation, message: string): WorktreeChanges 
 		.split("\n")
 		.map((s) => s.trim())
 		.filter(Boolean);
-	for (const f of staged.filter(isScratch)) {
+	const junk = classifyWorktreeJunk(staged);
+	if (junk.length > 0) {
+		console.log(`[isolation] Excluding ${junk.length} junk file(s) from commit: ${junk.join(", ")}`);
+	}
+	for (const f of junk) {
 		try {
 			git(["restore", "--staged", "--", f], iso.worktreePath);
 		} catch {

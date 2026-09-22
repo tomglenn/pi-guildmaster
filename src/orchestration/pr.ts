@@ -179,31 +179,41 @@ export async function raisePr(record: QuestRecord, deps: PrDeps): Promise<RaiseR
 		// Opening a NEW draft PR: no approval needed (a draft is for the human to review
 		// and decide on). Push first, then reconcile against the remote — a PR may already
 		// exist for this branch (e.g. opened out of band); adopt it rather than colliding
-		// on `gh pr create`.
-		await runGit(["push", "-u", "origin", pr.branch], worktreePath);
+		// on `gh pr create`. Wrapped so a push/create failure (network/auth) becomes a
+		// reported result rather than throwing: auto-raise-on-completion must not crash the
+		// Quest, and raise_pr can retry.
+		try {
+			await runGit(["push", "-u", "origin", pr.branch], worktreePath);
 
-		const existing = await findOpenPrForBranch(runGh, pr.branch, worktreePath);
-		if (existing?.url) {
-			pr.url = existing.url;
-			pr.number = existing.number;
+			const existing = await findOpenPrForBranch(runGh, pr.branch, worktreePath);
+			if (existing?.url) {
+				pr.url = existing.url;
+				pr.number = existing.number;
+				pr.draft = true;
+				results.push({
+					repo: pr.repo,
+					raised: true,
+					url: existing.url,
+					reason: `A PR already existed for \`${pr.branch}\` — adopted PR #${existing.number} and pushed the latest commits (no duplicate created).`,
+				});
+				continue;
+			}
+
+			const out = await runGh(
+				["pr", "create", "--draft", "--title", pr.title, "--body", `${pr.body}${siblingNote}`, "--head", pr.branch],
+				worktreePath,
+			);
+			const url = out.match(/https?:\/\/\S+/)?.[0];
+			pr.url = url;
 			pr.draft = true;
+			results.push({ repo: pr.repo, raised: true, url, reason: "Raised as a draft PR." });
+		} catch (err) {
 			results.push({
 				repo: pr.repo,
-				raised: true,
-				url: existing.url,
-				reason: `A PR already existed for \`${pr.branch}\` — adopted PR #${existing.number} and pushed the latest commits (no duplicate created).`,
+				raised: false,
+				reason: `Push/PR creation failed: ${err instanceof Error ? err.message : String(err)}`,
 			});
-			continue;
 		}
-
-		const out = await runGh(
-			["pr", "create", "--draft", "--title", pr.title, "--body", `${pr.body}${siblingNote}`, "--head", pr.branch],
-			worktreePath,
-		);
-		const url = out.match(/https?:\/\/\S+/)?.[0];
-		pr.url = url;
-		pr.draft = true;
-		results.push({ repo: pr.repo, raised: true, url, reason: "Raised as a draft PR." });
 	}
 
 	return { raised: results.filter((r) => r.raised).length, results };

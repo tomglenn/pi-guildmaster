@@ -101,6 +101,8 @@ export interface QuestRecord {
 	acknowledgedAt?: number;
 	/** The Quest this one was chained from (fromQuest) — multi-step lineage. */
 	parentId?: string;
+	/** Error from auto-raise attempt; user can retry with raise_pr */
+	raiseError?: string;
 }
 
 const TERMINAL: ReadonlySet<QuestState> = new Set(["completed", "failed", "cancelled"]);

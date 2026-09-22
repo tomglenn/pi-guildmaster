@@ -67,9 +67,10 @@ export function registerApprovals(pi: ExtensionAPI): void {
 		label: "Raise PR",
 		description: [
 			"Raise the draft PR for a completed write-Quest: pushes the branch and opens a DRAFT pull request.",
-			"Opening a draft needs no approval (a draft is for the human to review and decide whether to mark ready);",
-			"it never merges, and if a PR already exists for the branch it is adopted rather than duplicated. If no",
-			"questId is given, the most recent completed write-Quest with an un-raised draft is used.",
+			"PRs are auto-raised on Quest completion; use this tool to retry when auto-raise failed (network/auth) or",
+			"was blocked (security-fix detection). Opening a draft needs no approval (a draft is for the human to review",
+			"and decide whether to mark ready); it never merges, and if a PR already exists for the branch it is adopted",
+			"rather than duplicated. If no questId is given, the most recent completed write-Quest with an un-raised draft is used.",
 		].join(" "),
 		promptSnippet: "Raise (push + open draft PR) the branch a write-Quest produced; no approval needed for a draft",
 		promptGuidelines: [
