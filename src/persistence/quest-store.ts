@@ -12,8 +12,20 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { questsDir } from "../paths.ts";
 
-/** The six lifecycle states (§5). Do not add states without a demonstrated need. */
-export type QuestState = "created" | "running" | "awaiting-approval" | "completed" | "failed" | "cancelled";
+/**
+ * The lifecycle states (§5). Do not add states without a demonstrated need.
+ *   created → running → (awaiting-approval | awaiting-input)* → completed | failed | cancelled
+ * `awaiting-input` means a still-running party has PAUSED on a `request_user` gate and is
+ * parked on the user's answer in the inbox; it returns to `running` once the user responds.
+ */
+export type QuestState =
+	| "created"
+	| "running"
+	| "awaiting-approval"
+	| "awaiting-input"
+	| "completed"
+	| "failed"
+	| "cancelled";
 
 export type QuestMemberStatus = "pending" | "running" | "done" | "failed";
 

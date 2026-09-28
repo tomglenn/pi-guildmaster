@@ -25,6 +25,11 @@ export type GithubAccess =
 	| "read" // read-only envoy: gh pr view/diff/checkout, gh api reads — mutations refused
 	| "review"; // envoy may also POST a review, gated behind human approval
 
+/** Slack access granted to the party's Herald. */
+export type SlackAccess =
+	| "none" // no Herald; the party cannot reach Slack
+	| "read"; // read-only Herald: read/search channels, threads, users — writes refused
+
 export type Delivery =
 	| "report" // a written report, delivered as a card
 	| "draft-pr" // a committed branch + drafted PR (raise_pr to open)
@@ -42,6 +47,8 @@ export interface Recipe {
 	description: string;
 	write: boolean;
 	github: GithubAccess;
+	/** Slack access for the party's Herald. Omitted => "none". */
+	slack?: SlackAccess;
 	isolation: IsolationMode;
 	delivery: Delivery;
 	/** Optional restriction of the dispatchable party to these Guildmate names. */
@@ -53,11 +60,15 @@ export interface Recipe {
 }
 
 const GITHUB_ACCESS: readonly GithubAccess[] = ["none", "read", "review"];
+const SLACK_ACCESS: readonly SlackAccess[] = ["none", "read"];
 const DELIVERIES: readonly Delivery[] = ["report", "draft-pr", "post-review", "push-existing-pr"];
 const ISOLATIONS: readonly IsolationMode[] = ["none", "worktree", "attach-pr", "in-place"];
 
 export function isGithubAccess(v: unknown): v is GithubAccess {
 	return typeof v === "string" && (GITHUB_ACCESS as readonly string[]).includes(v);
+}
+export function isSlackAccess(v: unknown): v is SlackAccess {
+	return typeof v === "string" && (SLACK_ACCESS as readonly string[]).includes(v);
 }
 export function isDelivery(v: unknown): v is Delivery {
 	return typeof v === "string" && (DELIVERIES as readonly string[]).includes(v);
@@ -96,6 +107,16 @@ export const RECIPES = {
 		isolation: "none",
 		delivery: "report",
 	},
+	"slack-recon": {
+		id: "slack-recon",
+		description: "Read-only Slack reconnaissance via the Herald; produces a report. NEVER posts to Slack.",
+		write: false,
+		github: "none",
+		slack: "read",
+		isolation: "none",
+		delivery: "report",
+		party: ["herald", "scout"],
+	},
 	"pr-investigate": {
 		id: "pr-investigate",
 		description: "Fetch a PR (read-only) and analyse it — e.g. assess a reviewer's feedback and produce a plan. NEVER posts.",
@@ -119,6 +140,26 @@ export const RECIPES = {
 		github: "none",
 		isolation: "worktree",
 		delivery: "draft-pr",
+	},
+	"plan-implement": {
+		id: "plan-implement",
+		description: "Agree a plan WITH the user (a huddle), then implement it in an isolated worktree; produces a draft PR.",
+		write: true,
+		github: "none",
+		isolation: "worktree",
+		delivery: "draft-pr",
+		guidance: [
+			"This is a COLLABORATIVE build. Do NOT jump straight to implementing.",
+			"1. UNDERSTAND: dispatch scout/delver to map the relevant code, and architect to draft an approach.",
+			"2. AGREE THE PLAN WITH THE USER: write the plan as a markdown artifact and raise a `request_user` call",
+			"   with kind `huddle` (artifact = the full plan). The Quest hands the discussion to the foreground",
+			"   Guildmaster, who iterates on the plan file WITH the user and resumes you once it is settled. RE-READ",
+			"   the artifact after the huddle — the user may have edited it — and treat it as authoritative.",
+			"3. IMPLEMENT the settled plan: dispatch smith to write and runner to build/test.",
+			"4. SELF-REVIEW: have inquisitor (and warden for security-sensitive changes) attack the actual diff.",
+			"5. SENSE-CHECK: before finalizing, raise a `request_user` call with kind `review-artifact` (artifact =",
+			"   a short summary of what changed) so the user can sense-check the result. Then finalize with Scribe's PR body.",
+		].join("\n"),
 	},
 	"write-in-place": {
 		id: "write-in-place",

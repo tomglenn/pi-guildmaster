@@ -12,12 +12,13 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { discardIsolation } from "../execution/isolation.ts";
-import { questScratchDir, questsDir } from "../paths.ts";
+import { questScratchDir, questsDir, reportsDir } from "../paths.ts";
 import {
 	isTerminal,
 	newQuestId,
 	type QuestMember,
 	type QuestRecord,
+	type QuestState,
 	QuestStore,
 } from "../persistence/quest-store.ts";
 
@@ -104,6 +105,19 @@ export class QuestManager {
 		return record;
 	}
 
+	/**
+	 * Flip a still-running Quest's state (e.g. running ↔ awaiting-input around a
+	 * `request_user` gate) and repaint. Persists + emits so the board reacts, but
+	 * does NOT touch the active/terminal bookkeeping owned by `run`. Never use this
+	 * to reach a terminal state — that is `run`'s job.
+	 */
+	transition(record: QuestRecord, state: QuestState): void {
+		if (isTerminal(state)) throw new Error(`transition() cannot set terminal state "${state}"; that is run()'s job.`);
+		record.state = state;
+		this.store.save(record);
+		this.emit(record);
+	}
+
 	getActive(): QuestRecord[] {
 		return [...this.active.keys()]
 			.map((id) => this.recordCache.get(id))
@@ -125,13 +139,40 @@ export class QuestManager {
 	 * isolations + branches, deletes the record and its diff artifacts, and emits a
 	 * change so the Guild board repaints. In-place branches are left untouched.
 	 */
-	dismiss(id: string): { record?: QuestRecord; cancelledRunning: boolean; tornDown: boolean; inPlaceKept: boolean } {
+	/**
+	 * Preserve a Quest's report to the reports store so dismissing (which deletes the
+	 * record) never silently loses the artifact. Best-effort; returns the file path
+	 * when written. Only Quests that actually produced a report are saved.
+	 */
+	private persistReport(record: QuestRecord): string | undefined {
+		if (!record.report?.trim()) return undefined;
+		try {
+			const dir = reportsDir();
+			fs.mkdirSync(dir, { recursive: true });
+			const slug =
+				(record.title || "quest")
+					.toLowerCase()
+					.replace(/[^a-z0-9]+/g, "-")
+					.replace(/^-+|-+$/g, "")
+					.slice(0, 60) || "quest";
+			const file = path.join(dir, `${record.id}-${slug}.md`);
+			const header = `# ${record.title}\n\n_Quest ${record.id} · ${record.state}${record.project ? ` · ${record.project}` : ""} · saved ${new Date().toISOString()}_\n\n`;
+			fs.writeFileSync(file, `${header}${record.report.trim()}\n`, { mode: 0o600 });
+			return file;
+		} catch {
+			return undefined;
+		}
+	}
+
+	dismiss(id: string): { record?: QuestRecord; cancelledRunning: boolean; tornDown: boolean; inPlaceKept: boolean; savedReport?: string } {
 		const record = this.store.load(id);
 		if (this.active.has(id)) {
 			this.cancel(id);
 			return { record, cancelledRunning: true, tornDown: false, inPlaceKept: false };
 		}
 		if (!record) return { cancelledRunning: false, tornDown: false, inPlaceKept: false };
+		// Preserve the report BEFORE anything is torn down or deleted.
+		const savedReport = this.persistReport(record);
 		let tornDown = false;
 		let inPlaceKept = false;
 		for (const iso of record.isolations ?? []) {
@@ -160,7 +201,7 @@ export class QuestManager {
 		this.recordCache.delete(id); // Remove from cache since it's deleted
 		record.state = "cancelled";
 		this.emit(record); // listeners recompute from store (now empty of this id) and repaint
-		return { record, cancelledRunning: false, tornDown, inPlaceKept };
+		return { record, cancelledRunning: false, tornDown, inPlaceKept, savedReport };
 	}
 
 	/**

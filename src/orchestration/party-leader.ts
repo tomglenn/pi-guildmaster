@@ -13,18 +13,37 @@
  */
 
 import { randomUUID } from "node:crypto";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { type GuildmasterConfig, resolveModelSpec } from "../config.ts";
 import { collectUsage, lastAssistantText, runChildAgent, runSession } from "../execution/child-agent.ts";
 import { createEnvoyShellTool } from "../execution/gh-tool.ts";
 import { createRunnerShellTool } from "../execution/runner-shell.ts";
+import { createHeraldSlackTool, type SlackFetcher, UNBOUND_SLACK_FETCHER } from "../execution/slack-tool.ts";
 import { findGuildmate, type Guildmate, loadPartyLeaderPrompt } from "../roster.ts";
-import type { QuestMember } from "../persistence/quest-store.ts";
+import type { QuestMember, QuestState } from "../persistence/quest-store.ts";
 import type { RepoContext } from "../persistence/project-store.ts";
 import type { ApprovalManager } from "./approvals.ts";
 
+/**
+ * Hooks that let a running party PAUSE and ask the user (the `request_user` tool).
+ * Passed in by the Quest runner so the leader can gate on a decision, a choice, a
+ * free-text answer, or a draft artifact the user reads/edits before the party proceeds.
+ */
+export interface InteractiveHooks {
+	approvals: ApprovalManager;
+	questId: string;
+	/** Flip the Quest between `running` and `awaiting-input` so the board reflects the pause. */
+	setState: (state: QuestState) => void;
+	/** Scratch dir (outside any worktree) where draft artifacts for review are written. */
+	scratchDir: string;
+}
+
 const DISPATCHABLE_READONLY: ReadonlySet<string> = new Set(["read-only"]);
+// Read-only party that may also reach Slack through a gated Herald.
+const DISPATCHABLE_READONLY_SLACK: ReadonlySet<string> = new Set(["read-only", "messenger"]);
 // Read-only investigation that also needs GitHub context: the read-only specialists
 // plus the envoy, whose shell is read-only (it can fetch a PR but cannot post/mutate).
 const DISPATCHABLE_READONLY_GH: ReadonlySet<string> = new Set(["read-only", "envoy"]);
@@ -128,7 +147,7 @@ function buildRepoBlock(contexts: RepoContext[]): string[] {
 	];
 }
 
-function buildSystemPrompt(basePrompt: string, available: Guildmate[], config: GuildmasterConfig, write: boolean, contexts: RepoContext[], globalInstructions: string | undefined, instructions: string | undefined, reviewMode: boolean, acquire: boolean, openTag: string, endTag: string, partyHint?: string[]): string {
+function buildSystemPrompt(basePrompt: string, available: Guildmate[], config: GuildmasterConfig, write: boolean, contexts: RepoContext[], globalInstructions: string | undefined, instructions: string | undefined, reviewMode: boolean, acquire: boolean, openTag: string, endTag: string, partyHint: string[] | undefined, interactive: boolean): string {
 	const roster = available
 		.map((m) => `- ${m.name} [${m.tier}] (model: ${resolveModelSpec(config, m.model) ?? "default"}): ${m.tagline ?? m.description}`)
 		.join("\n");
@@ -138,7 +157,18 @@ function buildSystemPrompt(basePrompt: string, available: Guildmate[], config: G
 		: [];
 	const projectBlock = instructions?.trim() ? ["## Project context", instructions.trim(), ""] : [];
 
+	// Standing briefing doctrine for the leader: in code so it is global and cannot be
+	// dropped by a narrow brief. Stops the leader propagating the requester's hypothesis as
+	// fact and forces the party to account for the whole surface of the work.
+	const briefingDoctrine = [
+		"## Briefing doctrine",
+		"- Do NOT propagate the requester's hypothesis as fact. Pass on the task and the artifact to examine, but instruct each member to establish scope and verify the framing from primary sources first — the brief may mischaracterise or under-scope the work.",
+		"- Before any verdict or findings, ensure the party has mapped the FULL surface (e.g. EVERY changed file in a PR), not just the part the brief highlights. A partial review must declare itself partial rather than read as complete.",
+		"",
+	];
+
 	const common = [
+		...briefingDoctrine,
 		...globalBlock,
 		...projectBlock,
 		...buildRepoBlock(contexts),
@@ -162,6 +192,21 @@ function buildSystemPrompt(basePrompt: string, available: Guildmate[], config: G
 		"- Choose only the Guildmates the task needs. There is no fixed pipeline.",
 		"- Emit multiple `dispatch` calls in one turn to run independent work in parallel.",
 		"- Feed useful findings from one Guildmate into the next one's task.",
+		...(interactive
+			? [
+					"- PAUSING FOR THE USER: you have a `request_user` tool that parks this Quest and asks the human, then",
+					"  resumes with their answer. Use it ONLY when genuinely blocked on a decision only the user can make,",
+					"  or when a plan/output must be sense-checked before you proceed or before a side-effect. Prefer",
+					"  finishing autonomously; do not pester the user with questions you can resolve by investigation.",
+					"  kinds: `approve` (yes/no gate), `choose` (offer `options`), `answer` (free-text question),",
+					"  `review-artifact` (pass the full draft as `artifact`; the user reads/edits the file, then approves or",
+					"  sends it back), or `huddle` (pass a draft as `artifact` for a genuinely COLLABORATIVE, multi-round",
+					"  decision — e.g. agreeing a PLAN before you implement: the Quest hands the discussion to the foreground",
+					"  Guildmaster, who iterates on the artifact WITH the user and resumes you once it is settled).",
+					"  Use a huddle when the decision needs back-and-forth; use the one-shot kinds when a single answer suffices.",
+					"  Fold their answer into the work before continuing.",
+				]
+			: []),
 		"- ADVERSARIAL REVIEW: for any review, correctness, security, or decision, once you have a",
 		"  substantive conclusion or plan, dispatch `inquisitor` to attack it. Inquisitor runs on a DIFFERENT",
 		"  model family by design: take its objections seriously and resolve them before finalizing.",
@@ -257,10 +302,19 @@ export async function runParty(opts: {
 	acquire?: boolean;
 	/** Advisory list of preferred Guildmates for this recipe (does not hard-restrict). */
 	partyHint?: string[];
+	/** When true, grant a READ-ONLY Herald so the party can fetch Slack context (channels,
+	 * threads, search) without any ability to post/mutate. */
+	slack?: boolean;
+	/** Transport the Herald's gated Slack tool forwards reads through. Required for Slack to
+	 * actually reach the workspace; defaults to a fetcher that fails loudly if unbound. */
+	slackFetch?: SlackFetcher;
+	/** When set, the leader gets a `request_user` tool so it can pause mid-run and ask the user. */
+	interactive?: InteractiveHooks;
 }): Promise<PartyResult> {
 	const write = opts.write ?? false;
 	const reviewMode = Boolean(opts.review);
 	const acquire = Boolean(opts.acquire) && !reviewMode && !write;
+	const slack = Boolean(opts.slack) && !reviewMode && !write;
 	const contexts = opts.contexts;
 	const dispatchable = reviewMode
 		? DISPATCHABLE_REVIEW
@@ -268,7 +322,9 @@ export async function runParty(opts: {
 			? DISPATCHABLE_WRITE
 			: acquire
 				? DISPATCHABLE_READONLY_GH
-				: DISPATCHABLE_READONLY;
+				: slack
+					? DISPATCHABLE_READONLY_SLACK
+					: DISPATCHABLE_READONLY;
 	const available = opts.roster.filter((m) => dispatchable.has(m.tier));
 	const members: QuestMember[] = [];
 	let memberCost = 0;
@@ -291,7 +347,11 @@ export async function runParty(opts: {
 					`"${params.agent}" is not a dispatchable Guildmate. Available: ${available.map((m) => m.name).join(", ")}.`,
 				);
 			}
-			const readOnly = mate.tier === "read-only";
+			// Only write/exec members mutate the tree, so only they REQUIRE a writable repo.
+			// Messenger (Herald) never touches the tree at all — it works entirely through its
+			// Slack tool — so it just takes the first context and is never blocked on writability.
+			const needsWritableRepo = mate.tier === "write" || mate.tier === "exec";
+			const readOnly = mate.tier === "read-only" || mate.tier === "messenger";
 			const context = params.repo
 				? contexts.find((c) => c.name === params.repo)
 				: readOnly
@@ -300,7 +360,7 @@ export async function runParty(opts: {
 			if (!context) {
 				throw new Error(`Unknown repo "${params.repo}". Available: ${contexts.map((c) => c.name).join(", ")}.`);
 			}
-			if (!readOnly && !context.writable) {
+			if (needsWritableRepo && !context.writable) {
 				throw new Error(
 					`${mate.name} needs a writable repo; "${context.name}" is read-only. Writable: ${contexts.filter((c) => c.writable).map((c) => c.name).join(", ") || "none"}.`,
 				);
@@ -330,7 +390,12 @@ export async function runParty(opts: {
 							[createEnvoyShellTool({ cwd: context.path, reviewMode: false })]
 						: mate.tier === "exec"
 							? [createRunnerShellTool({ cwd: context.path, ...opts.config.shell })]
-							: undefined;
+							: mate.tier === "messenger" && slack
+								? // Read-only Herald: the gated Slack tool refuses every non-read Slack
+									// operation, so this door can only fetch, never post.
+									[createHeraldSlackTool({ fetch: opts.slackFetch ?? UNBOUND_SLACK_FETCHER })]
+								: undefined;
+			const shellToolName = shellTools ? (mate.tier === "messenger" ? "slack" : "shell") : undefined;
 
 			// Requirement fidelity: write/exec members act on the code, so they must see the quest's
 			// authoritative constraints, not just the leader's paraphrase of one bounded task. The brief
@@ -347,7 +412,7 @@ export async function runParty(opts: {
 				cwd: context.path,
 				signal,
 				customTools: shellTools,
-				extraTools: shellTools ? ["shell"] : undefined,
+				extraTools: shellToolName ? [shellToolName] : undefined,
 			});
 
 			memberCost += res.usage.cost;
@@ -366,6 +431,83 @@ export async function runParty(opts: {
 		},
 	});
 
+	// The `request_user` tool: park the Quest on a typed request and resume with the answer.
+	// Present only when the runner supplied interactive hooks (always, for real Quests).
+	const interactive = opts.interactive;
+	const requestUser: ToolDefinition | undefined = interactive
+		? defineTool({
+				name: "request_user",
+				label: "Ask user",
+				description:
+					"Pause this Quest and ask the human, then resume with their answer. Use only when genuinely blocked on " +
+					"a decision only the user can make, or when a plan/output must be sense-checked before proceeding. kinds: " +
+					"approve (yes/no) | choose (with options) | answer (free text) | review-artifact (pass the FULL draft as " +
+					"`artifact`; the user reads/edits the file then approves or sends back) | huddle (pass the draft as " +
+					"`artifact`; hands a multi-round DISCUSSION to the foreground Guildmaster, who iterates on it WITH the " +
+					"user and then resumes you with the settled artifact — use for genuinely collaborative decisions like a plan).",
+				parameters: Type.Object({
+					kind: Type.Union(
+						[Type.Literal("approve"), Type.Literal("choose"), Type.Literal("answer"), Type.Literal("review-artifact"), Type.Literal("huddle")],
+						{ description: "The kind of request." },
+					),
+					title: Type.String({ description: "One-line prompt shown to the user (the topic, for a huddle)." }),
+					description: Type.Optional(Type.String({ description: "Context the user needs to decide or discuss." })),
+					options: Type.Optional(Type.Array(Type.String(), { description: "kind 'choose': the options to pick from." })),
+					artifact: Type.Optional(Type.String({ description: "kind 'review-artifact'/'huddle': the FULL draft text to write to a file for the user to read/edit." })),
+					artifactName: Type.Optional(Type.String({ description: "filename for the artifact (default draft.md, or plan.md for a huddle)." })),
+				}),
+				execute: async (_toolCallId, params, signal) => {
+					const artifactKind = params.kind === "review-artifact" || params.kind === "huddle";
+					let artifactPath: string | undefined;
+					if (artifactKind && params.artifact) {
+						try {
+							fs.mkdirSync(interactive.scratchDir, { recursive: true });
+							const fallbackName = params.kind === "huddle" ? "plan.md" : "draft.md";
+							artifactPath = path.join(interactive.scratchDir, params.artifactName?.replace(/[^\w.-]/g, "_") || fallbackName);
+							fs.writeFileSync(artifactPath, params.artifact, { mode: 0o600 });
+						} catch {
+							/* if we cannot write the artifact, still ask (the description carries the gist) */
+						}
+					}
+					interactive.setState("awaiting-input");
+					let ans;
+					try {
+						ans = await interactive.approvals.ask({
+							kind: params.kind,
+							title: params.title,
+							description: params.description,
+							options: params.options,
+							artifactPath,
+							questId: interactive.questId,
+							signal,
+						});
+					} finally {
+						interactive.setState("running");
+					}
+					let text: string;
+					if (params.kind === "approve") text = ans.approved ? "User APPROVED." : "User DENIED.";
+					else if (params.kind === "choose") text = ans.choice ? `User chose: ${ans.choice}` : ans.approved ? "User approved." : "User declined to choose.";
+					else if (params.kind === "answer") text = ans.text ? `User answered: ${ans.text}` : "User gave no answer.";
+					else if (params.kind === "huddle")
+						text = ans.approved
+							? `The huddle is SETTLED. The user and the Guildmaster iterated on the artifact — it is now authoritative, so RE-READ it and proceed accordingly.${ans.text ? ` Their closing notes: ${ans.text}` : ""}`
+							: `The user ENDED the huddle without settling${ans.text ? `; their notes: ${ans.text}` : ""}. Do not proceed with the change; finalize with what you have or record why you stopped.`;
+					else
+						text = ans.approved
+							? `User APPROVED the artifact${ans.text ? ` with notes: ${ans.text}` : " (they may have edited it — re-read the file for the authoritative version)."}`
+							: `User did NOT approve the artifact${ans.text ? `; their notes: ${ans.text}` : ""}. Revise per their notes and, if appropriate, ask again.`;
+					if (artifactKind && artifactPath) {
+						try {
+							text += `\n\n--- Current artifact content (${artifactPath}) ---\n${fs.readFileSync(artifactPath, "utf-8")}`;
+						} catch {
+							/* ignore */
+						}
+					}
+					return { content: [{ type: "text", text }], details: {} };
+				},
+			})
+		: undefined;
+
 	// Per-run report delimiters: a random id makes the tokens unique to this run, so a
 	// report that discusses the delimiter machinery cannot collide with its own wrapper.
 	const nonce = randomUUID().slice(0, 8);
@@ -375,10 +517,10 @@ export async function runParty(opts: {
 	const run = await runSession({
 		// The leader has no file tools; it just needs a valid cwd for session setup.
 		cwd: contexts[0]?.path ?? process.cwd(),
-		systemPrompt: buildSystemPrompt(loadPartyLeaderPrompt() ?? DEFAULT_LEADER_PROMPT, available, opts.config, write, contexts, opts.globalInstructions, opts.instructions, reviewMode, acquire, openTag, endTag, opts.partyHint),
+		systemPrompt: buildSystemPrompt(loadPartyLeaderPrompt() ?? DEFAULT_LEADER_PROMPT, available, opts.config, write, contexts, opts.globalInstructions, opts.instructions, reviewMode, acquire, openTag, endTag, opts.partyHint, Boolean(interactive)),
 		modelSpec: resolveModelSpec(opts.config, opts.config.partyLeaderModel),
-		tools: ["dispatch"],
-		customTools: [dispatch],
+		tools: requestUser ? ["dispatch", "request_user"] : ["dispatch"],
+		customTools: requestUser ? [dispatch, requestUser] : [dispatch],
 		promptText: opts.brief,
 		signal: opts.signal,
 	});

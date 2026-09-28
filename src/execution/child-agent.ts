@@ -228,6 +228,21 @@ export interface RunChildOptions {
 	extraTools?: string[];
 }
 
+/**
+ * Standing investigative doctrine injected into EVERY dispatched Guildmate, ahead of its
+ * persona, on every Quest/Consult and in every session. This is deliberately in code (not a
+ * per-persona line or per-project instruction) so it is global and cannot drift or be omitted
+ * by a narrow brief. It exists to prevent anchoring: a Guildmate must review the actual work,
+ * not the requester's (or the Party Leader's) characterisation of it.
+ */
+export const INVESTIGATIVE_DOCTRINE = [
+	"## Investigative doctrine (applies no matter how the task is worded)",
+	"- The task's framing is a CLAIM to verify, not an established fact. If it says \"this PR does X\", \"this is the backend part\", or \"the cause is Y\", confirm it against primary sources (the real diff, files, data) BEFORE building on it — and report plainly if the true scope or nature differs.",
+	"- Establish the FULL surface first. For anything under review, enumerate every changed file/area before analysing; for any investigation, map the relevant paths before concluding. Do not confine yourself to the slice the brief emphasises.",
+	"- If you examined only part of the surface, say so explicitly and lower your confidence accordingly. A partial examination that reads as confident is a failure.",
+	"- Prefer evidence you gathered yourself (files opened, output observed) over the brief's summary. Cite what you actually inspected; flag what you did not. Never assert a commit's author/date/branch, or any fact you could check, without checking it.",
+].join("\n");
+
 /** Run a single Guildmate (tier-derived tools + system prompt) and shape a result. */
 export async function runChildAgent(options: RunChildOptions): Promise<ChildAgentResult> {
 	const { guildmate, task, modelSpec, cwd, signal, onUpdate } = options;
@@ -243,9 +258,13 @@ export async function runChildAgent(options: RunChildOptions): Promise<ChildAgen
 		error: r.error,
 	});
 
+	// Prepend the standing doctrine ahead of the persona so it applies to every member,
+	// regardless of persona wording or how narrowly the task was briefed.
+	const systemPrompt = `${INVESTIGATIVE_DOCTRINE}\n\n${guildmate.systemPrompt}`;
+
 	const result = await runSession({
 		cwd,
-		systemPrompt: guildmate.systemPrompt,
+		systemPrompt,
 		modelSpec,
 		tools: [...toolsForTier(guildmate.tier), ...(options.extraTools ?? [])],
 		customTools: options.customTools,

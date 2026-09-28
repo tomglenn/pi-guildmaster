@@ -26,6 +26,10 @@ const TIER_TOOLS: Record<Tier, string[]> = {
 	// separate POLICY-GATED custom tool injected by orchestration (see execution/gh-tool.ts),
 	// never the raw `bash` tool — so it structurally cannot run an ungated mutation.
 	envoy: ["read", "grep", "find", "ls"],
+	// Herald talks to Slack. Like the envoy it gets read-only FILE tools here; its Slack
+	// access is a separate READ-ONLY-GATED custom tool injected by orchestration (see
+	// execution/slack-tool.ts), never raw MCP tools — so it structurally cannot post to Slack.
+	messenger: ["read", "grep", "find", "ls"],
 	// Orchestrators do not run as child agents; give them read-only if ever built as one.
 	orchestrator: ["read", "grep", "find", "ls"],
 };

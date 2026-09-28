@@ -91,7 +91,15 @@ export function registerCommands(pi: ExtensionAPI): void {
 
 	const MEMBER_ICON: Record<QuestMemberStatus, string> = { pending: "○", running: "●", done: "✓", failed: "✗" };
 	const stateColor = (s: string) =>
-		s === "completed" ? "success" : s === "failed" ? "error" : s === "cancelled" ? "warning" : "accent";
+		s === "completed"
+			? "success"
+			: s === "failed"
+				? "error"
+				: s === "cancelled"
+					? "warning"
+					: s === "awaiting-approval" || s === "awaiting-input"
+						? "warning"
+						: "accent";
 
 	pi.registerCommand("party", {
 		description: "Show active Party / Quest state",
