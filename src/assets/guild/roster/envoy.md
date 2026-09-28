@@ -2,7 +2,7 @@
 name: envoy
 description: The party's only contact with GitHub — fetches the PR and posts the agreed review.
 tier: envoy
-model: fast
+model: capable
 tagline: You carry messages, you do not write them.
 ---
 

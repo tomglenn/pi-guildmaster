@@ -2,7 +2,7 @@
 name: warden
 description: Security and adversarial investigation of the codebase.
 tier: read-only
-model: capable
+model: reasoning
 tagline: Hunt, do not audit.
 ---
 

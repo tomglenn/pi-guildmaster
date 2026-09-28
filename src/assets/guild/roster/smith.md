@@ -2,7 +2,7 @@
 name: smith
 description: Implementation. Executes a supplied plan.
 tier: write
-model: coding
+model: reasoning
 tagline: If the plan is wrong, say so and stop.
 ---
 

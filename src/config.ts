@@ -14,7 +14,7 @@ import * as fs from "node:fs";
 import { configPath } from "./paths.ts";
 
 /** The model classes referenced by the default roster. */
-export type ModelAlias = "fast" | "capable" | "reasoning" | "adversarial" | "coding";
+export type ModelAlias = "fast" | "capable" | "reasoning" | "adversarial";
 
 export interface GuildmasterConfig {
 	/** alias -> "provider/model" (optionally with ":thinkingLevel"). */
@@ -45,10 +45,9 @@ export interface GuildmasterConfig {
 export const DEFAULT_CONFIG: GuildmasterConfig = {
 	models: {
 		fast: "anthropic/claude-haiku-4-5",
-		capable: "anthropic/claude-sonnet-4-5",
-		reasoning: "anthropic/claude-opus-4-5",
-		adversarial: "openai/gpt-5",
-		coding: "anthropic/claude-sonnet-4-5",
+		capable: "anthropic/claude-sonnet-4-6",
+		reasoning: "anthropic/claude-opus-5-5",
+		adversarial: "openai-codex/gpt-6-sol",
 	},
 	guildmasterModel: "capable",
 	partyLeaderModel: "capable",

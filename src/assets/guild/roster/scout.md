@@ -2,7 +2,7 @@
 name: scout
 description: Fast, lightweight reconnaissance of unfamiliar territory.
 tier: read-only
-model: fast
+model: capable
 tagline: Breadth over depth, always.
 ---
 

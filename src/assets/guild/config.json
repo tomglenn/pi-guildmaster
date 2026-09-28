@@ -1,10 +1,9 @@
 {
   "models": {
     "fast": "anthropic/claude-haiku-4-5",
-    "capable": "anthropic/claude-sonnet-4-5",
-    "reasoning": "anthropic/claude-opus-4-5",
-    "adversarial": "openai-codex/gpt-5.5",
-    "coding": "anthropic/claude-sonnet-4-5"
+    "capable": "anthropic/claude-sonnet-4-6",
+    "reasoning": "anthropic/claude-opus-5-5",
+    "adversarial": "openai-codex/gpt-6-sol"
   },
   "guildmasterModel": "capable",
   "partyLeaderModel": "reasoning",
