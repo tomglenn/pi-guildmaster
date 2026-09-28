@@ -76,6 +76,15 @@ export function approvalsDir(): string {
 	return path.join(guildmasterHome(), "approvals");
 }
 
+/**
+ * Preserved Quest reports. A completed Quest's report is saved here on dismiss so
+ * the artifact is never lost by default when its record is torn down. Lives under
+ * the Guildmaster store (never the user's home root), alongside quests/ and worktrees/.
+ */
+export function reportsDir(): string {
+	return path.join(guildmasterHome(), "reports");
+}
+
 /** Named project registry (multi-repo). Location-independent: resolved by name, not cwd. */
 export function projectsDir(): string {
 	return path.join(guildmasterHome(), "projects");

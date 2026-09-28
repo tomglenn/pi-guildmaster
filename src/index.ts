@@ -28,6 +28,9 @@ import { registerApprovals } from "./approvals-ui.ts";
 import { registerCommands } from "./commands.ts";
 import { registerConsultTool } from "./consult.ts";
 import { gateHostCommand } from "./execution/host-gate.ts";
+import { registerHuddleTools } from "./huddle-tool.ts";
+import { bindSlackFetcher } from "./execution/slack-fetch.ts";
+import { createSlackMcpFetcher } from "./execution/slack-transport.ts";
 import { getApprovalManager, getQuestManager } from "./orchestration/manager.ts";
 import { type Project, ProjectStore } from "./persistence/project-store.ts";
 import { registerProjects } from "./projects-ui.ts";
@@ -48,9 +51,19 @@ export default function guildmaster(pi: ExtensionAPI): void {
 		// Non-fatal: commands surface an empty roster if seeding failed.
 	}
 
+	// Bind the Herald's Slack transport so Quest parties granted slack:"read" can
+	// reach the workspace read-only (the fetcher itself resolves config + OAuth token
+	// lazily at call time, so this is safe even when Slack is not configured).
+	try {
+		bindSlackFetcher(createSlackMcpFetcher());
+	} catch {
+		// Non-fatal: without a binding the Herald fails loudly only if actually dispatched.
+	}
+
 	registerInfoCard(pi);
 	registerConsultTool(pi);
 	registerQuestTool(pi);
+	registerHuddleTools(pi);
 	registerApprovals(pi);
 	registerProjects(pi);
 	registerCommands(pi);
@@ -91,6 +104,13 @@ export default function guildmaster(pi: ExtensionAPI): void {
 			const guidance =
 				"When the user refers to a project by name, resolve it to a registered project id and pass it as the `project` argument to consult/quest — do not rely on the current working directory. If the name is unknown or ambiguous, ask the user rather than guessing.";
 			parts.push(guidance);
+
+			// Standing briefing discipline (in code so it is global across every project and
+			// session): brief delegations with evidence, not conclusions, so a party derives
+			// scope from primary sources instead of inheriting — and being anchored by — your framing.
+			const briefingDiscipline =
+				"When delegating a Consult or Quest, brief with the task and the concrete artifact to examine (the PR, files, channel, data) — never a pre-baked conclusion. State any hypothesis explicitly AS a hypothesis to test, not as established fact, so the party verifies scope and framing from primary sources rather than inheriting yours. For a review or investigation, require the party to account for the whole surface (e.g. every changed file in a PR) and treat a partial examination as incomplete. Do not narrow a party's scope to a sibling artifact's description of the work.";
+			parts.push(briefingDiscipline);
 
 			const addition = parts.join("\n\n");
 			return { systemPrompt: `${event.systemPrompt}\n\n${addition}` };
@@ -181,6 +201,10 @@ export default function guildmaster(pi: ExtensionAPI): void {
 		const manager = getQuestManager();
 		for (const quest of manager.getActive()) manager.cancel(quest.id);
 		getApprovalManager().denyAll();
+		// Drop the captured ctx + cancel any pending repaint LAST: the cancel()/denyAll()
+		// calls above fire manager onChange → scheduleRepaint(), arming a timer that would
+		// otherwise fire against the now-stale ctx after a /reload and crash pi.
+		status.detach();
 	});
 
 	pi.on("session_start", async (event, ctx) => {

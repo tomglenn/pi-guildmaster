@@ -20,7 +20,17 @@
 import { type ExtensionAPI, type ExtensionContext, getMarkdownTheme, type ThemeColor } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { getApprovalManager, getQuestManager } from "./orchestration/manager.ts";
+import { desktopNotify } from "./execution/notify-desktop.ts";
 import type { QuestMemberStatus, QuestRecord } from "./persistence/quest-store.ts";
+
+/** Kind-aware inbox hint + the command that answers it. */
+const KIND_HINT: Record<string, string> = {
+	approve: "/approve",
+	choose: "/choose",
+	answer: "/answer",
+	"review-artifact": "/review",
+	huddle: "quest_huddle",
+};
 
 const WIDGET = "guildmaster-board";
 const QUEST_CARD = "guildmaster-quest";
@@ -137,7 +147,7 @@ function formatMemberChips(
 /** Overall party status colour: failed → awaiting-approval → all-done → in-flight. */
 function partyColor(record: QuestRecord): ThemeColor {
 	if (record.members.some((m) => m.status === "failed")) return "error";
-	if (record.state === "awaiting-approval") return "warning";
+	if (record.state === "awaiting-approval" || record.state === "awaiting-input") return "warning";
 	if (record.members.length > 0 && record.members.every((m) => m.status === "done")) return "success";
 	return "accent";
 }
@@ -171,6 +181,23 @@ export class StatusSurface {
 	attach(ctx: ExtensionContext): void {
 		this.ctx = ctx;
 		this.repaint();
+	}
+
+	/**
+	 * Drop the captured ctx and cancel any pending repaint. Call on session_shutdown
+	 * (e.g. during /reload). After a reload/session replacement the old ctx is stale
+	 * and touching ctx.ui throws; a debounced repaint timer (armed by the quest
+	 * cancellations that shutdown itself triggers) would otherwise fire against that
+	 * stale ctx and crash pi with an uncaughtException. Detaching here guarantees no
+	 * timer or notify runs against a stale ctx before the next attach().
+	 */
+	detach(): void {
+		if (this.repaintTimer) {
+			clearTimeout(this.repaintTimer);
+			this.repaintTimer = undefined;
+		}
+		this.repaintScheduled = false;
+		this.ctx = undefined;
 	}
 
 	/**
@@ -209,6 +236,8 @@ export class StatusSurface {
 				this.showQuestCard(record);
 			} else if (record.state === "awaiting-approval") {
 				this.notify(`Quest "${record.title}" is awaiting approval.`, "warning");
+			} else if (record.state === "awaiting-input") {
+				this.notify(`Quest "${record.title}" is paused, waiting on you — see /inbox.`, "warning");
 			}
 		}
 		this.scheduleRepaint();
@@ -217,7 +246,17 @@ export class StatusSurface {
 	private onApprovalChange(): void {
 		const current = getApprovalManager().list();
 		for (const a of current) {
-			if (!this.knownApprovals.has(a.id)) this.notify(`Approval needed — /approve ${a.id}  (${a.title})`, "warning");
+			if (!this.knownApprovals.has(a.id)) {
+				if (a.kind === "huddle") {
+					this.notify(`Huddle ready — a Quest wants to work through "${a.title}" with you. Ask me to pick it up.`, "warning");
+					desktopNotify(a.title, "A Quest wants to huddle — ask the Guildmaster to pick it up.");
+				} else {
+					const cmd = KIND_HINT[a.kind] ?? "/inbox";
+					this.notify(`Waiting on you — ${cmd} ${a.id}  (${a.title})`, "warning");
+					// Also fire a native desktop notification: the user is often away from the terminal.
+					desktopNotify(a.title, `${a.kind === "review-artifact" ? "Review" : "Request"} — ${cmd} ${a.id}`);
+				}
+			}
 		}
 		this.knownApprovals = new Set(current.map((a) => a.id));
 		this.scheduleRepaint();
@@ -247,6 +286,19 @@ export class StatusSurface {
 	 */
 	private doRepaint(): void {
 		if (!this.ctx) return;
+		try {
+			this.doRepaintInner(this.ctx);
+		} catch (err) {
+			// A reload/session replacement can leave a stale ctx captured while a
+			// debounced repaint is still queued; accessing ctx.ui then throws. Swallow
+			// it rather than crashing pi with an uncaughtException — the next attach()
+			// repaints against the fresh ctx.
+			this.ctx = undefined;
+			console.error("[guildmaster] status repaint skipped (stale ctx):", err);
+		}
+	}
+
+	private doRepaintInner(ctx: ExtensionContext): void {
 		const quests = getQuestManager();
 		const active = quests.getActive();
 		const pending = getApprovalManager().list();
@@ -259,7 +311,7 @@ export class StatusSurface {
 		);
 
 		if (active.length === 0 && pending.length === 0 && done.length === 0) {
-			this.ctx.ui.setWidget(WIDGET, undefined);
+			ctx.ui.setWidget(WIDGET, undefined);
 			return;
 		}
 
@@ -273,14 +325,19 @@ export class StatusSurface {
 			}
 		}
 		const snapshot = { active: [...active], pending: [...pending], done: [...done], lineage };
-		this.ctx.ui.setWidget(WIDGET, (_tui, theme) => {
+		ctx.ui.setWidget(WIDGET, (_tui, theme) => {
 			const fg = (c: ThemeColor, t: string) => theme.fg(c, t);
 			const box = new Container();
 			box.addChild(new Spacer(1));
 			box.addChild(new Text(fg("toolTitle", theme.bold("◆ Guildmaster Quest Log")), 0, 0));
 			for (const q of snapshot.active) {
 				const label = q.project ? fg("muted", `[${q.project}] `) : "";
-				const end = q.state === "awaiting-approval" ? `  ${fg("warning", "⏸ awaiting approval")}` : "";
+				const end =
+					q.state === "awaiting-approval"
+						? `  ${fg("warning", "⏸ awaiting approval")}`
+						: q.state === "awaiting-input"
+							? `  ${fg("warning", "⏸ waiting on you — /inbox")}`
+							: "";
 				
 				// Calculate width budget for member chips
 				// Use process.stdout.columns as terminal width (may differ from widget width, but acceptable approximation)
@@ -289,7 +346,7 @@ export class StatusSurface {
 				if (termWidth !== undefined) {
 					// Build prefix/suffix to measure overhead
 					const prefix = `  ● ${q.project ? `[${q.project}] ` : ""}${q.title}  `;
-					const suffix = q.state === "awaiting-approval" ? "  ⏸ awaiting approval" : "";
+					const suffix = q.state === "awaiting-approval" ? "  ⏸ awaiting approval" : q.state === "awaiting-input" ? "  ⏸ waiting on you — /inbox" : "";
 					const budget = termWidth - visibleWidth(prefix) - visibleWidth(suffix);
 					chips = formatMemberChips(q, theme, budget);
 				} else {

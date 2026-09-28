@@ -22,6 +22,7 @@ import {
 	isDelivery,
 	isGithubAccess,
 	isIsolation,
+	isSlackAccess,
 	type Recipe,
 	type RecipeRegistry,
 } from "./recipes.ts";
@@ -31,6 +32,7 @@ type RecipeFrontmatter = {
 	id?: unknown;
 	description?: unknown;
 	github?: unknown;
+	slack?: unknown;
 	write?: unknown;
 	isolation?: unknown;
 	delivery?: unknown;
@@ -72,12 +74,14 @@ export function parseRecipeFile(
 	if (!id) return { issue: "missing `name`/`id`" };
 
 	const github = frontmatter.github !== undefined ? frontmatter.github : base?.github;
+	const slack = frontmatter.slack !== undefined ? frontmatter.slack : (base?.slack ?? "none");
 	const isolation = frontmatter.isolation !== undefined ? frontmatter.isolation : base?.isolation;
 	const delivery = frontmatter.delivery !== undefined ? frontmatter.delivery : base?.delivery;
 	const write = asBool(frontmatter.write) ?? base?.write;
 
 	// Guardrail: a recipe may only compose KNOWN capability values.
 	if (!isGithubAccess(github)) return { issue: `invalid or missing \`github\` (got ${JSON.stringify(frontmatter.github ?? null)})` };
+	if (!isSlackAccess(slack)) return { issue: `invalid \`slack\` (got ${JSON.stringify(frontmatter.slack ?? null)})` };
 	if (!isIsolation(isolation)) return { issue: `invalid or missing \`isolation\` (got ${JSON.stringify(frontmatter.isolation ?? null)})` };
 	if (!isDelivery(delivery)) return { issue: `invalid or missing \`delivery\` (got ${JSON.stringify(frontmatter.delivery ?? null)})` };
 	if (write === undefined) return { issue: "missing `write` (true/false)" };
@@ -87,6 +91,7 @@ export function parseRecipeFile(
 		description: asString(frontmatter.description) ?? base?.description ?? id,
 		write,
 		github,
+		slack,
 		isolation,
 		delivery,
 		party: asStringArray(frontmatter.party) ?? base?.party,

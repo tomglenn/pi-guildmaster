@@ -21,6 +21,7 @@ import { Type } from "typebox";
 import { effectiveConfig, loadConfig } from "./config.ts";
 import type { GuildmasterConfig } from "./config.ts";
 import { postReview, type ReviewVerdict } from "./execution/gh-tool.ts";
+import { getSlackFetcher } from "./execution/slack-fetch.ts";
 import { attachToExistingBranch, commitAndDiff, createWorktree, inPlaceIsolation, isGitRepo, isWorkingTreeClean } from "./execution/isolation.ts";
 import { formatFeedbackBrief, gatherPrFeedback } from "./orchestration/pr-feedback.ts";
 import type { ApprovalManager } from "./orchestration/approvals.ts";
@@ -32,7 +33,7 @@ import { executionShape, preflightRecipe, resolveRecipe } from "./orchestration/
 import { pickRepoBySlug, readonlyContexts, resolveProjectQuery } from "./orchestration/resolve.ts";
 import { ProjectStore, type RepoContext } from "./persistence/project-store.ts";
 import type { QuestRecord } from "./persistence/quest-store.ts";
-import { guildmasterHome, questsDir } from "./paths.ts";
+import { guildmasterHome, questScratchDir, questsDir } from "./paths.ts";
 import { loadRoster } from "./roster.ts";
 
 function started(record: QuestRecord, projectId?: string, targetRepo?: string, write = false, inPlace = false) {
@@ -115,6 +116,8 @@ async function runQuestInBackground(
 		review?: { prText?: string; approvals: ApprovalManager; number: string; slug?: string; repoName?: string; label: string };
 		/** Read-only GitHub acquisition (investigate mode): envoy can fetch but not post. */
 		acquire?: boolean;
+		/** Read-only Slack acquisition: a gated Herald can fetch channels/threads but not post. */
+		slack?: boolean;
 		/** Advisory preferred party (from the recipe). */
 		partyHint?: string[];
 	},
@@ -134,8 +137,18 @@ async function runQuestInBackground(
 				instructions: opts.instructions,
 				review: opts.review ? { prText: opts.review.prText, approvals: opts.review.approvals, questId: record.id } : undefined,
 				acquire: opts.acquire,
+				slack: opts.slack,
+				slackFetch: getSlackFetcher(),
 				partyHint: opts.partyHint,
 				onProgress: (members) => api.setMembers(members),
+				// Let the party pause mid-run and ask the user (the `request_user` tool). State
+				// flips running ↔ awaiting-input around each gate so the Guild board reflects the pause.
+				interactive: {
+					approvals: getApprovalManager(),
+					questId: record.id,
+					setState: (state) => manager.transition(record, state),
+					scratchDir: questScratchDir(record.id),
+				},
 			});
 			// Persist how the party's run ended, for forensics, before anything can throw.
 			record.stopReason = party.stopReason;
@@ -220,22 +233,48 @@ async function runQuestInBackground(
 				}
 			}
 
-			// Review-Quest finalize: pause for approval, then let the envoy post (or leave a draft).
+			// Review-Quest finalize: surface the drafted review as an EDITABLE artifact and pause.
+			// The user reads/edits review.md in the inbox (/review), then /approve posts the edited
+			// file (sense-check-before-it-posts), or leaves it as a draft with optional notes.
 			if (opts.review && party.report?.trim()) {
 				const verdict = parseVerdict(party.report);
 				record.review = { number: opts.review.number, slug: opts.review.slug, repoName: opts.review.repoName, verdict };
 				record.report = party.report; // so the card / quest_status show the review while it awaits approval
 				record.state = "awaiting-approval";
 				manager.store.save(record);
-				const approved = await opts.review.approvals.request({
-					title: `Post ${verdict} review to ${opts.review.label}?`,
+
+				// Write the drafted review to a scratch file the user can edit before it posts.
+				const scratch = questScratchDir(record.id);
+				let artifactPath: string | undefined;
+				try {
+					fs.mkdirSync(scratch, { recursive: true });
+					artifactPath = path.join(scratch, "review.md");
+					fs.writeFileSync(artifactPath, party.report, { mode: 0o600 });
+				} catch {
+					artifactPath = undefined;
+				}
+
+				const ans = await opts.review.approvals.ask({
+					kind: "review-artifact",
+					title: `Sense-check the ${verdict} review for ${opts.review.label} before it posts`,
 					description: party.report.slice(0, 4000),
 					operation: `gh pr review --${verdict}`,
+					artifactPath,
 					questId: record.id,
+					signal: api.signal,
 				});
-				if (approved) {
+				if (ans.approved) {
+					// Post the CURRENT file contents — the user may have edited the review.
+					let body = party.report;
+					if (artifactPath) {
+						try {
+							body = fs.readFileSync(artifactPath, "utf-8") || party.report;
+						} catch {
+							/* fall back to the drafted report */
+						}
+					}
 					const cwd = opts.contexts[0]?.path ?? process.cwd();
-					const res = postReview({ cwd, number: opts.review.number, slug: opts.review.slug, verdict, body: party.report, prText: opts.review.prText });
+					const res = postReview({ cwd, number: opts.review.number, slug: opts.review.slug, verdict, body, prText: opts.review.prText });
 					if (!res.error) {
 						record.review.posted = true;
 						record.review.url = res.url;
@@ -243,10 +282,11 @@ async function runQuestInBackground(
 					const note = res.error
 						? `\n\n---\n⚠\ufe0f Posting failed: ${res.error}. Left as a draft.`
 						: `\n\n---\n✅ Posted **${verdict}** review${res.url ? `: ${res.url}` : ""}.`;
-					return { report: `${party.report}${note}`, usage: party.usage };
+					return { report: `${body}${note}`, usage: party.usage };
 				}
+				const back = ans.text ? `\n\nYour notes: ${ans.text}` : "";
 				return {
-					report: `${party.report}\n\n---\n🚪 Not posted — left as a draft. Ask me to post it when you're ready.`,
+					report: `${party.report}\n\n---\n🚪 Not posted — left as a draft. Ask me to post it when you're ready.${back}`,
 					usage: party.usage,
 				};
 			}
@@ -656,7 +696,7 @@ export function registerQuestTool(pi: ExtensionAPI): void {
 					content: [
 						{
 							type: "text" as const,
-							text: `Started PR review Quest "${record.title}" (id ${record.id})${project ? ` for ${project.id}` : ""} on ${prLabel}. The party fetches the PR, reviews it (correctness, security, adversarial), and Scribe drafts the review. When it's ready the Quest PAUSES for your approval: /approve to have the envoy post it, or leave it as a draft. Nothing is posted without your /approve, and it never merges.`,
+							text: `Started PR review Quest "${record.title}" (id ${record.id})${project ? ` for ${project.id}` : ""} on ${prLabel}. The party fetches the PR, reviews it (correctness, security, adversarial), and Scribe drafts the review. When it's ready the Quest PAUSES and drops the review into your inbox as an EDITABLE draft: /review it (read + edit review.md), then /approve to post the edited version or /deny to leave it as a draft. Nothing is posted without your approval, and it never merges.`,
 						},
 					],
 					details: { id: record.id, project: project?.id, pr: prLabel },
@@ -715,7 +755,7 @@ export function registerQuestTool(pi: ExtensionAPI): void {
 				record.parentId = parent.id;
 				manager.store.save(record);
 			}
-			void runQuestInBackground(record, { write: false, acquire, contexts, config, globalInstructions: config.globalInstructions, instructions, partyHint: recipe.party });
+			void runQuestInBackground(record, { write: false, acquire, slack: recipe.slack === "read", contexts, config, globalInstructions: config.globalInstructions, instructions, partyHint: recipe.party });
 			return started(record, project?.id, undefined, false);
 		},
 
@@ -775,9 +815,10 @@ export function registerQuestTool(pi: ExtensionAPI): void {
 		label: "Quest Dismiss",
 		description: [
 			"Stand a Quest down and remove it from the Guild board. Cancels it if still running; for a finished",
-			"Quest it tears down the isolated worktree + branch, deletes the record and its saved diff, and",
-			"refreshes the board. In-place Quests keep their branch (that is the user's real checkout) — only the",
-			"record is removed. Never touches the user's checkout. Use to clean up demo/abandoned Quests.",
+			"Quest it first PRESERVES its report to the Guildmaster reports store, then tears down the isolated",
+			"worktree + branch, deletes the record and its saved diff, and refreshes the board. In-place Quests keep",
+			"their branch (that is the user's real checkout) — only the record is removed. Never touches the user's",
+			"checkout. Use to clean up demo/abandoned Quests.",
 		].join(" "),
 		promptSnippet: "Stand down and remove a Quest (cancel if running, tear down its worktree/branch, clear the board)",
 		promptGuidelines: [
@@ -788,14 +829,15 @@ export function registerQuestTool(pi: ExtensionAPI): void {
 		}),
 		async execute(_toolCallId, params) {
 			const manager = getQuestManager();
-			const { record, cancelledRunning, tornDown, inPlaceKept } = manager.dismiss(params.questId);
+			const { record, cancelledRunning, tornDown, inPlaceKept, savedReport } = manager.dismiss(params.questId);
 			if (!record) throw new Error(`No Quest with id ${params.questId}.`);
 			const title = `"${record.title}"`;
 			const branchNote = tornDown ? "worktree + branch torn down, " : inPlaceKept ? "in-place branch left intact, " : "";
+			const savedNote = savedReport ? ` Report preserved to ${savedReport}.` : "";
 			const text = cancelledRunning
 				? `Quest ${title} was still running — sent it a cancel. It will settle to "cancelled" shortly; dismiss again afterwards to remove its record and worktree.`
-				: `Dismissed Quest ${title} — ${branchNote}record and diff removed, and cleared from the Guild board.`;
-			return { content: [{ type: "text", text }], details: { id: params.questId, cancelledRunning, tornDown } };
+				: `Dismissed Quest ${title} — ${branchNote}record and diff removed, and cleared from the Guild board.${savedNote}`;
+			return { content: [{ type: "text", text }], details: { id: params.questId, cancelledRunning, tornDown, savedReport } };
 		},
 	});
 
