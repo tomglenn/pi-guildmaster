@@ -12,7 +12,7 @@
  * so context is only spent when the user actually wants the detail.
  */
 
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -20,7 +20,7 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { effectiveConfig, loadConfig } from "./config.ts";
 import type { GuildmasterConfig } from "./config.ts";
-import { postReview } from "./execution/gh-tool.ts";
+import { assertPrTarget, postReview } from "./execution/gh-tool.ts";
 import { getSlackFetcher } from "./execution/slack-fetch.ts";
 import { attachToExistingBranch, commitAndDiff, createWorktree, inPlaceIsolation, isGitRepo, isWorkingTreeClean } from "./execution/isolation.ts";
 import { formatFeedbackBrief, gatherPrFeedback } from "./orchestration/pr-feedback.ts";
@@ -86,14 +86,26 @@ function draftPrFromReport(report: string): { title: string; body: string } {
 }
 
 /** Run a Quest to completion in the background. Errors are recorded as failed by the manager. */
-/** Parse a PR target: a number, `owner/repo#number`, or a full GitHub PR URL. */
-function parsePrTarget(pr: string): { number: string; slug?: string } {
+/**
+ * Parse a PR target: a number, `owner/repo#number`, or a full GitHub PR URL.
+ * Throws unless the number is digits-only and the slug is a plain `owner/repo`,
+ * since both reach `gh` argv and the prompts.
+ */
+export function parsePrTarget(pr: string): { number: string; slug?: string } {
 	const url = pr.match(/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/i);
-	if (url) return { slug: url[1], number: url[2] };
 	const slugHash = pr.match(/^([^/\s]+\/[^/\s#]+)#(\d+)$/);
-	if (slugHash) return { slug: slugHash[1], number: slugHash[2] };
 	const num = pr.match(/^#?(\d+)$/);
-	return { number: num ? num[1] : pr };
+	const target: { number: string; slug?: string } = url
+		? { slug: url[1], number: url[2] }
+		: slugHash
+			? { slug: slugHash[1], number: slugHash[2] }
+			: { number: num ? num[1] : pr };
+	try {
+		assertPrTarget(target.number, target.slug);
+	} catch (err) {
+		throw new Error(`Invalid PR target "${pr}": ${(err as Error).message} Use a number, owner/repo#number, or a GitHub PR URL.`);
+	}
+	return target;
 }
 
 async function runQuestInBackground(
@@ -697,8 +709,8 @@ export function registerQuestTool(pi: ExtensionAPI): void {
 				// Best-effort: fetch PR title/body up front for the security gate (and to confirm it exists).
 				let prText: string | undefined;
 				try {
-					const repoFlag = target.slug ? ` --repo ${target.slug}` : "";
-					const out = execSync(`gh pr view ${target.number}${repoFlag} --json title,body`, {
+					const repoArgs = target.slug ? ["--repo", target.slug] : [];
+					const out = execFileSync("gh", ["pr", "view", target.number, ...repoArgs, "--json", "title,body"], {
 						cwd: repoPath ?? process.cwd(),
 						encoding: "utf-8",
 						timeout: 20_000,

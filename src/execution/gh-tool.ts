@@ -6,22 +6,27 @@
  * policy classifier (policy.ts) before it can run:
  *
  *   - read      (gh pr view/diff, git status)     → runs immediately
- *   - mutate    (gh pr review/comment, api POST)  → parks a human approval first
- *   - forbidden (gh pr merge)                      → refused outright
+ *   - mutate    (gh api POST, …)                  → parks a human approval first
+ *   - forbidden (gh pr merge; shell operators; the envoy posting a review/comment)
+ *                                                  → refused outright
+ *
+ * The command runs as the exact argv the gate classified (execFileSync, no shell).
+ * In a review Quest the review itself is posted only by postReview, from the
+ * confirmed /approve snapshot of review.md — never by the envoy.
  *
  * A suspected security fix is blocked from auto-publish and must be confirmed out
  * of band, honouring the org security policy. Nothing hits GitHub without either a
  * read classification or the user's explicit /approve.
  */
 
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { ApprovalManager } from "../orchestration/approvals.ts";
-import { gateReviewCommand } from "./policy.ts";
+import { gateReviewCommand, shellWords } from "./policy.ts";
 
 export type ReviewVerdict = "approve" | "request-changes" | "comment";
 
@@ -29,6 +34,42 @@ export type ReviewVerdict = "approve" | "request-changes" | "comment";
 export function reviewFlag(v: ReviewVerdict): "--approve" | "--request-changes" | "--comment" {
 	return v === "approve" ? "--approve" : v === "request-changes" ? "--request-changes" : "--comment";
 }
+
+/** A PR number: digits only. */
+export const PR_NUMBER_RE = /^\d+$/;
+/** An `owner/repo` slug: word chars, dots and dashes only. */
+export const REPO_SLUG_RE = /^[\w.-]+\/[\w.-]+$/;
+
+/** Throw unless `number` / `slug` are a plain PR number and `owner/repo` slug. */
+export function assertPrTarget(number: string, slug?: string): void {
+	if (!PR_NUMBER_RE.test(number)) throw new Error(`Invalid PR number "${number}": expected digits only.`);
+	if (slug !== undefined && !REPO_SLUG_RE.test(slug)) {
+		throw new Error(`Invalid repo slug "${slug}": expected owner/repo (letters, digits, _ . - only).`);
+	}
+}
+
+/** The `gh` argv that posts a review. Validates the target; never goes through a shell. */
+export function buildReviewArgs(opts: { number: string; slug?: string; verdict: ReviewVerdict; bodyFile: string }): string[] {
+	assertPrTarget(opts.number, opts.slug);
+	return [
+		"pr",
+		"review",
+		opts.number,
+		...(opts.slug ? ["--repo", opts.slug] : []),
+		reviewFlag(opts.verdict),
+		"--body-file",
+		opts.bodyFile,
+	];
+}
+
+/** Runs a binary with an argv (no shell). Injectable so tests can capture the argv. */
+export type ExecFile = (
+	file: string,
+	args: string[],
+	opts: { cwd: string; encoding: "utf-8"; timeout: number; stdio: ["ignore", "pipe", "pipe"] },
+) => string;
+
+const defaultExecFile: ExecFile = (file, args, opts) => execFileSync(file, args, opts);
 
 /**
  * Post a PR review via `gh pr review` (the envoy's action, run by the extension
@@ -42,15 +83,27 @@ export function postReview(opts: {
 	verdict: ReviewVerdict;
 	body: string;
 	prText?: string;
+	exec?: ExecFile;
 }): { url?: string; error?: string } {
-	const flag = reviewFlag(opts.verdict);
-	const repoFlag = opts.slug ? ` --repo ${opts.slug}` : "";
-	const gate = gateReviewCommand(`gh pr review ${opts.number}${repoFlag} ${flag}`, { reviewMode: true, prText: opts.prText });
-	if (gate.blocked) return { error: gate.reason };
-	const tmp = path.join(os.tmpdir(), `gm-review-${Date.now()}.md`);
+	const exec = opts.exec ?? defaultExecFile;
 	try {
-		fs.writeFileSync(tmp, opts.body, "utf-8");
-		execSync(`gh pr review ${opts.number}${repoFlag} ${flag} --body-file ${tmp}`, {
+		assertPrTarget(opts.number, opts.slug);
+	} catch (err) {
+		return { error: (err as Error).message };
+	}
+	const repoArgs = opts.slug ? ["--repo", opts.slug] : [];
+	const gate = gateReviewCommand(["gh", "pr", "review", opts.number, ...repoArgs, reviewFlag(opts.verdict)].join(" "), {
+		reviewMode: true,
+		prText: opts.prText,
+	});
+	if (gate.blocked) return { error: gate.reason };
+	// A private, freshly created directory + an exclusive 0600 file: nothing else can pre-create or read it.
+	let dir: string | undefined;
+	try {
+		dir = fs.mkdtempSync(path.join(os.tmpdir(), "gm-review-"));
+		const bodyFile = path.join(dir, "body.md");
+		fs.writeFileSync(bodyFile, opts.body, { encoding: "utf-8", flag: "wx", mode: 0o600 });
+		exec("gh", buildReviewArgs({ number: opts.number, slug: opts.slug, verdict: opts.verdict, bodyFile }), {
 			cwd: opts.cwd,
 			encoding: "utf-8",
 			timeout: 60_000,
@@ -59,7 +112,7 @@ export function postReview(opts: {
 		let url: string | undefined;
 		try {
 			url =
-				execSync(`gh pr view ${opts.number}${repoFlag} --json reviews -q ".reviews[-1].url"`, {
+				exec("gh", ["pr", "view", opts.number, ...repoArgs, "--json", "reviews", "-q", ".reviews[-1].url"], {
 					cwd: opts.cwd,
 					encoding: "utf-8",
 					timeout: 20_000,
@@ -73,7 +126,7 @@ export function postReview(opts: {
 		const e = err as { stderr?: string; message?: string };
 		return { error: e.stderr || e.message || String(err) };
 	} finally {
-		fs.rmSync(tmp, { force: true });
+		if (dir) fs.rmSync(dir, { recursive: true, force: true });
 	}
 }
 
@@ -90,14 +143,16 @@ export function createEnvoyShellTool(opts: {
 		name: "shell",
 		label: "Shell (gated)",
 		description:
-			"Run a shell command as the party's GitHub envoy. Read-only commands (gh pr view/diff, git status) " +
-			"run immediately. Mutations (gh pr review/comment) require the user's approval before running. " +
-			"`gh pr merge` is forbidden. Use this to fetch the PR and to post the review the party agreed.",
+			"Run ONE gh or read-only git command as the party's GitHub envoy (no shell: pipes, ;, &&, redirects " +
+			"and $(\u2026) are refused). Read-only commands (gh pr view/diff/checks, gh api GET, git status) run " +
+			"immediately. The envoy never posts reviews or comments: a review Quest's review is posted from the " +
+			"review.md comment block when the user runs /approve. Other mutations require the user's approval. " +
+			"`gh pr merge` is forbidden. Use this to fetch the PR.",
 		parameters: Type.Object({
 			command: Type.String({ description: "The shell command to run, e.g. `gh pr diff 1905`." }),
 		}),
 		execute: async (_toolCallId, params) => {
-			const gate = gateReviewCommand(params.command, { reviewMode: opts.reviewMode, prText: opts.prText });
+			const gate = gateReviewCommand(params.command, { reviewMode: opts.reviewMode, prText: opts.prText, envoy: true });
 			if (gate.blocked) {
 				return {
 					content: [{ type: "text", text: `BLOCKED (${gate.operation}): ${gate.reason}. Command not run.` }],
@@ -124,8 +179,13 @@ export function createEnvoyShellTool(opts: {
 					};
 				}
 			}
+			// Run the exact argv the gate classified, with no shell in between.
+			const argv = shellWords(params.command.trim());
+			if (argv.length === 0) {
+				return { content: [{ type: "text", text: "Command failed: empty command." }], details: {} };
+			}
 			try {
-				const out = execSync(params.command, {
+				const out = execFileSync(argv[0], argv.slice(1), {
 					cwd: opts.cwd,
 					encoding: "utf-8",
 					timeout: 60_000,

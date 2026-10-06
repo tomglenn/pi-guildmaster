@@ -17,7 +17,6 @@ const READS = [
 	"gh pr diff 1957",
 	"gh pr checks 1957",
 	"gh run view 37454274328 --log-failed",
-	`gh run view 37454274328 --log-failed 2>&1 | grep -A 60 "mount-restore migration" | head -70`,
 	"gh run list --branch main",
 	"gh run watch 123",
 	"gh run download 123 -n artifact",
@@ -34,7 +33,6 @@ const READS = [
 	"gh search prs --review-requested=@me",
 	"gh api repos/o/r/pulls/1/comments",
 	"gh api -X GET repos/o/r/pulls/1/reviews",
-	"gh api --method=GET search/issues -f q=is:open",
 	`gh api graphql -f query='query { viewer { login } }'`,
 ];
 
@@ -53,12 +51,19 @@ const NEEDS_APPROVAL = [
 	"gh api repos/o/r/issues/1/comments --field body=hi",
 	"gh api repos/o/r/pulls/1/reviews --input review.json",
 	`gh api graphql -f query='mutation { addComment(input: {}) { clientMutationId } }'`,
-	// A mutation chained behind a read still needs approval.
-	"gh pr view 1 && gh pr comment 1 --body x",
-	"gh run view 1 ; gh run rerun 1",
+	// A field flag forces a non-read even with GET; the allowlist parser is conservative.
+	"gh api --method=GET search/issues -f q=is:open",
 ];
 
-const FORBIDDEN = ["gh pr merge 1", "gh pr view 1 && gh pr merge 1 --squash", "gh pr diff 1 | cat ; gh pr merge 1"];
+const FORBIDDEN = [
+	"gh pr merge 1",
+	// Shell operators are refused outright, so nothing can ride behind a read.
+	"gh pr view 1 && gh pr merge 1 --squash",
+	"gh pr diff 1 | cat ; gh pr merge 1",
+	"gh pr view 1 && gh pr comment 1 --body x",
+	"gh run view 1 ; gh run rerun 1",
+	`gh run view 37454274328 --log-failed 2>&1 | grep -A 60 "x" | head -70`,
+];
 
 for (const c of READS) {
 	test(`read runs without approval: ${c}`, () => {
@@ -77,7 +82,7 @@ for (const c of NEEDS_APPROVAL) {
 }
 
 for (const c of FORBIDDEN) {
-	test(`merge is refused: ${c}`, () => {
+	test(`refused: ${c}`, () => {
 		assert.equal(gate(c).blocked, true);
 	});
 }
