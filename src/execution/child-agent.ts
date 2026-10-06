@@ -14,6 +14,7 @@
 
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import {
+	type AgentSessionEvent,
 	createAgentSession,
 	DefaultResourceLoader,
 	getAgentDir,
@@ -115,6 +116,8 @@ export interface RunSessionSpec {
 	signal?: AbortSignal;
 	/** Called on each turn/tool/message event with the live message list. */
 	onEvent?: (messages: AgentMessage[]) => void;
+	/** Called for EVERY session event (including streaming deltas): a liveness signal. */
+	onActivity?: (event: AgentSessionEvent) => void;
 }
 
 export interface RunSessionResult {
@@ -175,6 +178,13 @@ export async function runSession(spec: RunSessionSpec): Promise<RunSessionResult
 	// endings are an explicit cancel via `signal` (stopReason "aborted") or a genuine
 	// model/transport error. We just relay live events for the progress UI.
 	const unsubscribe = session.subscribe((event) => {
+		if (spec.onActivity) {
+			try {
+				spec.onActivity(event);
+			} catch {
+				/* a liveness hook must never break the session */
+			}
+		}
 		if (event.type === "turn_end" || event.type === "tool_execution_end" || event.type === "message_end") {
 			spec.onEvent?.(session.messages);
 		}

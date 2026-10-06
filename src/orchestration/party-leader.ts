@@ -319,6 +319,12 @@ export async function runParty(opts: {
 	slackFetch?: SlackFetcher;
 	/** When set, the leader gets a `request_user` tool so it can pause mid-run and ask the user. */
 	interactive?: InteractiveHooks;
+	/** Called on every LEADER session event (not members'): a liveness signal for the stall watchdog. */
+	onActivity?: () => void;
+	/** Called with the leader's latest assistant text as it streams, so partial output survives a stall. */
+	onLeaderText?: (text: string) => void;
+	/** Called with the leader's text once per COMPLETED assistant message (message_end only, never per delta). */
+	onLeaderMessage?: (text: string) => void;
 }): Promise<PartyResult> {
 	const write = opts.write ?? false;
 	const reviewMode = Boolean(opts.review);
@@ -379,64 +385,75 @@ export async function runParty(opts: {
 				members.push({ name: mate.name, task: params.task, model: modelSpec, status: "running", repo: context.name }) - 1;
 			opts.onProgress?.(members.slice());
 
-			// Shell access is always a bounded/gated CUSTOM tool, never raw bash: the envoy gets the
-			// policy-gated GitHub shell for review parties; the runner (exec) gets the bounded shell
-			// that refuses non-terminating commands and reaps a silently hung one.
-			const shellTools =
-				mate.tier === "envoy" && opts.review
-					? [
-							createEnvoyShellTool({
-								cwd: context.path,
-								reviewMode: true,
-								prText: opts.review.prText,
-								approvals: opts.review.approvals,
-								questId: opts.review.questId,
-							}),
-						]
-					: mate.tier === "envoy" && acquire
-						? // Read-only envoy: reviewMode:false makes policy REFUSE every mutation
-							// outright (no approval path), so this shell can only fetch.
-							[createEnvoyShellTool({ cwd: context.path, reviewMode: false })]
-						: mate.tier === "exec"
-							? [createRunnerShellTool({ cwd: context.path, ...opts.config.shell })]
-							: mate.tier === "messenger" && slack
-								? // Read-only Herald: the gated Slack tool refuses every non-read Slack
-									// operation, so this door can only fetch, never post.
-									[createHeraldSlackTool({ fetch: opts.slackFetch ?? UNBOUND_SLACK_FETCHER })]
-								: undefined;
-			const shellToolName = shellTools ? (mate.tier === "messenger" ? "slack" : "shell") : undefined;
+			// A member whose dispatch throws must never stay "running": that would mask a stall
+			// from the watchdog forever. Mark it failed, report progress, and rethrow to the leader.
+			try {
+				// Shell access is always a bounded/gated CUSTOM tool, never raw bash: the envoy gets the
+				// policy-gated GitHub shell for review parties; the runner (exec) gets the bounded shell
+				// that refuses non-terminating commands and reaps a silently hung one.
+				const shellTools =
+					mate.tier === "envoy" && opts.review
+						? [
+								createEnvoyShellTool({
+									cwd: context.path,
+									reviewMode: true,
+									prText: opts.review.prText,
+									approvals: opts.review.approvals,
+									questId: opts.review.questId,
+								}),
+							]
+						: mate.tier === "envoy" && acquire
+							? // Read-only envoy: reviewMode:false makes policy REFUSE every mutation
+								// outright (no approval path), so this shell can only fetch.
+								[createEnvoyShellTool({ cwd: context.path, reviewMode: false })]
+							: mate.tier === "exec"
+								? [createRunnerShellTool({ cwd: context.path, ...opts.config.shell })]
+								: mate.tier === "messenger" && slack
+									? // Read-only Herald: the gated Slack tool refuses every non-read Slack
+										// operation, so this door can only fetch, never post.
+										[createHeraldSlackTool({ fetch: opts.slackFetch ?? UNBOUND_SLACK_FETCHER })]
+									: undefined;
+				const shellToolName = shellTools ? (mate.tier === "messenger" ? "slack" : "shell") : undefined;
 
-			// Requirement fidelity: write/exec members act on the code, so they must see the quest's
-			// authoritative constraints, not just the leader's paraphrase of one bounded task. The brief
-			// is appended so smith/runner satisfy EVERY requirement, not only the observable one.
-			const memberTask =
-				mate.tier === "write" || mate.tier === "exec"
-					? `${params.task}\n\n## Quest brief (authoritative requirements — satisfy ALL of these, not just the task above)\n${opts.brief}`
-					: params.task;
+				// Requirement fidelity: write/exec members act on the code, so they must see the quest's
+				// authoritative constraints, not just the leader's paraphrase of one bounded task. The brief
+				// is appended so smith/runner satisfy EVERY requirement, not only the observable one.
+				const memberTask =
+					mate.tier === "write" || mate.tier === "exec"
+						? `${params.task}\n\n## Quest brief (authoritative requirements — satisfy ALL of these, not just the task above)\n${opts.brief}`
+						: params.task;
 
-			const res = await runChildAgent({
-				guildmate: mate,
-				task: memberTask,
-				modelSpec,
-				cwd: context.path,
-				signal,
-				customTools: shellTools,
-				extraTools: shellToolName ? [shellToolName] : undefined,
-			});
+				const res = await runChildAgent({
+					guildmate: mate,
+					task: memberTask,
+					modelSpec,
+					cwd: context.path,
+					signal,
+					customTools: shellTools,
+					extraTools: shellToolName ? [shellToolName] : undefined,
+				});
 
-			memberCost += res.usage.cost;
-			const failed = Boolean(res.error) || res.stopReason === "error" || res.stopReason === "aborted";
-			members[index].status = failed ? "failed" : "done";
-			members[index].summary = res.finalText.slice(0, 400);
-			opts.onProgress?.(members.slice());
+				memberCost += res.usage.cost;
+				const failed = Boolean(res.error) || res.stopReason === "error" || res.stopReason === "aborted";
+				members[index].status = failed ? "failed" : "done";
+				members[index].summary = res.finalText.slice(0, 400);
+				opts.onProgress?.(members.slice());
 
-			if (failed) {
-				return {
-					content: [{ type: "text", text: `${mate.name} failed: ${res.error ?? res.stopReason ?? "unknown"}` }],
-					details: {},
-				};
+				if (failed) {
+					return {
+						content: [{ type: "text", text: `${mate.name} failed: ${res.error ?? res.stopReason ?? "unknown"}` }],
+						details: {},
+					};
+				}
+				return { content: [{ type: "text", text: res.finalText || "(no result)" }], details: {} };
+			} catch (err) {
+				if (members[index].status === "running") {
+					members[index].status = "failed";
+					members[index].summary = `Dispatch failed: ${err instanceof Error ? err.message : String(err)}`.slice(0, 400);
+					opts.onProgress?.(members.slice());
+				}
+				throw err;
 			}
-			return { content: [{ type: "text", text: res.finalText || "(no result)" }], details: {} };
 		},
 	});
 
@@ -532,6 +549,19 @@ export async function runParty(opts: {
 		customTools: requestUser ? [dispatch, requestUser] : [dispatch],
 		promptText: opts.brief,
 		signal: opts.signal,
+		onActivity:
+			opts.onActivity || opts.onLeaderText || opts.onLeaderMessage
+				? (event) => {
+						opts.onActivity?.();
+						if ((event.type === "message_update" || event.type === "message_end") && event.message.role === "assistant") {
+							const text = lastAssistantText([event.message]);
+							if (text) {
+								opts.onLeaderText?.(text);
+								if (event.type === "message_end") opts.onLeaderMessage?.(text);
+							}
+						}
+					}
+				: undefined,
 	});
 
 	const leaderUsage = collectUsage(run.messages);

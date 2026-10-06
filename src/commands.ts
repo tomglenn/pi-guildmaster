@@ -124,7 +124,8 @@ export function registerCommands(pi: ExtensionAPI): void {
 	pi.registerCommand("quests", {
 		description: "Show current and recent Quests",
 		handler: async (_args, _ctx) => {
-			const quests: QuestRecord[] = getQuestManager().store.list().slice(0, 12);
+			// reconcileOrphans() reads the store once and fails any dead run, so it never shows as running.
+			const quests: QuestRecord[] = getQuestManager().reconcileOrphans().slice(0, 12);
 			if (quests.length === 0) {
 				showCard(pi, { title: "Quests", lines: [{ text: "No Quests yet.", color: "muted" }] });
 				return;

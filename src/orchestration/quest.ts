@@ -27,6 +27,25 @@ export interface QuestRunApi {
 	readonly signal: AbortSignal;
 	/** Replace the party member list and persist. Drives the live TUI panel. */
 	setMembers(members: QuestMember[]): void;
+	/** Record liveness (e.g. a leader session event) for the stall watchdog. Does not persist. */
+	touch(): void;
+	/** Remember the leader's latest partial text, kept as the report if the watchdog fails the run. */
+	notePartial(text: string): void;
+	/** Persist the executor's direct record changes. A no-op once run() has settled (fenced). */
+	save(): void;
+}
+
+/**
+ * How long a running Quest may go with no activity while no party member is running
+ * before the stall watchdog fails it. Also the age after which a legacy (pid-less)
+ * non-terminal record with no live run is treated as orphaned.
+ */
+export const LEADER_STALL_MS = 20 * 60_000;
+
+export interface QuestManagerTimings {
+	stallMs?: number;
+	stallCheckMs?: number;
+	stallGraceMs?: number;
 }
 
 export interface QuestOutcome {
@@ -39,6 +58,24 @@ export type QuestExecutor = (api: QuestRunApi) => Promise<QuestOutcome>;
 interface ActiveQuest {
 	controller: AbortController;
 	cancelled: boolean;
+	/** Last observed sign of life (member progress, state transition, leader event). */
+	lastActivity: number;
+	stalled: boolean;
+	stallReason?: string;
+	/** The leader's latest text, recorded as partial output on a stall. */
+	partial?: string;
+	/** run() has reached a terminal state: a late executor must not change the record. */
+	settled: boolean;
+}
+
+/** True unless signalling the pid reports ESRCH (no such process). EPERM means it exists. */
+function isProcessAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (err) {
+		return (err as NodeJS.ErrnoException).code !== "ESRCH";
+	}
 }
 
 export class QuestManager {
@@ -47,9 +84,15 @@ export class QuestManager {
 	private readonly listeners = new Set<(record: QuestRecord) => void>();
 	private readonly recordCache = new Map<string, QuestRecord>();
 	private cacheHydrated = false;
+	private readonly stallMs: number;
+	private readonly stallCheckMs: number;
+	private readonly stallGraceMs: number;
 
-	constructor(store: QuestStore = new QuestStore()) {
+	constructor(store: QuestStore = new QuestStore(), timings: QuestManagerTimings = {}) {
 		this.store = store;
+		this.stallMs = timings.stallMs ?? LEADER_STALL_MS;
+		this.stallCheckMs = timings.stallCheckMs ?? 60_000;
+		this.stallGraceMs = timings.stallGraceMs ?? 60_000;
 		this.store.onSave((record) => this.updateCache(record));
 	}
 
@@ -71,10 +114,48 @@ export class QuestManager {
 		}
 	}
 
+	/**
+	 * Fail non-terminal records that no live process is running, so a Quest left `running`
+	 * by a crashed/killed process does not show as running forever. A record is orphaned when
+	 * its owner pid is another process that is dead, or (legacy, no pid) when it has not been
+	 * updated for {@link LEADER_STALL_MS}. A record owned by THIS pid but absent from this
+	 * manager's active map is left alone: a previous module generation in this process (e.g.
+	 * before /reload) is still settling it. Reads `store.list()` once and returns that list
+	 * (newest first) with any orphans updated in place, so callers need not re-read.
+	 */
+	reconcileOrphans(now: number = Date.now()): QuestRecord[] {
+		const records = this.store.list();
+		for (const rec of records) {
+			if (isTerminal(rec.state) || this.active.has(rec.id)) continue;
+			const pid = Number.isInteger(rec.ownerPid) && (rec.ownerPid as number) > 0 ? (rec.ownerPid as number) : undefined;
+			if (pid === process.pid) continue;
+			const orphaned = pid !== undefined ? !isProcessAlive(pid) : now - rec.updatedAt > LEADER_STALL_MS;
+			if (!orphaned) continue;
+			const was = rec.state;
+			const leaderFile = this.store.leaderOutputPath(rec.id);
+			rec.state = "failed";
+			rec.error =
+				`Quest orphaned: no live process is running it (was ${was}, owner pid ${pid ?? "unknown"}). ` +
+				`Any commits on its branch are preserved; partial leader output, if any, is in ${leaderFile}.`;
+			// Keep the leader's last completed message as the report, so dismiss preserves it.
+			if (!rec.report?.trim()) {
+				try {
+					const partial = fs.readFileSync(leaderFile, "utf-8");
+					if (partial.trim()) rec.report = `_Partial output: the quest was orphaned before finishing._\n\n${partial}`;
+				} catch {
+					/* best effort: no partial output on disk */
+				}
+			}
+			this.store.save(rec);
+			this.emit(rec);
+		}
+		return records;
+	}
+
 	private hydrateCache(): void {
 		if (this.cacheHydrated) return;
 		this.cacheHydrated = true;
-		for (const rec of this.store.list()) {
+		for (const rec of this.reconcileOrphans()) {
 			if (this.active.has(rec.id) || (isTerminal(rec.state) && !rec.acknowledgedAt)) {
 				this.recordCache.set(rec.id, rec);
 			}
@@ -113,7 +194,11 @@ export class QuestManager {
 	 */
 	transition(record: QuestRecord, state: QuestState): void {
 		if (isTerminal(state)) throw new Error(`transition() cannot set terminal state "${state}"; that is run()'s job.`);
+		// Fence: once run() has settled the record, a late executor cannot revive it.
+		if (isTerminal(record.state)) return;
 		record.state = state;
+		const entry = this.active.get(record.id);
+		if (entry) entry.lastActivity = Date.now();
 		this.store.save(record);
 		this.emit(record);
 	}
@@ -228,7 +313,7 @@ export class QuestManager {
 		options: { signal?: AbortSignal; onChange?: (record: QuestRecord) => void } = {},
 	): Promise<QuestRecord> {
 		const controller = new AbortController();
-		const entry: ActiveQuest = { controller, cancelled: false };
+		const entry: ActiveQuest = { controller, cancelled: false, lastActivity: Date.now(), stalled: false, settled: false };
 		this.active.set(record.id, entry);
 
 		const linkAbort = () => {
@@ -241,12 +326,14 @@ export class QuestManager {
 		}
 
 		const persist = () => {
+			if (entry.settled) return;
 			this.store.save(record);
 			options.onChange?.(record);
 			this.emit(record);
 		};
 
 		record.state = "running";
+		record.ownerPid = process.pid;
 		persist();
 
 		const api: QuestRunApi = {
@@ -255,14 +342,57 @@ export class QuestManager {
 			},
 			signal: controller.signal,
 			setMembers: (members) => {
+				if (entry.settled) return;
 				record.members = members;
+				entry.lastActivity = Date.now();
 				persist();
+			},
+			touch: () => {
+				if (!entry.settled) entry.lastActivity = Date.now();
+			},
+			notePartial: (text) => {
+				if (!entry.settled) entry.partial = text;
+			},
+			save: () => {
+				if (!entry.settled) this.store.save(record);
 			},
 		};
 
+		// Stall watchdog: a leader that goes silent while no member is running is aborted;
+		// if it then ignores the abort for the grace period, run() settles without it.
+		let graceTimer: ReturnType<typeof setTimeout> | undefined;
+		let rejectStall: (err: Error) => void = () => {};
+		const stallSettled = new Promise<never>((_resolve, reject) => {
+			rejectStall = reject;
+		});
+		const watchdog = setInterval(() => {
+			if (entry.stalled || entry.settled || record.state !== "running") return;
+			if (record.members.some((m) => m.status === "running")) return;
+			const idle = Date.now() - entry.lastActivity;
+			if (idle <= this.stallMs) return;
+			entry.stalled = true;
+			entry.stallReason = `Party leader stalled: no activity for ${Math.round(idle / 60_000)} min after all party members finished; aborted by the stall watchdog.`;
+			controller.abort();
+			graceTimer = setTimeout(() => rejectStall(new Error(entry.stallReason)), this.stallGraceMs);
+		}, this.stallCheckMs);
+		watchdog.unref?.();
+
+		const failStalled = () => {
+			record.state = "failed";
+			record.error = entry.stallReason;
+			if (entry.partial?.trim()) {
+				record.report = `_Partial output: the party leader stalled before finishing._\n\n${entry.partial}`;
+			}
+		};
+
 		try {
-			const outcome = await executor(api);
-			if (entry.cancelled || controller.signal.aborted) {
+			const running = executor(api);
+			// If the watchdog settles first, the executor may still reject later: never unhandled.
+			running.catch(() => {});
+			const outcome = await Promise.race([running, stallSettled]);
+			if (entry.stalled) {
+				failStalled();
+			} else if (entry.cancelled || controller.signal.aborted) {
 				record.state = "cancelled";
 			} else if (!outcome.report?.trim()) {
 				// Reality check: no result means this did not complete.
@@ -274,12 +404,19 @@ export class QuestManager {
 				record.state = "completed";
 			}
 		} catch (err) {
-			record.state = entry.cancelled ? "cancelled" : "failed";
-			if (record.state === "failed") record.error = err instanceof Error ? err.message : String(err);
+			if (entry.stalled) {
+				failStalled();
+			} else {
+				record.state = entry.cancelled ? "cancelled" : "failed";
+				if (record.state === "failed") record.error = err instanceof Error ? err.message : String(err);
+			}
 		} finally {
+			clearInterval(watchdog);
+			if (graceTimer) clearTimeout(graceTimer);
 			options.signal?.removeEventListener("abort", linkAbort);
 			this.active.delete(record.id);
 			persist();
+			entry.settled = true;
 		}
 
 		return record;

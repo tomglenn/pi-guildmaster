@@ -81,6 +81,9 @@ export interface QuestRecord {
 	/** Registered project id this Quest belongs to (undefined = ad-hoc / cwd-scoped). */
 	project?: string;
 	state: QuestState;
+	/** pid of the process whose QuestManager.run() is executing this Quest. Lets another
+	 * process (or a restart) tell a live run from an orphan left by a dead process. */
+	ownerPid?: number;
 	createdAt: number;
 	updatedAt: number;
 	members: QuestMember[];
@@ -149,6 +152,11 @@ export class QuestStore {
 
 	private filePath(id: string): string {
 		return path.join(this.dir, `${id}.json`);
+	}
+
+	/** Where the leader's latest/final raw message for a Quest is kept (`<id>.leader.md`). */
+	leaderOutputPath(id: string): string {
+		return path.join(this.dir, `${id}.leader.md`);
 	}
 
 	/** Persist a record. Atomic (temp + rename). Bumps updatedAt. Enforces invariant. */

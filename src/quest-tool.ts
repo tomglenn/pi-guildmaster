@@ -118,6 +118,14 @@ async function runQuestInBackground(
 	const roster = loadRoster();
 	try {
 		await manager.run(record, async (api) => {
+			const leaderFile = manager.store.leaderOutputPath(record.id);
+			// Fence late side effects: a run that was cancelled or failed by the stall watchdog
+			// (possibly already settled) must never go on to commit, raise a PR, save or post a review.
+			// Checked after EVERY await in the post-party path, and every direct save goes through
+			// api.save(), which no-ops once run() has settled.
+			const fence = (why: string) => {
+				if (api.signal.aborted) throw new Error(why);
+			};
 			const party = await runParty({
 				brief: api.record.brief,
 				contexts: opts.contexts,
@@ -133,6 +141,20 @@ async function runQuestInBackground(
 				slackFetch: getSlackFetcher(),
 				partyHint: opts.partyHint,
 				onProgress: (members) => api.setMembers(members),
+				// Leader liveness + latest text for the stall watchdog (partial output survives a stall).
+				onActivity: () => api.touch(),
+				onLeaderText: (text) => api.notePartial(text),
+				// Each COMPLETED leader message goes to disk, so a process that dies keeps it
+				// (reconcileOrphans recovers it). The final write after runParty overwrites it.
+				onLeaderMessage: (text) => {
+					// A cancelled / stall-failed run must not keep rewriting the recovery artifact.
+					if (api.signal.aborted) return;
+					try {
+						fs.writeFileSync(leaderFile, text, { mode: 0o600 });
+					} catch {
+						/* best effort */
+					}
+				},
 				// Let the party pause mid-run and ask the user (the `request_user` tool). State
 				// flips running ↔ awaiting-input around each gate so the Guild board reflects the pause.
 				interactive: {
@@ -148,11 +170,23 @@ async function runQuestInBackground(
 			// Persist the leader's RAW final message before anything can throw. This is the
 			// recovery artifact: even if delimiter extraction truncates or the run failed,
 			// the full report source is on disk (the one lossy-without-recovery gap we hit).
+			// An empty rawFinal (e.g. an aborted party) never clobbers a non-empty leader.md.
 			try {
-				fs.writeFileSync(path.join(questsDir(), `${record.id}.leader.md`), party.rawFinal ?? "", { mode: 0o600 });
+				const raw = party.rawFinal ?? "";
+				let existing = "";
+				if (!raw.trim()) {
+					try {
+						existing = fs.readFileSync(leaderFile, "utf-8");
+					} catch {
+						/* none yet */
+					}
+				}
+				if (raw.trim() || !existing.trim()) fs.writeFileSync(leaderFile, raw, { mode: 0o600 });
 			} catch {
 				/* best effort */
 			}
+
+			fence(party.error || "Party aborted");
 
 			// A party that did not finalize has no trustworthy report: fail honestly rather
 			// than promoting partial/aborted output to a "completed" Quest.
@@ -197,22 +231,28 @@ async function runQuestInBackground(
 				// security-looking change is refused by default (safe). raise_pr can retry.
 				let raiseResult: RaiseResult | undefined;
 				if (prs.length > 0) {
+					let raiseFailure: unknown;
 					try {
 						raiseResult = await raisePr(record, {
 							confirmSecurity: undefined, // refuses security-looking changes by default
 						});
+					} catch (err) {
+						raiseFailure = err;
+					}
+					// An abort/stall during raisePr stops here: no further saves or side effects.
+					fence("Quest aborted while raising its PR; later side effects skipped.");
+					if (raiseResult) {
 						// Check for per-repo failures and record them
 						const failures = raiseResult.results.filter((r) => !r.raised);
 						if (failures.length > 0) {
 							record.raiseError = failures.map((f) => `${f.repo}: ${f.reason}`).join("; ");
 						}
-						// Save immediately so raised URLs are persisted even if something fails later
-						manager.store.save(record);
-					} catch (err) {
+					} else {
 						// Unexpected failures (not per-repo network issues) are recorded
-						record.raiseError = err instanceof Error ? err.message : String(err);
-						manager.store.save(record);
+						record.raiseError = raiseFailure instanceof Error ? raiseFailure.message : String(raiseFailure);
 					}
+					// Save immediately so raised URLs are persisted even if something fails later
+					api.save();
 				}
 
 				// A write-Quest that committed nothing did not do its job. Never present an
@@ -231,13 +271,14 @@ async function runQuestInBackground(
 			// with that snapshot — which is exactly what posts. Never the whole file, never a cached
 			// verdict. An approval without that snapshot re-parks; nothing is posted.
 			if (opts.review && party.report?.trim()) {
+				fence("Quest aborted before its review was drafted; nothing posted.");
 				const review = opts.review;
 				record.review = { number: review.number, slug: review.slug, repoName: review.repoName };
 				const initial = extractPostableReview(party.report);
 				if (!("error" in initial)) record.review.verdict = initial.verdict;
 				record.report = party.report; // so the card / quest_status show the review while it awaits approval
 				record.state = "awaiting-approval";
-				manager.store.save(record);
+				api.save();
 
 				// Write the drafted review to a scratch file the user can edit before it posts. Without
 				// it the user cannot sense-check what would post, so refuse rather than post blind.
@@ -276,7 +317,9 @@ async function runQuestInBackground(
 						questId: record.id,
 						signal: api.signal,
 					});
-					if (!ans.approved || api.signal.aborted) {
+					// Cancelled/stalled while parked on the approval: stop, never post.
+					fence("Quest aborted while awaiting review approval; nothing posted.");
+					if (!ans.approved) {
 						const back = ans.text ? `\n\nYour notes: ${ans.text}` : "";
 						return {
 							report: `${party.report}\n\n---\n🚪 Not posted — left as a draft. Ask me to post it when you're ready.${back}`,
@@ -290,6 +333,7 @@ async function runQuestInBackground(
 					}
 					// Post EXACTLY the snapshot the user confirmed (not a re-read of the file).
 					const { verdict, body } = ans.review;
+					fence("Quest aborted before its review posted; nothing posted.");
 					record.review.verdict = verdict;
 					const cwd = opts.contexts[0]?.path ?? process.cwd();
 					const res = postReview({ cwd, number: review.number, slug: review.slug, verdict, body, prText: review.prText });
@@ -799,14 +843,15 @@ export function registerQuestTool(pi: ExtensionAPI): void {
 		}),
 		async execute(_toolCallId, params) {
 			const manager = getQuestManager();
+			// Fail any orphaned non-terminal Quest first, so a dead run never reads as running.
+			const records = manager.reconcileOrphans();
 			if (params.questId) {
-				const q = manager.store.load(params.questId);
+				const q = records.find((r) => r.id === params.questId);
 				if (!q) throw new Error(`No Quest with id ${params.questId}.`);
 				return { content: [{ type: "text", text: describeQuest(q) }], details: q };
 			}
 			const active = new Set(manager.getActive().map((q) => q.id));
-			const list = manager.store
-				.list()
+			const list = records
 				.filter((q) => !params.project || q.project === params.project)
 				.slice(0, 12);
 			const text = list.length
