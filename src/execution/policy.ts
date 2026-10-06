@@ -24,6 +24,37 @@ function basename(p: string): string {
 // mutation, so it counts as a read for gating purposes.
 const GH_PR_READ = new Set(["view", "list", "checks", "diff", "status", "checkout"]);
 
+/**
+ * Read-only verbs per gh resource (besides `pr`, above). Anything not listed is
+ * treated as a mutation and needs approval, so this list fails closed. `run
+ * download` / `release download` only write artifacts to the local worktree.
+ */
+const GH_READ_VERBS: Record<string, ReadonlySet<string>> = {
+	issue: new Set(["view", "list", "status"]),
+	repo: new Set(["view", "list"]),
+	run: new Set(["view", "list", "watch", "download"]),
+	workflow: new Set(["view", "list"]),
+	release: new Set(["view", "list", "download"]),
+	label: new Set(["list"]),
+	ruleset: new Set(["view", "list", "check"]),
+	cache: new Set(["list"]),
+	gist: new Set(["view", "list"]),
+};
+
+/**
+ * Is a `gh api` call a write? An explicit non-GET method counts as a write.
+ * So do field or input flags (-f/-F/--field/--raw-field/--input) with no
+ * explicit method, because gh then defaults to POST. GraphQL always POSTs, so
+ * for it a write means the query contains a `mutation`.
+ */
+function isGhApiWrite(tokens: string[], command: string): boolean {
+	const m = command.match(/(?:-X|--method)[\s=]*([A-Za-z]+)/);
+	if (m) return m[1].toUpperCase() !== "GET";
+	const endpoint = tokens.slice(2).find((t) => !t.startsWith("-"));
+	if (endpoint === "graphql") return /\bmutation\b/i.test(command);
+	return tokens.some((t) => /^(?:-f|-F|--field|--raw-field|--input)(?:=|$)/.test(t) || /^-[fF]\S/.test(t));
+}
+
 /** Classify a shell command's privilege. Unknown/non-git-gh commands are treated as read. */
 export function classifyCommand(command: string): OpDecision {
 	const tokens = command.trim().split(/\s+/).filter(Boolean);
@@ -45,12 +76,11 @@ export function classifyCommand(command: string): OpDecision {
 			return { klass: "forbidden", operation: "gh pr merge", reason: "Guildmaster never merges; merging is the team's decision" };
 		}
 
-		const isApiWrite = sub === "api" && /(?:-X|--method)\s*(POST|PUT|PATCH|DELETE)/i.test(command);
+		const isApiWrite = sub === "api" && isGhApiWrite(tokens, command);
 		const isApiRead = sub === "api" && !isApiWrite;
 		const isRead =
 			(sub === "pr" && GH_PR_READ.has(sub2)) ||
-			(sub === "repo" && sub2 === "view") ||
-			(sub === "issue" && (sub2 === "view" || sub2 === "list")) ||
+			(sub !== undefined && sub2 !== undefined && GH_READ_VERBS[sub]?.has(sub2) === true) ||
 			sub === "search" ||
 			sub === "status" ||
 			isApiRead;
@@ -77,7 +107,13 @@ export interface ReviewGate extends OpDecision {
  * without explicit out-of-band confirmation (§ org policy).
  */
 export function gateReviewCommand(command: string, opts: { reviewMode: boolean; prText?: string }): ReviewGate {
-	const d = classifyCommand(command);
+	// Classify every chained segment. The most privileged one decides, so a
+	// mutation can't hide behind a read (`gh pr view 1 && gh pr merge 1`).
+	const rank = { read: 0, mutate: 1, forbidden: 2 } as const;
+	const segments = splitShellSegments(command);
+	const d = (segments.length ? segments : [command])
+		.map(classifyCommand)
+		.reduce((worst, cur) => (rank[cur.klass] > rank[worst.klass] ? cur : worst));
 	if (d.klass === "forbidden") return { ...d, needsApproval: false, blocked: true };
 	if (d.klass === "read") return { ...d, needsApproval: false, blocked: false };
 	// mutate:
