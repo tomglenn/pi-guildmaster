@@ -12,7 +12,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { test } from "node:test";
 import { ApprovalManager } from "../src/orchestration/approvals.ts";
-import { desktopNotify } from "../src/execution/notify-desktop.ts";
+import { buildNotifyCommand, desktopNotify, desktopNotifySuppressed } from "../src/execution/notify-desktop.ts";
 
 function tmpDir(): string {
 	return fs.mkdtempSync(path.join(os.tmpdir(), "gm-requests-"));
@@ -116,6 +116,23 @@ test("answering an unknown id is a no-op that returns false", () => {
 	assert.equal(m.resolve("nope", true), false);
 });
 
-test("desktopNotify never throws regardless of platform", () => {
+test("desktopNotify never throws, and shows nothing under the test runner", () => {
+	assert.equal(desktopNotifySuppressed(), true, "node --test should suppress real notifications");
 	assert.doesNotThrow(() => desktopNotify("title", "a message with \"quotes\" and \\ backslash"));
+});
+
+test("desktopNotifySuppressed honours the opt-out and is otherwise on", () => {
+	assert.equal(desktopNotifySuppressed({}), false);
+	assert.equal(desktopNotifySuppressed({ GUILDMASTER_DESKTOP_NOTIFY: "0" }), true);
+	assert.equal(desktopNotifySuppressed({ NODE_TEST_CONTEXT: "child" }), true);
+});
+
+test("buildNotifyCommand escapes quotes and backslashes for AppleScript", () => {
+	const c = buildNotifyCommand("title", 'a message with "quotes" and \\ backslash', "darwin");
+	assert.equal(c?.cmd, "osascript");
+	assert.equal(
+		c?.args[1],
+		'display notification "a message with \\"quotes\\" and \\\\ backslash" with title "Guildmaster" subtitle "title"',
+	);
+	assert.equal(buildNotifyCommand("t", "m", "win32"), undefined);
 });
