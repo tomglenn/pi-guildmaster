@@ -14,7 +14,8 @@ import { Type } from "typebox";
 import { getApprovalManager, getQuestManager } from "./orchestration/manager.ts";
 import { type ReviewVerdict, reviewFlag } from "./execution/gh-tool.ts";
 import type { ApprovalManager, UserRequest } from "./orchestration/approvals.ts";
-import { raisePr } from "./orchestration/pr.ts";
+import { commitsAhead } from "./execution/isolation.ts";
+import { explainUnraisable, raisePr } from "./orchestration/pr.ts";
 import { extractPostableReview } from "./orchestration/review-post.ts";
 import type { QuestRecord } from "./persistence/quest-store.ts";
 import { type CardLine, showCard } from "./ui.ts";
@@ -304,7 +305,24 @@ export function registerApprovals(pi: ExtensionAPI): void {
 						.find((q) => q.state === "completed" && q.isolations?.length && q.prs?.some((p) => !p.url));
 
 			if (!record?.prs?.some((p) => !p.url) || !record.isolations?.length) {
-				throw new Error("No completed write-Quest with an un-raised draft PR was found.");
+				if (params.questId && !record) throw new Error(`No Quest found with id "${params.questId}".`);
+				// Explain the specific Quest (or, when auto-searching, the newest write-Quest) rather
+				// than a bare refusal: e.g. a failed Quest whose branch still has commits gets the
+				// manual push / gh pr create commands. Never auto-raises it.
+				const target = record ?? manager.store.list().find((q) => q.isolations?.length);
+				if (!target) throw new Error("No completed write-Quest with an un-raised draft PR was found.");
+				if (target.prs?.length && target.prs.every((p) => p.url)) {
+					throw new Error(`Quest "${target.title}" (${target.id}) has no un-raised draft PR: all its PRs are already raised (${target.prs.map((p) => p.url).join(", ")}).`);
+				}
+				const ahead = (iso: Parameters<typeof commitsAhead>[0]) => {
+					try {
+						return commitsAhead(iso);
+					} catch {
+						return undefined; // e.g. the worktree was removed
+					}
+				};
+				const prefix = record ? "" : "No completed write-Quest with an un-raised draft PR was found. Most recent write-Quest: ";
+				throw new Error(prefix + explainUnraisable(target, ahead));
 			}
 
 			const repos = record.prs.filter((p) => !p.url).map((p) => p.repo).join(", ");

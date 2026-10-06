@@ -213,8 +213,24 @@ export function classifyWorktreeJunk(paths: string[]): string[] {
 }
 
 /**
+ * How many commits the isolation's branch HEAD is ahead of its base
+ * (`git rev-list --count <baseRef>..HEAD` in the worktree). Git errors propagate:
+ * an unreadable worktree must not masquerade as "no commits".
+ */
+export function commitsAhead(iso: Isolation): number {
+	const out = git(["rev-list", "--count", `${iso.baseRef}..HEAD`], iso.worktreePath).trim();
+	const n = Number(out);
+	if (!Number.isInteger(n) || n < 0) throw new Error(`Unexpected git rev-list --count output: "${out}"`);
+	return n;
+}
+
+/**
  * Stage and commit whatever the Party changed in the worktree (so the branch is
  * PR-ready), then return the diff vs the base. Skips hooks to stay bounded.
+ *
+ * `committed` means the branch has commits ahead of the base AFTER this step —
+ * including commits a member (e.g. runner) already made during the Quest, which
+ * leave a clean tree and nothing staged here.
  *
  * Agent scratch litter is unstaged before committing so it never enters history.
  * In in-place mode (index == the user's real repo) such litter is also deleted
@@ -262,11 +278,13 @@ export function commitAndDiff(iso: Isolation, message: string): WorktreeChanges 
 		git(["commit", "-m", message, "--no-verify"], iso.worktreePath);
 	}
 
+	// Judge by the branch, not the index: a member's own commit is real work.
+	const committed = commitsAhead(iso) > 0;
 	const range = `${iso.baseRef}..HEAD`;
 	return {
-		committed: hasChanges,
-		stat: hasChanges ? git(["diff", "--stat", range], iso.worktreePath).trim() : "",
-		diff: hasChanges ? git(["diff", range], iso.worktreePath) : "",
+		committed,
+		stat: committed ? git(["diff", "--stat", range], iso.worktreePath).trim() : "",
+		diff: committed ? git(["diff", range], iso.worktreePath) : "",
 	};
 }
 

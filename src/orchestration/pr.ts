@@ -15,7 +15,7 @@
 
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import type { QuestRecord } from "../persistence/quest-store.ts";
+import type { QuestIsolation, QuestRecord } from "../persistence/quest-store.ts";
 import { classifyCommand, isGrafanaFirstParty, isLikelySecurityFix, repoSlugFromRemote } from "../execution/policy.ts";
 
 const execFileAsync = promisify(execFile);
@@ -60,6 +60,42 @@ async function findOpenPrForBranch(runGh: CommandRunner, branch: string, cwd: st
 		/* no PR / not-JSON / gh error → treat as none and fall through to create */
 	}
 	return undefined;
+}
+
+/**
+ * Explain why raise_pr cannot raise a Quest that has no un-raised draft PR recorded
+ * (e.g. it failed, so no PR was drafted) and, for every branch that nonetheless has
+ * commits ahead of its base, give the exact manual push + draft-PR commands. Pure:
+ * `ahead` reports commits ahead of base per isolation, or undefined when unknown
+ * (e.g. the worktree is gone). Never auto-raises anything.
+ */
+export function explainUnraisable(record: QuestRecord, ahead: (iso: QuestIsolation) => number | undefined): string {
+	const status = `${record.state}${record.error ? `: ${record.error}` : ""}`;
+	const head = `Quest "${record.title}" (${record.id}) is ${status}.`;
+	const isolations = record.isolations ?? [];
+	if (isolations.length === 0) {
+		return `${head} It is not a write-Quest with a branch, so there is nothing to raise.`;
+	}
+	const counts = isolations.map((iso) => ({ iso, n: ahead(iso) }));
+	const withCommits = counts.filter((c) => c.n !== undefined && c.n > 0);
+	if (withCommits.length === 0) {
+		const unknown = counts.some((c) => c.n === undefined) ? " (some worktrees could not be checked \u2014 they may be missing)" : "";
+		return `${head} No draft PR was recorded and there are no commits ahead of base${unknown}, so there is nothing to raise.`;
+	}
+	const lines = [`${head} raise_pr cannot raise it because no draft PR was recorded for it. These branches have commits you can raise manually:`];
+	for (const { iso, n } of withCommits) {
+		const base = iso.baseLabel ?? iso.baseRef.slice(0, 12);
+		const slug = record.sourcePr && (!record.sourcePr.repo || record.sourcePr.repo === iso.repo) ? record.sourcePr.slug : undefined;
+		lines.push(
+			`- ${iso.repo}: branch \`${iso.branch}\` in ${iso.worktreePath} is ${n} commit(s) ahead of ${base}.`,
+			`    git -C ${iso.worktreePath} push -u origin ${iso.branch}`,
+			`    cd ${iso.worktreePath} && gh pr create --draft --head ${iso.branch}${slug ? ` --repo ${slug}` : ""}`,
+		);
+	}
+	for (const { iso } of counts.filter((c) => c.n === undefined)) {
+		lines.push(`- ${iso.repo}: could not count commits on \`${iso.branch}\` (worktree ${iso.worktreePath} may be missing).`);
+	}
+	return lines.join("\n");
 }
 
 /**

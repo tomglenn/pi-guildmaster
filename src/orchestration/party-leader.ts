@@ -252,6 +252,8 @@ export function buildSystemPrompt(basePrompt: string, available: Guildmate[], co
 				"  inquisitor attack the PLAN. THEN dispatch `smith` to implement and `runner` to build/test. Only",
 				"  dispatch smith after a plan exists; if smith says the plan is wrong, stop and re-plan rather than",
 				"  improvising. (Runner can only run bounded commands; watch modes/servers are refused by its shell.)",
+				"- COMMITTING: the harness commits any changes left in the worktree when the party finalizes, so smith",
+				"  having no shell is expected and smith need not commit. Commits a member makes are kept and count as changes.",
 				"- REVIEW YOUR OWN DIFF BEFORE FINALIZING: once smith has implemented and runner's build/tests are",
 				"  green, you MUST dispatch `inquisitor` (and `warden` when the change touches security/auth/input",
 				"  handling) to review the ACTUAL CHANGES, not the plan. Give the reviewer the changed-file list and",
