@@ -160,7 +160,7 @@ export function createRunnerShellTool(opts: {
 					shell: true,
 					stdio: ["ignore", "pipe", "pipe"] as ["ignore", "pipe", "pipe"],
 					detached: process.platform !== "win32",
-					env: { ...process.env, CI: "true" },
+					env: { ...scrubGitRepoEnv(process.env), CI: "true" },
 				};
 				const child = spawn(params.command, [], spawnOpts);
 
@@ -299,4 +299,18 @@ export function createRunnerShellTool(opts: {
 			});
 		},
 	});
+}
+
+/**
+ * Git env vars that pin a command to a specific repository. If pi itself was started
+ * with any of these set (e.g. from inside a git hook or `rebase --exec`), every git call
+ * the runner makes, including a project's test fixtures in temp dirs, would target that
+ * repo instead of the worktree. Strip them so the runner's cwd decides.
+ */
+const GIT_REPO_ENV = ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_PREFIX"];
+
+export function scrubGitRepoEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+	const out = { ...env };
+	for (const k of GIT_REPO_ENV) delete out[k];
+	return out;
 }

@@ -430,8 +430,37 @@ export interface RunnerGate {
  * runner acting mid-Quest — that is exactly the hole that let a party open a PR
  * out of band. Reads pass freely; so does all local git.
  */
+/**
+ * Git commands that run a nested command with GIT_DIR exported to it:
+ * `git rebase --exec/-x` and `git bisect run`. In a linked worktree GIT_DIR points
+ * into the MAIN repo's .git/worktrees/<name>, so a test suite run this way sends
+ * every `git config` / `git init` its fixtures make in temp dirs to the user's real
+ * repo (that is how a quest set core.bare=true on the user's checkout). Returns the
+ * operation name, or undefined.
+ */
+export function gitNestedExec(command: string): string | undefined {
+	const t = shellWords(command.trim());
+	if (basename(t[0] ?? "") !== "git") return undefined;
+	const subIdx = t.findIndex((w, i) => i > 0 && !w.startsWith("-"));
+	const sub = t[subIdx];
+	const rest = t.slice(subIdx + 1);
+	if (sub === "rebase" && rest.some((w) => w === "--exec" || w.startsWith("--exec=") || /^-[A-Za-z]*x/.test(w))) {
+		return "git rebase --exec";
+	}
+	if (sub === "bisect" && rest[0] === "run") return "git bisect run";
+	return undefined;
+}
+
 export function gateRunnerCommand(command: string): RunnerGate {
 	for (const seg of splitShellSegments(command)) {
+		const nested = gitNestedExec(seg);
+		if (nested) {
+			return {
+				blocked: true,
+				operation: nested,
+				reason: `${nested} exports GIT_DIR to the command it runs, which makes test fixtures write to the user's real repo; check out each commit and run the command directly instead`,
+			};
+		}
 		const d = classifyCommand(seg);
 		if (d.klass === "forbidden") {
 			return { blocked: true, operation: d.operation, reason: d.reason };

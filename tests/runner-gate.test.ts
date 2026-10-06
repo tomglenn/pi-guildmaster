@@ -70,3 +70,35 @@ test("runner shell still runs an ordinary local command", async () => {
 	assert.ok(!(result.details as any).blocked, "local command must not be blocked");
 	assert.ok((result.content[0] as any).text.includes("42"));
 });
+
+// Nested-exec git commands export GIT_DIR, which sends test fixtures' git writes to the
+// user's real repo (regression: a quest set core.bare=true on the user's checkout).
+for (const c of [
+	"git rebase --exec 'npm test' main",
+	"git rebase -x 'npm test' 9851d0a",
+	"git rebase --exec='npm run typecheck' main",
+	"git rebase -ix 'npm test' main",
+	"npm run build && git rebase -x 'npm test' main",
+	"git bisect run npm test",
+]) {
+	test(`runner refuses nested-exec git: ${c}`, () => {
+		const g = gateRunnerCommand(c);
+		assert.equal(g.blocked, true);
+		assert.match(g.reason ?? "", /GIT_DIR/);
+	});
+}
+
+for (const c of ["git rebase main", "git rebase -i main", "git rebase --continue", "git bisect start", "git log --exec-path"]) {
+	test(`runner still allows ordinary git: ${c}`, () => {
+		assert.equal(gateRunnerCommand(c).blocked, false);
+	});
+}
+
+test("scrubGitRepoEnv removes repo-pinning git vars and keeps the rest", async () => {
+	const { scrubGitRepoEnv } = await import("../src/execution/runner-shell.ts");
+	const out = scrubGitRepoEnv({ GIT_DIR: "/x/.git", GIT_WORK_TREE: "/x", GIT_AUTHOR_NAME: "a", PATH: "/bin" });
+	assert.equal(out.GIT_DIR, undefined);
+	assert.equal(out.GIT_WORK_TREE, undefined);
+	assert.equal(out.GIT_AUTHOR_NAME, "a");
+	assert.equal(out.PATH, "/bin");
+});
