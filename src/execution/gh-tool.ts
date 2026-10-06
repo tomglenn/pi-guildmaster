@@ -25,6 +25,11 @@ import { gateReviewCommand } from "./policy.ts";
 
 export type ReviewVerdict = "approve" | "request-changes" | "comment";
 
+/** The `gh pr review` flag for a verdict — the event GitHub records (APPROVE / REQUEST_CHANGES / COMMENT). */
+export function reviewFlag(v: ReviewVerdict): "--approve" | "--request-changes" | "--comment" {
+	return v === "approve" ? "--approve" : v === "request-changes" ? "--request-changes" : "--comment";
+}
+
 /**
  * Post a PR review via `gh pr review` (the envoy's action, run by the extension
  * once the user has approved). Re-runs the policy gate as a final safety check:
@@ -38,7 +43,7 @@ export function postReview(opts: {
 	body: string;
 	prText?: string;
 }): { url?: string; error?: string } {
-	const flag = opts.verdict === "approve" ? "--approve" : opts.verdict === "request-changes" ? "--request-changes" : "--comment";
+	const flag = reviewFlag(opts.verdict);
 	const repoFlag = opts.slug ? ` --repo ${opts.slug}` : "";
 	const gate = gateReviewCommand(`gh pr review ${opts.number}${repoFlag} ${flag}`, { reviewMode: true, prText: opts.prText });
 	if (gate.blocked) return { error: gate.reason };

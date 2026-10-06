@@ -55,7 +55,8 @@ export interface QuestReview {
 	number: string;
 	slug?: string;
 	repoName?: string;
-	verdict: "approve" | "request-changes" | "comment";
+	/** Unset while the draft's verdict can't be parsed; set to what was posted once confirmed. */
+	verdict?: "approve" | "request-changes" | "comment";
 	posted?: boolean;
 	url?: string;
 }

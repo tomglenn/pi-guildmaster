@@ -12,8 +12,10 @@ import * as fs from "node:fs";
 import type { ExtensionAPI, ThemeColor } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { getApprovalManager, getQuestManager } from "./orchestration/manager.ts";
+import { type ReviewVerdict, reviewFlag } from "./execution/gh-tool.ts";
 import type { ApprovalManager, UserRequest } from "./orchestration/approvals.ts";
 import { raisePr } from "./orchestration/pr.ts";
+import { extractPostableReview } from "./orchestration/review-post.ts";
 import type { QuestRecord } from "./persistence/quest-store.ts";
 import { type CardLine, showCard } from "./ui.ts";
 
@@ -49,6 +51,50 @@ function splitIdAndRest(approvals: ApprovalManager, args: string): { id?: string
 
 function requestTitle(questTitle: string | undefined, r: UserRequest): string {
 	return questTitle ? `[${questTitle}] ${r.title}` : r.title;
+}
+
+/** The GitHub review event each verdict records. */
+const REVIEW_EVENT: Record<ReviewVerdict, string> = {
+	approve: "APPROVE",
+	"request-changes": "REQUEST_CHANGES",
+	comment: "COMMENT",
+};
+
+/**
+ * The /approve confirm prompt for posting a PR review. It is self-sufficient: it has
+ * the exact event (GitHub event + gh flag + full command line) and the FULL,
+ * untruncated body that will be posted, so the user never has to trust a separate
+ * card. pi renders confirm as a wrapping text block with no length cap.
+ */
+export function buildReviewConfirm(
+	operation: string | undefined,
+	verdict: ReviewVerdict,
+	body: string,
+): { title: string; message: string } {
+	const flag = reviewFlag(verdict);
+	const command = `${operation ?? "gh pr review"} ${flag}`;
+	return {
+		title: `Post this review as ${REVIEW_EVENT[verdict]} (${flag})?`,
+		message: [
+			`Event: ${REVIEW_EVENT[verdict]}`,
+			`Command: ${command}`,
+			"Inline comments are not supported; only the body below is posted.",
+			"",
+			"----- exact body (posted verbatim) -----",
+			body,
+			"----- end of body -----",
+		].join("\n"),
+	};
+}
+
+/** Read a postsReview artifact FRESH and parse what would post (never a cached or whole-file body). */
+function readPostable(artifactPath: string | undefined): ReturnType<typeof extractPostableReview> {
+	if (!artifactPath) return { error: "the request has no review file" };
+	try {
+		return extractPostableReview(fs.readFileSync(artifactPath, "utf-8"));
+	} catch (err) {
+		return { error: `could not read ${artifactPath} (${err instanceof Error ? err.message : String(err)})` };
+	}
 }
 
 export function registerApprovals(pi: ExtensionAPI): void {
@@ -104,6 +150,40 @@ export function registerApprovals(pi: ExtensionAPI): void {
 				const id = resolveId(approvals, args);
 				if (!id) {
 					ctx.ui.notify(`No matching pending request for "${args.trim()}".`, "warning");
+					return;
+				}
+				const req = approvals.get(id);
+				if (verb === "approve" && req?.kind === "review-artifact" && req.postsReview) {
+					// Posting a PR review: parse the CURRENT file, show the exact event + body, confirm,
+					// and answer with that snapshot — it is exactly what gets posted.
+					const parsed = readPostable(req.artifactPath);
+					if ("error" in parsed) {
+						ctx.ui.notify(`Not posted: ${parsed.error}. Edit ${req.artifactPath ?? "review.md"} and /approve ${id} again.`, "warning");
+						return;
+					}
+					if (!ctx.hasUI) {
+						ctx.ui.notify(`Not posted: ${id} posts a PR review and needs an interactive confirm of the exact body. Run /approve ${id} in the interactive terminal.`, "warning");
+						return;
+					}
+					const flag = reviewFlag(parsed.verdict);
+					const command = `${req.operation ?? "gh pr review"} ${flag}`;
+					showCard(pi, {
+						title: `About to post: ${req.title}`,
+						lines: [
+							{ text: command, color: "accent", bold: true },
+							{ text: "Inline comments are not supported; only this text is posted.", color: "muted" },
+							{ text: "", color: "muted" },
+							...parsed.body.split("\n").map((line) => ({ text: line })),
+						],
+					});
+					const prompt = buildReviewConfirm(req.operation, parsed.verdict, parsed.body);
+					const ok = await ctx.ui.confirm(prompt.title, prompt.message);
+					if (!ok) {
+						ctx.ui.notify(`Not posted — ${id} is still pending. Edit ${req.artifactPath} and /approve ${id} again, or /deny ${id}.`, "info");
+						return;
+					}
+					const done = approvals.answer(id, { action: "approve", approved: true, review: { verdict: parsed.verdict, body: parsed.body } });
+					ctx.ui.notify(done ? `Request ${id} approved — posting as ${flag}.` : `Request ${id} is no longer pending; nothing posted.`, done ? "info" : "warning");
 					return;
 				}
 				approvals.resolve(id, verb === "approve");
@@ -170,9 +250,22 @@ export function registerApprovals(pi: ExtensionAPI): void {
 				content = "(could not read the artifact file)";
 			}
 			const preview = content.split("\n").slice(0, 60);
+			// A review that posts: lead with exactly what /approve would send (or why it can't).
+			const postable: CardLine[] = [];
+			if (req.postsReview) {
+				const parsed = readPostable(req.artifactPath);
+				if ("error" in parsed) {
+					postable.push({ text: `\u26a0 Cannot post: ${parsed.error}`, color: "warning", bold: true });
+				} else {
+					postable.push({ text: `Will post: ${reviewFlag(parsed.verdict)}`, color: "accent", bold: true });
+					postable.push(...parsed.body.split("\n").map((line) => ({ text: line })));
+				}
+				postable.push({ text: "", color: "muted" });
+			}
 			showCard(pi, {
 				title: `Review: ${req.title}`,
 				lines: [
+					...postable,
 					{ text: `Edit this file, then /approve ${id} to use the edited version:`, color: "muted" },
 					{ text: req.artifactPath, color: "accent" },
 					{ text: `Or /answer ${id} <notes> to send it back for revision, or /deny ${id} to leave it as a draft.`, color: "muted" },

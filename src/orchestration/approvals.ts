@@ -44,6 +44,9 @@ export interface UserRequest {
 	options?: string[];
 	/** kind "review-artifact": absolute path to a file the user reads/edits before deciding. */
 	artifactPath?: string;
+	/** kind "review-artifact": approving POSTS a PR review parsed from the artifact, so `/approve`
+	 * must show the exact event + body and return them as {@link UserAnswer.review}. */
+	postsReview?: boolean;
 	createdAt: number;
 	status: RequestStatus;
 }
@@ -61,6 +64,8 @@ export interface UserAnswer {
 	choice?: string;
 	/** kind "answer": the free text; kind "review-artifact"/send-back: the user's notes. */
 	text?: string;
+	/** postsReview requests: the exact verdict + body the user confirmed at /approve. The post uses this snapshot. */
+	review?: { verdict: "approve" | "request-changes" | "comment"; body: string };
 }
 
 interface Parked {
@@ -119,6 +124,7 @@ export class ApprovalManager {
 		operation?: string;
 		options?: string[];
 		artifactPath?: string;
+		postsReview?: boolean;
 		questId?: string;
 		signal?: AbortSignal;
 	}): Promise<UserAnswer> {
@@ -132,6 +138,7 @@ export class ApprovalManager {
 			operation: input.operation,
 			options: input.options,
 			artifactPath: input.artifactPath,
+			postsReview: input.postsReview,
 			createdAt: Date.now(),
 			status: "pending",
 		};

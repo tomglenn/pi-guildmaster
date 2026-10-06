@@ -20,13 +20,14 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { effectiveConfig, loadConfig } from "./config.ts";
 import type { GuildmasterConfig } from "./config.ts";
-import { postReview, type ReviewVerdict } from "./execution/gh-tool.ts";
+import { postReview } from "./execution/gh-tool.ts";
 import { getSlackFetcher } from "./execution/slack-fetch.ts";
 import { attachToExistingBranch, commitAndDiff, createWorktree, inPlaceIsolation, isGitRepo, isWorkingTreeClean } from "./execution/isolation.ts";
 import { formatFeedbackBrief, gatherPrFeedback } from "./orchestration/pr-feedback.ts";
 import type { ApprovalManager } from "./orchestration/approvals.ts";
 import { getApprovalManager, getQuestManager } from "./orchestration/manager.ts";
 import { raisePr, type RaiseResult } from "./orchestration/pr.ts";
+import { extractPostableReview } from "./orchestration/review-post.ts";
 import { runParty } from "./orchestration/party-leader.ts";
 import { loadRecipeRegistry } from "./orchestration/recipe-loader.ts";
 import { executionShape, preflightRecipe, resolveRecipe } from "./orchestration/recipes.ts";
@@ -85,15 +86,6 @@ function draftPrFromReport(report: string): { title: string; body: string } {
 }
 
 /** Run a Quest to completion in the background. Errors are recorded as failed by the manager. */
-/** Read the party's intended verdict from the review text (defaults to a plain comment). */
-function parseVerdict(report: string): ReviewVerdict {
-	const m = report.match(/verdict[^\n]*?(request[\s-]*changes|approve|comment)/i);
-	const v = m?.[1]?.toLowerCase();
-	if (v?.startsWith("request")) return "request-changes";
-	if (v === "approve") return "approve";
-	return "comment";
-}
-
 /** Parse a PR target: a number, `owner/repo#number`, or a full GitHub PR URL. */
 function parsePrTarget(pr: string): { number: string; slug?: string } {
 	const url = pr.match(/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/i);
@@ -234,47 +226,73 @@ async function runQuestInBackground(
 			}
 
 			// Review-Quest finalize: surface the drafted review as an EDITABLE artifact and pause.
-			// The user reads/edits review.md in the inbox (/review), then /approve posts the edited
-			// file (sense-check-before-it-posts), or leaves it as a draft with optional notes.
+			// The user reads/edits review.md in the inbox (/review). Interactive /approve parses the
+			// CURRENT file (extractPostableReview), shows the exact event + body, and on confirm answers
+			// with that snapshot — which is exactly what posts. Never the whole file, never a cached
+			// verdict. An approval without that snapshot re-parks; nothing is posted.
 			if (opts.review && party.report?.trim()) {
-				const verdict = parseVerdict(party.report);
-				record.review = { number: opts.review.number, slug: opts.review.slug, repoName: opts.review.repoName, verdict };
+				const review = opts.review;
+				record.review = { number: review.number, slug: review.slug, repoName: review.repoName };
+				const initial = extractPostableReview(party.report);
+				if (!("error" in initial)) record.review.verdict = initial.verdict;
 				record.report = party.report; // so the card / quest_status show the review while it awaits approval
 				record.state = "awaiting-approval";
 				manager.store.save(record);
 
-				// Write the drafted review to a scratch file the user can edit before it posts.
+				// Write the drafted review to a scratch file the user can edit before it posts. Without
+				// it the user cannot sense-check what would post, so refuse rather than post blind.
 				const scratch = questScratchDir(record.id);
-				let artifactPath: string | undefined;
+				const artifactPath = path.join(scratch, "review.md");
 				try {
 					fs.mkdirSync(scratch, { recursive: true });
-					artifactPath = path.join(scratch, "review.md");
 					fs.writeFileSync(artifactPath, party.report, { mode: 0o600 });
-				} catch {
-					artifactPath = undefined;
+				} catch (err) {
+					throw new Error(
+						`Could not write the review draft to ${artifactPath} (${err instanceof Error ? err.message : String(err)}). ` +
+							"Refusing to post a review that cannot be sense-checked first.",
+					);
 				}
 
-				const ans = await opts.review.approvals.ask({
-					kind: "review-artifact",
-					title: `Sense-check the ${verdict} review for ${opts.review.label} before it posts`,
-					description: party.report.slice(0, 4000),
-					operation: `gh pr review --${verdict}`,
-					artifactPath,
-					questId: record.id,
-					signal: api.signal,
-				});
-				if (ans.approved) {
-					// Post the CURRENT file contents — the user may have edited the review.
-					let body = party.report;
-					if (artifactPath) {
-						try {
-							body = fs.readFileSync(artifactPath, "utf-8") || party.report;
-						} catch {
-							/* fall back to the drafted report */
-						}
+				// The operation carries no flag: the event comes from the file at /approve time.
+				const operation = `gh pr review ${review.number}${review.slug ? ` --repo ${review.slug}` : ""}`;
+				let notPostedReason: string | undefined;
+				// Loop until the user posts a confirmed snapshot or declines; the Quest stays awaiting-approval.
+				for (;;) {
+					let current: ReturnType<typeof extractPostableReview>;
+					try {
+						current = extractPostableReview(fs.readFileSync(artifactPath, "utf-8"));
+					} catch (err) {
+						current = { error: `could not read ${artifactPath} (${err instanceof Error ? err.message : String(err)})` };
 					}
+					const ans = await review.approvals.ask({
+						kind: "review-artifact",
+						postsReview: true,
+						title: notPostedReason
+							? `Review for ${review.label} NOT posted: ${notPostedReason} — edit review.md and /approve again`
+							: `Sense-check the review for ${review.label} before it posts`,
+						description: "error" in current ? `Cannot post yet: ${current.error}` : current.body,
+						operation,
+						artifactPath,
+						questId: record.id,
+						signal: api.signal,
+					});
+					if (!ans.approved || api.signal.aborted) {
+						const back = ans.text ? `\n\nYour notes: ${ans.text}` : "";
+						return {
+							report: `${party.report}\n\n---\n🚪 Not posted — left as a draft. Ask me to post it when you're ready.${back}`,
+							usage: party.usage,
+						};
+					}
+					if (!ans.review) {
+						// Some non-interactive path approved without the confirmed snapshot: never post blind.
+						notPostedReason = "approval must come from interactive /approve, which shows the exact body";
+						continue;
+					}
+					// Post EXACTLY the snapshot the user confirmed (not a re-read of the file).
+					const { verdict, body } = ans.review;
+					record.review.verdict = verdict;
 					const cwd = opts.contexts[0]?.path ?? process.cwd();
-					const res = postReview({ cwd, number: opts.review.number, slug: opts.review.slug, verdict, body, prText: opts.review.prText });
+					const res = postReview({ cwd, number: review.number, slug: review.slug, verdict, body, prText: review.prText });
 					if (!res.error) {
 						record.review.posted = true;
 						record.review.url = res.url;
@@ -284,11 +302,6 @@ async function runQuestInBackground(
 						: `\n\n---\n✅ Posted **${verdict}** review${res.url ? `: ${res.url}` : ""}.`;
 					return { report: `${body}${note}`, usage: party.usage };
 				}
-				const back = ans.text ? `\n\nYour notes: ${ans.text}` : "";
-				return {
-					report: `${party.report}\n\n---\n🚪 Not posted — left as a draft. Ask me to post it when you're ready.${back}`,
-					usage: party.usage,
-				};
 			}
 			return { report: party.report, usage: party.usage };
 		}, {});

@@ -26,6 +26,7 @@ import { findGuildmate, type Guildmate, loadPartyLeaderPrompt } from "../roster.
 import type { QuestMember, QuestState } from "../persistence/quest-store.ts";
 import type { RepoContext } from "../persistence/project-store.ts";
 import type { ApprovalManager } from "./approvals.ts";
+import { REVIEW_BLOCK_END, REVIEW_BLOCK_START, REVIEW_FORMAT_EXAMPLE } from "./review-post.ts";
 
 /**
  * Hooks that let a running party PAUSE and ask the user (the `request_user` tool).
@@ -147,7 +148,7 @@ function buildRepoBlock(contexts: RepoContext[]): string[] {
 	];
 }
 
-function buildSystemPrompt(basePrompt: string, available: Guildmate[], config: GuildmasterConfig, write: boolean, contexts: RepoContext[], globalInstructions: string | undefined, instructions: string | undefined, reviewMode: boolean, acquire: boolean, openTag: string, endTag: string, partyHint: string[] | undefined, interactive: boolean): string {
+export function buildSystemPrompt(basePrompt: string, available: Guildmate[], config: GuildmasterConfig, write: boolean, contexts: RepoContext[], globalInstructions: string | undefined, instructions: string | undefined, reviewMode: boolean, acquire: boolean, openTag: string, endTag: string, partyHint: string[] | undefined, interactive: boolean): string {
 	const roster = available
 		.map((m) => `- ${m.name} [${m.tier}] (model: ${resolveModelSpec(config, m.model) ?? "default"}): ${m.tagline ?? m.description}`)
 		.join("\n");
@@ -222,7 +223,13 @@ function buildSystemPrompt(basePrompt: string, available: Guildmate[], config: G
 		"  findings grouped by theme with file:line, and a verdict (comment / approve / request-changes).",
 		"- Do NOT post the review yourself. Your final report IS the review Scribe wrote. After you finish, a",
 		"  separate human-approved step posts it via the envoy (or leaves it as a draft). Never merge.",
-		"- End with an explicit verdict line, e.g. `Verdict: Request changes`, so the post step knows what to submit.",
+		"- REVIEW FORMAT (the post step parses this and REFUSES to post anything else). Your final report must contain:",
+		"  - exactly ONE line `Verdict: Approve | Request changes | Comment` (pick one), OUTSIDE the comment block;",
+		`  - exactly ONE block from \`${REVIEW_BLOCK_START}\` to \`${REVIEW_BLOCK_END}\` containing ONLY the`,
+		"    reviewer-facing comment, addressed to the PR author \u2014 no internal notes or messages to the user.",
+		"  Only the text inside the block is ever posted; everything outside it is NEVER posted. Inline/line",
+		"  comments are not supported, so cite file:line inside the block. Give Scribe this exact format. Example:",
+		...REVIEW_FORMAT_EXAMPLE.split("\n").map((line) => `    ${line}`),
 	];
 
 	const acquireWorkflow = [
