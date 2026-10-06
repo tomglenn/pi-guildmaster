@@ -48,6 +48,57 @@ export interface RaiseResult {
 const realGit: CommandRunner = async (args, cwd) => (await execFileAsync("git", args, { cwd, timeout: NETWORK_TIMEOUT_MS })).stdout;
 const realGh: CommandRunner = async (args, cwd) => (await execFileAsync("gh", args, { cwd, timeout: NETWORK_TIMEOUT_MS })).stdout;
 
+/** An error's full text: execFile errors carry git's stderr on `.stderr`, plus the message. */
+function errText(e: unknown): string {
+	const stderr = (e as { stderr?: unknown } | null)?.stderr;
+	const message = e instanceof Error ? e.message : String(e);
+	return `${stderr ? `${String(stderr)}\n` : ""}${message}`;
+}
+
+/**
+ * True when a push was rejected by a "require signed commits" rule. A bare GH013 is
+ * NOT enough: GH013 covers every repository-rule violation (e.g. "Changes must be made
+ * through a pull request"), so signature-related text is required.
+ */
+export function isSignatureRejection(raw: string): boolean {
+	return /verified signatures|must be signed|signed commits|commit signature/i.test(raw);
+}
+
+/**
+ * What to tell the user when the remote rejected unsigned commits. The rejected
+ * push never reached the remote, so the commits since `baseRef` are local only:
+ * re-signing them rewrites nothing published, and the retried push is still a
+ * plain fast-forward (no force push).
+ */
+export function signatureRejectionMessage(opts: {
+	repo: string;
+	branch: string;
+	baseRef: string;
+	worktreePath: string;
+	raw: string;
+	/** True when the branch already exists on the remote (an existing PR's head): only commits after baseRef are unpushed. */
+	published?: boolean;
+}): string {
+	const lines = opts.raw
+		.split("\n")
+		.map((s) => s.trim())
+		.filter(Boolean);
+	// Quote the actual signature violation line, plus the GH013 header when present.
+	const violation = lines.find((l) => /verified signatures|must be signed|signed commits|commit signature/i.test(l)) ?? lines[0] ?? "";
+	const header = lines.find((l) => /GH013/.test(l));
+	const first = header && header !== violation ? `${header} ${violation}` : violation;
+	const which = opts.published
+		? `the commits added on top of the PR head (${opts.baseRef.slice(0, 12)}), which were not pushed`
+		: "the branch's commits, none of which were pushed";
+	return (
+		`${opts.repo} requires verified (signed) commits, and the push was rejected because commits on \`${opts.branch}\` are unsigned. ` +
+		`Configure commit signing (user.signingkey, plus ssh-agent or gpg-agent holding the key), then re-sign ${which}: ` +
+		`\`git -C ${opts.worktreePath} rebase --force-rebase --gpg-sign ${opts.baseRef}\`. ` +
+		"The rejected push never reached the remote, so those commits are local only; re-signing them keeps the push a fast-forward (no force push needed). " +
+		`Then retry with raise_pr. (${first})`
+	);
+}
+
 /** Look up an OPEN PR for a branch, if any. Best-effort: any error / non-JSON → none. */
 async function findOpenPrForBranch(runGh: CommandRunner, branch: string, cwd: string): Promise<{ url: string; number: number } | undefined> {
 	try {
@@ -172,6 +223,24 @@ export async function raisePr(record: QuestRecord, deps: PrDeps): Promise<RaiseR
 			try {
 				await runGit(["push"], worktreePath);
 			} catch (e) {
+				const raw = errText(e);
+				if (isSignatureRejection(raw)) {
+					// iso.baseRef is the PR head tip at attach time (attachToExistingBranch), so
+					// baseRef..HEAD is exactly this Quest's unpushed commits on top of the PR.
+					results.push({
+						repo: pr.repo,
+						raised: false,
+						reason: signatureRejectionMessage({
+							repo: sourcePr.slug ?? pr.repo,
+							branch: iso.branch,
+							baseRef: iso.baseRef,
+							worktreePath,
+							raw,
+							published: true,
+						}),
+					});
+					continue;
+				}
 				results.push({
 					repo: pr.repo,
 					raised: false,
@@ -244,6 +313,17 @@ export async function raisePr(record: QuestRecord, deps: PrDeps): Promise<RaiseR
 			pr.draft = true;
 			results.push({ repo: pr.repo, raised: true, url, reason: "Raised as a draft PR." });
 		} catch (err) {
+			const raw = errText(err);
+			if (isSignatureRejection(raw)) {
+				// New branch: baseRef is the clean base it was cut from, so baseRef..HEAD is
+				// every commit on it, none of which reached the remote.
+				results.push({
+					repo: pr.repo,
+					raised: false,
+					reason: signatureRejectionMessage({ repo: pr.repo, branch: pr.branch, baseRef: iso.baseRef, worktreePath, raw, published: false }),
+				});
+				continue;
+			}
 			results.push({
 				repo: pr.repo,
 				raised: false,

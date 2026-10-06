@@ -325,6 +325,7 @@ function describeQuest(q: QuestRecord): string {
 				: "draft, not raised — use raise_pr";
 		lines.push(`PR (${pr.repo}): ${status}${pr.diffStat ? `\n${pr.diffStat}` : ""}`);
 	}
+	if (q.raiseError && q.prs?.some((p) => !p.url)) lines.push(`Raise error: ${q.raiseError}`);
 	if (q.error) lines.push(`Error: ${q.error}${q.stopReason ? ` [stopReason: ${q.stopReason}]` : ""}`);
 	if (q.report) lines.push(`\n${q.report}`);
 	return lines.join("\n");

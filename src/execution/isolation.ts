@@ -37,6 +37,112 @@ function git(args: string[], cwd: string): string {
 	return execFileSync("git", args, { cwd, encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"] });
 }
 
+export type SigningMode = "explicit-on" | "explicit-off" | "key-only" | "none";
+
+/**
+ * How the user's git config (as seen from `cwd`) wants commits signed:
+ *  - explicit-on / explicit-off: commit.gpgsign is set; git itself honours it.
+ *  - key-only: commit.gpgsign is unset but user.signingkey is set — Guildmaster
+ *    signs party commits by default (a configured key means signed commits are wanted).
+ *  - none: neither is set.
+ * An unreadable commit.gpgsign (e.g. an invalid boolean) is treated as explicit-on,
+ * which leaves the decision (and the error) to git.
+ */
+export function signingMode(cwd: string): SigningMode {
+	try {
+		const v = git(["config", "--type=bool", "--get", "commit.gpgsign"], cwd).trim();
+		return v === "false" ? "explicit-off" : "explicit-on";
+	} catch (e) {
+		if ((e as { status?: number }).status !== 1) return "explicit-on";
+	}
+	try {
+		return git(["config", "--get", "user.signingkey"], cwd).trim() ? "key-only" : "none";
+	} catch {
+		return "none";
+	}
+}
+
+/** True when signing applies to party commits in this mode (explicit-off / none leave them alone). */
+function signs(mode: SigningMode): boolean {
+	return mode === "explicit-on" || mode === "key-only";
+}
+
+/** Commits in baseRef..HEAD whose header has no signature (`gpgsig` / `gpgsig-sha256`). */
+export function unsignedCommits(iso: Isolation): string[] {
+	return git(["rev-list", `${iso.baseRef}..HEAD`], iso.worktreePath)
+		.split("\n")
+		.map((s) => s.trim())
+		.filter(Boolean)
+		.filter((sha) => {
+			const raw = git(["cat-file", "commit", sha], iso.worktreePath);
+			const end = raw.indexOf("\n\n");
+			const header = end === -1 ? raw : raw.slice(0, end);
+			return !header.split("\n").some((l) => l.startsWith("gpgsig"));
+		});
+}
+
+/**
+ * Re-sign member commits made without signing (e.g. a runner's plain `git commit`).
+ * Signing is injected only here, scoped to the worktree's own branch, never via env
+ * (GIT_CONFIG_* would leak into every repo a member touches, e.g. test fixtures).
+ * baseRef..HEAD is local and unpublished (a new branch's clean base, or the PR head
+ * at attach), so rewriting it is safe. It refuses (without rewriting) when the range
+ * holds a merge commit (a rebase would flatten it) or tracked changes are uncommitted.
+ * On failure the rebase is aborted, the tip is checked against the original, and a
+ * clear error is thrown: never push unsigned silently.
+ */
+function resignMemberCommits(iso: Isolation, mode: SigningMode): void {
+	if (!signs(mode)) return;
+	if (unsignedCommits(iso).length === 0) return;
+	const { key, why } = signingContext(iso.worktreePath, mode);
+	const keyHint = `make the key available (e.g. \`ssh-add${key ? ` ${key}` : ""}\` or unlock gpg-agent)`;
+	const intro = `Commit signing is configured, but the party's member commits on \`${iso.branch}\``;
+
+	const merges = git(["rev-list", "--merges", `${iso.baseRef}..HEAD`], iso.worktreePath).trim();
+	if (merges) {
+		throw new Error(
+			`${intro} include merge commit(s) (${merges.split("\n")[0].slice(0, 12)}\u2026), which can't be safely re-signed automatically: ` +
+				`a rebase would flatten them. Nothing was rewritten or pushed. ${why} To fix by hand: ${keyHint}, then in ${iso.worktreePath} ` +
+				`re-sign each unsigned commit (e.g. \`git rebase --rebase-merges --gpg-sign ${iso.baseRef}\`, then check the history), or set commit.gpgsign=false to opt out.`,
+		);
+	}
+	const dirty = git(["status", "--porcelain", "--untracked-files=no"], iso.worktreePath).trim();
+	if (dirty) {
+		throw new Error(
+			`${intro} could not be re-signed: the worktree ${iso.worktreePath} has uncommitted changes to tracked files, ` +
+				`so the branch was not rewritten. Nothing was pushed. Commit or discard them (\`git -C ${iso.worktreePath} status\`), ` +
+				`then run \`git -C ${iso.worktreePath} rebase --force-rebase --gpg-sign ${iso.baseRef}\`, or set commit.gpgsign=false to opt out.`,
+		);
+	}
+
+	const originalTip = git(["rev-parse", "HEAD"], iso.worktreePath).trim();
+	try {
+		// --no-verify: skip hooks, as the commit does.
+		git(["rebase", "--force-rebase", "--gpg-sign", "--no-verify", iso.baseRef], iso.worktreePath);
+	} catch (e) {
+		try {
+			git(["rebase", "--abort"], iso.worktreePath);
+		} catch {
+			/* best effort: nothing to abort */
+		}
+		let tipNow = "";
+		try {
+			tipNow = git(["rev-parse", "HEAD"], iso.worktreePath).trim();
+		} catch {
+			/* unreadable HEAD: reported as not restored */
+		}
+		const state =
+			tipNow === originalTip
+				? `The rebase was aborted and the branch was restored to its original tip ${originalTip}; no commit was rewritten.`
+				: `The rebase was aborted but the branch was NOT restored: HEAD is ${tipNow || "unreadable"}, the original tip was ${originalTip} ` +
+					`(recover with \`git -C ${iso.worktreePath} reset --hard ${originalTip}\`).`;
+		throw new Error(
+			`${intro} could not be re-signed: ${firstErrorLine(e)}. ${why} Nothing was pushed. ${state} To fix: ${keyHint}, ` +
+				`then run \`git -C ${iso.worktreePath} rebase --force-rebase --gpg-sign ${iso.baseRef}\`, or set commit.gpgsign=false to opt out.`,
+		);
+	}
+}
+
 function gh(args: string[], cwd: string): string {
 	return execFileSync("gh", args, { cwd, encoding: "utf-8", timeout: 120_000, stdio: ["ignore", "pipe", "pipe"] });
 }
@@ -232,6 +338,9 @@ export function commitsAhead(iso: Isolation): number {
  * including commits a member (e.g. runner) already made during the Quest, which
  * leave a clean tree and nothing staged here.
  *
+ * When signing applies (explicit-on, or key-only), member commits in baseRef..HEAD
+ * that lack a signature are re-signed (see resignMemberCommits); failure throws.
+ *
  * Agent scratch litter is unstaged before committing so it never enters history.
  * In in-place mode (index == the user's real repo) such litter is also deleted
  * from disk, since a clean start means it was created by this quest.
@@ -274,9 +383,21 @@ export function commitAndDiff(iso: Isolation, message: string): WorktreeChanges 
 		hasChanges = true; // non-zero exit => staged changes exist
 	}
 
+	const mode = signingMode(iso.worktreePath);
 	if (hasChanges) {
-		git(["commit", "-m", message, "--no-verify"], iso.worktreePath);
+		// key-only: sign this one command (scoped `-c`); explicit settings are left to git.
+		const signArgs = mode === "key-only" ? ["-c", "commit.gpgsign=true"] : [];
+		try {
+			git([...signArgs, "commit", "-m", message, "--no-verify"], iso.worktreePath);
+		} catch (e) {
+			// Never fall back to an unsigned commit: the user's config asks for signing.
+			if (!signs(mode)) throw e;
+			throw new Error(signingFailureMessage(iso.worktreePath, mode, e));
+		}
 	}
+
+	// A member (e.g. a runner) may have committed without signing: re-sign before the diff.
+	resignMemberCommits(iso, mode);
 
 	// Judge by the branch, not the index: a member's own commit is real work.
 	const committed = commitsAhead(iso) > 0;
@@ -286,6 +407,42 @@ export function commitAndDiff(iso: Isolation, message: string): WorktreeChanges 
 		stat: committed ? git(["diff", "--stat", range], iso.worktreePath).trim() : "",
 		diff: committed ? git(["diff", range], iso.worktreePath) : "",
 	};
+}
+
+/** The first non-empty stderr line of a failed git call (else its message's first line). */
+function firstErrorLine(e: unknown): string {
+	const err = e as { stderr?: string | Buffer; message?: string };
+	return (
+		`${err.stderr ?? ""}`
+			.split("\n")
+			.map((s) => s.trim())
+			.find(Boolean) ?? (err.message ?? String(e)).split("\n")[0]
+	);
+}
+
+/** The configured signing key (if any) and a sentence on why Guildmaster signs. */
+function signingContext(worktreePath: string, mode: SigningMode): { key: string; why: string } {
+	let key = "";
+	try {
+		key = git(["config", "--get", "user.signingkey"], worktreePath).trim();
+	} catch {
+		/* no key configured */
+	}
+	const why =
+		mode === "key-only"
+			? `Your git config has a signing key (${key}); Guildmaster signs party commits when one is set.`
+			: `Your git config enables commit signing (commit.gpgsign=true${key ? `, key ${key}` : ""}).`;
+	return { key, why };
+}
+
+function signingFailureMessage(worktreePath: string, mode: SigningMode, e: unknown): string {
+	const detail = firstErrorLine(e);
+	const { key, why } = signingContext(worktreePath, mode);
+	return (
+		`Signing the commit failed: ${detail}. ${why} The changes are still uncommitted in ${worktreePath}. ` +
+		`Make the key available (e.g. \`ssh-add${key ? ` ${key}` : ""}\` or unlock gpg-agent), then commit and push from there, ` +
+		"or set commit.gpgsign=false to opt out."
+	);
 }
 
 /** Remove a worktree (best-effort). Kept around by default for reattach/PR. */

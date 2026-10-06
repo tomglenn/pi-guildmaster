@@ -334,6 +334,8 @@ export function registerApprovals(pi: ExtensionAPI): void {
 			const result = await raisePr(record, {
 				confirmSecurity: (message) => ctx.ui.confirm("Possible security fix", message),
 			});
+			const failures = result.results.filter((r) => !r.raised);
+			record.raiseError = failures.length ? failures.map((f) => `${f.repo}: ${f.reason}`).join("; ") : undefined;
 			manager.store.save(record);
 			const summary = result.results
 				.map((r) => (r.raised ? `${r.repo}: ${r.url ?? "raised"}` : `${r.repo || "?"}: ${r.reason}`))
