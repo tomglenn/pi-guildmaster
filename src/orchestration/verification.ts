@@ -7,16 +7,34 @@ const CHECK_RE = /\b(test|vitest|jest|pytest|go\s+test|cargo\s+test|typecheck|li
 /** `;`, `|`, `||` or a lone `&` can hide a failing check's exit status. `&&` and `2>&1` cannot. */
 const MASKING_RE = /\|\||[|;]|(?<![&0-9>])&(?![&0-9>])/;
 
+/** Programs that never verify anything, even when a path argument contains "test" (e.g. `git add test/x.js`). */
+const NON_CHECK_PROGRAMS = new Set(["git", "cd", "cat", "ls", "echo", "printf", "sed", "awk", "grep", "rg", "find", "head", "tail", "wc", "cp", "mv", "rm", "mkdir", "touch", "diff", "less", "true", "false", "export", "pwd"]);
+const SEGMENT_SPLIT = /&&|\|\||[;|]|(?<![&0-9>])&(?![&0-9>])/;
+
+/**
+ * True when some command in the line actually RUNS a check: the program is not a plain
+ * file/git utility, and a check word appears outside path/file arguments.
+ */
+function runsCheck(command: string): boolean {
+	return command.split(SEGMENT_SPLIT).some((segment) => {
+		const tokens = segment.trim().split(/\s+/).filter(Boolean);
+		while (tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[0])) tokens.shift(); // FOO=1 npm test
+		if (!tokens.length || NON_CHECK_PROGRAMS.has(tokens[0])) return false;
+		const words = tokens.filter((t) => !/[/.]/.test(t) || /^(\.\/)?(node_modules\/\.bin\/|gradlew)/.test(t));
+		return CHECK_RE.test(words.join(" "));
+	});
+}
+
 /** A shell invocation counts only if it looks like a bounded verification command. */
 export function isCheck(command: string): boolean {
 	// Do not credit a shell command that can mask a failing check's exit status.
 	if (MASKING_RE.test(command)) return false;
-	return CHECK_RE.test(command);
+	return runsCheck(command);
 }
 
 /** A check-like command whose exit status may be masked: recorded so the status can say why, never credited. */
 export function isMaskedCheck(command: string): boolean {
-	return MASKING_RE.test(command) && CHECK_RE.test(command);
+	return MASKING_RE.test(command) && runsCheck(command);
 }
 
 export function checkResults(results: { command?: string; exitCode?: number }[]): CheckResult[] {

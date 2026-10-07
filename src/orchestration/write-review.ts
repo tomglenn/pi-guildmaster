@@ -21,6 +21,15 @@ export function reviewPassed(text: string): boolean {
 	return verdicts.length === 1 && verdicts[0][1].toUpperCase() === "PASS";
 }
 
+/**
+ * `block` is a FINDING to act on (fix round, or the user decides), never a reason to kill
+ * the Quest by itself. Infrastructure failures (reviewer errored/aborted, diff too large,
+ * reviewer missing) still throw: there is no finding to iterate on.
+ */
+export type ReviewOutcome =
+	| { verdict: "skipped"; cost: number; member?: undefined }
+	| { verdict: "pass" | "block"; reviewer: "warden" | "inquisitor"; member: QuestMember; cost: number; findings: string };
+
 export async function reviewSensitiveDiff(opts: {
 	isolation: QuestIsolation;
 	brief: string;
@@ -30,7 +39,7 @@ export async function reviewSensitiveDiff(opts: {
 	onProgress?: (member: QuestMember) => void;
 	/** Test seam: independent review without a live model. */
 	runReviewer?: typeof runChildAgent;
-}): Promise<{ member?: QuestMember; cost: number }> {
+}): Promise<ReviewOutcome> {
 	const { isolation: iso } = opts;
 	const git = (args: string[]) => execFileSync("git", args, { cwd: iso.worktreePath, encoding: "utf-8", maxBuffer: 2_000_000 });
 	const diff = git(["diff", iso.baseRef, "--"]);
@@ -45,7 +54,7 @@ export async function reviewSensitiveDiff(opts: {
 	}).join("\n");
 	const fullDiff = `${diff}\n${snapshots}`;
 	const reviewerName = requiredReviewer(opts.brief, files, fullDiff);
-	if (!reviewerName) return { cost: 0 };
+	if (!reviewerName) return { verdict: "skipped", cost: 0 };
 	if (Buffer.byteLength(fullDiff) > 100_000) throw new Error("Risk-sensitive diff exceeds independent review limit (100 KB). Worktree preserved for manual review.");
 	const reviewer = findGuildmate(opts.roster, reviewerName);
 	if (!reviewer) throw new Error(`Risk-sensitive change requires ${reviewerName}, but that reviewer is unavailable. Worktree preserved.`);
@@ -56,12 +65,20 @@ export async function reviewSensitiveDiff(opts: {
 			guildmate: reviewer, modelSpec: resolveModelSpec(opts.config, reviewer.model), cwd: iso.worktreePath, signal: opts.signal,
 			task: `Independently review the FINAL change against the full brief. Inspect every changed file (including untracked files). Check for security and correctness issues. End with exactly one standalone line VERDICT: PASS or VERDICT: BLOCK. BLOCK on material issues or incomplete examination. Explain findings with file:line.\n\nBrief:\n${opts.brief}\n\nChanged files:\n${files.join("\n")}\n\nDiff and untracked files:\n${fullDiff}`,
 		});
-		member.status = res.error || res.stopReason === "aborted" || res.stopReason === "error" || !reviewPassed(res.finalText) ? "failed" : "done";
+		if (res.error || res.stopReason === "aborted" || res.stopReason === "error") {
+			member.status = "failed";
+			member.finishedAt = Date.now();
+			member.summary = (res.error ?? `Reviewer stopped (${res.stopReason}).`).slice(0, 400);
+			opts.onProgress?.({ ...member });
+			throw new Error(`Independent ${reviewerName} review could not run for ${iso.repo}: ${res.error ?? res.stopReason}. Worktree preserved.`);
+		}
+		const passed = reviewPassed(res.finalText);
+		member.status = "done";
+		member.step = passed ? "Review passed" : "Review blocked: findings sent for a fix";
 		member.summary = res.finalText.slice(0, 400);
 		member.finishedAt = Date.now();
 		opts.onProgress?.({ ...member });
-		if (member.status === "failed") throw new Error(`Independent ${reviewerName} review did not pass for ${iso.repo}: ${res.error ?? res.finalText.slice(0, 1200)}. Worktree preserved.`);
-		return { member, cost: res.usage.cost };
+		return { verdict: passed ? "pass" : "block", reviewer: reviewerName, member, cost: res.usage.cost, findings: res.finalText.trim() };
 	} catch (error) {
 		if (member.status === "running") {
 			member.status = "failed";

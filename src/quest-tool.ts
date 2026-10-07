@@ -33,6 +33,7 @@ import { runFastWrite } from "./orchestration/fast-write.ts";
 import { useFastWrite } from "./orchestration/write-routing.ts";
 import { evaluateVerification, unverifiedReason } from "./orchestration/verification.ts";
 import { reviewSensitiveDiff } from "./orchestration/write-review.ts";
+import { runReviewLoop } from "./orchestration/review-loop.ts";
 import { loadRecipeRegistry } from "./orchestration/recipe-loader.ts";
 import { executionShape, preflightRecipe, resolveRecipe } from "./orchestration/recipes.ts";
 import { pickRepoBySlug, readonlyContexts, resolveProjectQuery } from "./orchestration/resolve.ts";
@@ -237,17 +238,68 @@ async function runQuestInBackground(
 
 			// Independently inspect risk from the ACTUAL diff, not just the brief. This gate is
 			// enforced by the harness even when the leader elects not to dispatch a reviewer.
+			// A BLOCK is a finding to iterate on (Builder fix round → checks → re-review); the
+			// user decides only when iterating cannot settle it (see review-loop.ts).
 			if (opts.write) for (const iso of record.isolations ?? []) {
-				const review = await reviewSensitiveDiff({
-					isolation: iso, brief: record.brief, roster, config: opts.config, signal: api.signal,
-					onProgress: (member) => api.setMembers([...party.members, member]),
+				const approvals = getApprovalManager();
+				const ask = async (input: Parameters<ApprovalManager["ask"]>[0]) => {
+					manager.transition(record, "awaiting-input");
+					try {
+						return await approvals.ask({ ...input, questId: record.id, signal: api.signal });
+					} finally {
+						if (!api.signal.aborted) manager.transition(record, "running");
+					}
+				};
+				const context = { name: iso.repo, path: iso.worktreePath, writable: true };
+				const loop = await runReviewLoop({
+					repo: iso.repo,
+					brief: record.brief,
+					onMembers: (members) => api.setMembers([...party.members, ...members]),
+					review: () => reviewSensitiveDiff({
+						isolation: iso, brief: record.brief, roster, config: opts.config, signal: api.signal,
+						onProgress: (member) => api.setMembers([...party.members, member]),
+					}),
+					fix: async (prompt) => {
+						fence("Quest aborted during review fix round.");
+						const fixed = await runFastWrite({
+							brief: prompt, context, config: opts.config, signal: api.signal,
+							instructions: opts.instructions, globalInstructions: opts.globalInstructions,
+							onProgress: (members) => api.setMembers([...party.members, ...members]),
+							onActivity: () => api.touch(),
+						});
+						const member = fixed.members[0];
+						member.task = `Fix round: ${prompt.split("\n")[0]}`;
+						const report = fixed.rawFinal ?? "";
+						const checks = evaluateVerification([member], [iso.repo]);
+						const blocker = /^CONFLICT:/i.test(report.trim())
+							? `The Builder reports that a finding conflicts with the brief:\n${report.trim().slice(0, 2_000)}`
+							: fixed.error
+								? `The fix round did not finish: ${fixed.error.slice(0, 2_000)}`
+								: checks.state !== "verified"
+									? `The fix round's checks did not pass (${checks.state}${checks.checks.length ? `: ${checks.checks.map((c) => `${c.command} (exit ${c.exitCode ?? "?"})`).join(", ")}` : ""}).`
+									: undefined;
+						return { member, cost: fixed.usage.cost, report, blocker };
+					},
+					choose: (title, description, options) => ask({ kind: "choose", title, description, options }),
+					answer: (title, description) => ask({ kind: "answer", title, description }),
 				});
 				fence("Quest aborted during independent review.");
-				if (review.member) {
-					party.members.push(review.member);
-					party.usage.cost += review.cost;
-					api.setMembers(party.members.slice());
+				party.members.push(...loop.members);
+				party.usage.cost += loop.cost;
+				api.setMembers(party.members.slice());
+				if (loop.note) party.report = `${party.report}\n\n${loop.note}`;
+				if (loop.fixRounds > 0) {
+					// Fix rounds changed the code: earlier checks are stale. Re-derive from every member
+					// (the latest result per command wins), so a failing fix cannot ride on an old pass.
+					const verification = evaluateVerification(party.members, record.isolations?.map((i) => i.repo));
+					record.verification = verification.state;
+					record.raiseError = verification.state === "unverified"
+						? unverifiedReason(verification.masked)
+						: verification.state === "failed"
+							? `Checks fail after the review fix round (${verification.checks.filter((c) => c.exitCode !== 0).map((c) => c.command).join(", ")}); branch kept local.`
+							: undefined;
 				}
+				api.save();
 			}
 
 			// Commit each writable repo's worktree + draft a PR per changed repo BEFORE

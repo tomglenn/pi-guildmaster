@@ -33,9 +33,17 @@ test("actual changed and untracked files trigger an independent review before co
 		assert.equal(result.member?.status, "done");
 		assert.match(task, /export const token/);
 		assert.match(task, /notes\.js \(untracked\)/);
+		assert.equal(result.verdict, "pass");
+		// A BLOCK is a finding to iterate on, returned in full, not a thrown Quest failure.
+		const blocked = await reviewSensitiveDiff({ isolation, brief: "Update app", roster: [warden], config: DEFAULT_CONFIG,
+			runReviewer: async (options) => ({ ...(await runReviewer(options)), finalText: `VERDICT: BLOCK\nUnsafe.${"x".repeat(3000)}` }),
+		});
+		assert.equal(blocked.verdict, "block");
+		assert.ok(blocked.verdict === "block" && blocked.findings.length > 3000, "findings are not cut to a fragment");
+		// A reviewer that could not run is still fail-closed.
 		await assert.rejects(() => reviewSensitiveDiff({ isolation, brief: "Update app", roster: [warden], config: DEFAULT_CONFIG,
-			runReviewer: async (options) => ({ ...(await runReviewer(options)), finalText: "VERDICT: BLOCK\nUnsafe." }),
-		}), /did not pass/);
+			runReviewer: async (options) => ({ ...(await runReviewer(options)), error: "model down" }),
+		}), /could not run/);
 	} finally {
 		fs.rmSync(cwd, { recursive: true, force: true });
 	}

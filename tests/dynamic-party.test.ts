@@ -45,6 +45,15 @@ test("a chained check is recorded as masked: never credited, and the unverified 
 	assert.equal(evaluateVerification([member([...checks, { command: "npm test", exitCode: 1 }])]).state, "failed");
 	// Redirects and && do not mask an exit code.
 	assert.deepEqual(checkResults([{ command: "npm test 2>&1", exitCode: 1 }, { command: "cd x && npm test &>out.log", exitCode: 1 }]), [{ command: "npm test 2>&1", exitCode: 1 }, { command: "cd x && npm test &>out.log", exitCode: 1 }]);
+	// A path containing "test" is not a check (E2E: `git add ... test/cue.test.js && git commit` was credited).
+	assert.deepEqual(checkResults([
+		{ command: "cd /wt && git add src/cue.js test/cue.test.js && git commit -m x", exitCode: 0 },
+		{ command: "cat test/cue.test.js", exitCode: 0 },
+		{ command: "cd /wt && npm test", exitCode: 0 },
+		{ command: "CI=1 node --test", exitCode: 0 },
+		{ command: "npx tsc --noEmit -p tsconfig.json", exitCode: 0 },
+		{ command: "python -m pytest tests/", exitCode: 0 },
+	]).map((c) => c.command), ["cd /wt && npm test", "CI=1 node --test", "npx tsc --noEmit -p tsconfig.json", "python -m pytest tests/"]);
 	// Builder is told to run plain checks.
 	assert.match(createBuilderGuildmate().systemPrompt, /ONE plain command/);
 });
