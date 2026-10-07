@@ -31,7 +31,7 @@ import { extractPostableReview } from "./orchestration/review-post.ts";
 import { runParty } from "./orchestration/party-leader.ts";
 import { runFastWrite } from "./orchestration/fast-write.ts";
 import { useFastWrite } from "./orchestration/write-routing.ts";
-import { evaluateVerification } from "./orchestration/verification.ts";
+import { evaluateVerification, unverifiedReason } from "./orchestration/verification.ts";
 import { reviewSensitiveDiff } from "./orchestration/write-review.ts";
 import { loadRecipeRegistry } from "./orchestration/recipe-loader.ts";
 import { executionShape, preflightRecipe, resolveRecipe } from "./orchestration/recipes.ts";
@@ -228,7 +228,7 @@ async function runQuestInBackground(
 			if (opts.write) {
 				const verification = evaluateVerification(party.members, record.isolations?.map((iso) => iso.repo));
 				record.verification = verification.state;
-				if (verification.state === "unverified") record.raiseError = "No observed passing verification checks; branch kept local.";
+				if (verification.state === "unverified") record.raiseError = unverifiedReason(verification.masked);
 				api.save();
 				if (verification.state === "failed") {
 					throw new Error(`Verification failed or returned no exit code: ${verification.checks.filter((c) => c.exitCode !== 0).map((c) => `${c.command} (exit ${c.exitCode ?? "?"})`).join(", ")}. Worktree preserved for repair.`);
@@ -403,7 +403,7 @@ async function runQuestInBackground(
 					return { report: `${body}${note}`, usage: party.usage };
 				}
 			}
-			return { report: record.verification === "unverified" ? `${party.report}\n\n⚠️ UNVERIFIED: no observed passing build, lint, typecheck or test. Branch committed but draft PR not auto-raised; run verification before raising.` : party.report, usage: party.usage };
+			return { report: record.verification === "unverified" ? `${party.report}\n\n⚠️ UNVERIFIED: ${record.raiseError ?? "no observed passing build, lint, typecheck or test."} Branch committed but draft PR not auto-raised; run verification before raising.` : party.report, usage: party.usage };
 		}, {});
 	} catch {
 		// manager.run already transitioned the record to failed and persisted it.

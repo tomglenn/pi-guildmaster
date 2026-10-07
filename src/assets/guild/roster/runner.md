@@ -16,6 +16,9 @@ Report what happened, not what should have happened.
 - Only run BOUNDED commands that terminate on their own. Your shell refuses watch
   modes, dev servers and pagers — always use the one-shot form (e.g.
   `jest --watchAll=false`, `vitest run`, `tsc --noEmit`, `docker compose up -d`).
+- Run each check as ONE plain command (e.g. `npm test`). Do not chain it with
+  `;`, `|`, `|| true` or `echo $?`: the harness records the exit code itself and
+  does not count chained checks.
 
 Return a factual account: what you ran, what happened, and whether it passed.
 

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { buildSystemPrompt, dynamicDispatchBudget } from "../src/orchestration/party-leader.ts";
 import { DEFAULT_CONFIG } from "../src/config.ts";
 import { createBuilderGuildmate } from "../src/orchestration/fast-write.ts";
-import { evaluateVerification, checkResults } from "../src/orchestration/verification.ts";
+import { evaluateVerification, checkResults, unverifiedReason } from "../src/orchestration/verification.ts";
 import { requiredReviewer, reviewPassed } from "../src/orchestration/write-review.ts";
 import type { QuestMember } from "../src/persistence/quest-store.ts";
 
@@ -25,8 +25,28 @@ test("verification uses observed exit codes, not final prose", () => {
 	assert.equal(evaluateVerification([member([{ command: "npm test", exitCode: 1 }])]).state, "failed");
 	assert.equal(evaluateVerification([member([{ command: "npm test", exitCode: 1 }, { command: "npm test", exitCode: 0 }])]).state, "verified");
 	assert.equal(evaluateVerification([member([{ command: "npm test" }])]).state, "failed");
-	assert.deepEqual(checkResults([{ command: "git diff HEAD", exitCode: 0 }, { command: "npm test", exitCode: 0 }, { command: "npm test || true", exitCode: 0 }]), [{ command: "npm test", exitCode: 0 }]);
+	assert.deepEqual(checkResults([{ command: "git diff HEAD", exitCode: 0 }, { command: "npm test", exitCode: 0 }, { command: "npm test || true", exitCode: 0 }]), [{ command: "npm test", exitCode: 0 }, { command: "npm test || true", exitCode: 0, masked: true }]);
 	assert.equal(evaluateVerification([{ ...member([{ command: "npm test", exitCode: 0 }]), repo: "one" }], ["one", "two"]).state, "unverified");
+});
+
+test("a chained check is recorded as masked: never credited, and the unverified status says why", () => {
+	const member = (checks?: QuestMember["checks"]): QuestMember => ({ name: "builder", task: "test", status: "done", checks });
+	// The E2E failure: the builder ran the failing test chained with echo, which exits 0.
+	const checks = checkResults([{ command: 'cd /wt && npm test 2>&1; echo "EXIT=$?"', exitCode: 0 }]);
+	assert.equal(checks.length, 1);
+	assert.equal(checks[0].masked, true);
+	const v = evaluateVerification([member(checks)]);
+	assert.equal(v.state, "unverified");
+	assert.equal(v.masked.length, 1);
+	assert.match(unverifiedReason(v.masked), /chained with ';' or '\|'.*npm test 2>&1; echo/);
+	assert.match(unverifiedReason([]), /No observed passing verification checks/);
+	// A masked check never upgrades or downgrades real results.
+	assert.equal(evaluateVerification([member([...checks, { command: "npm test", exitCode: 0 }])]).state, "verified");
+	assert.equal(evaluateVerification([member([...checks, { command: "npm test", exitCode: 1 }])]).state, "failed");
+	// Redirects and && do not mask an exit code.
+	assert.deepEqual(checkResults([{ command: "npm test 2>&1", exitCode: 1 }, { command: "cd x && npm test &>out.log", exitCode: 1 }]), [{ command: "npm test 2>&1", exitCode: 1 }, { command: "cd x && npm test &>out.log", exitCode: 1 }]);
+	// Builder is told to run plain checks.
+	assert.match(createBuilderGuildmate().systemPrompt, /ONE plain command/);
 });
 
 test("post-diff risk review is independent and fail-closed", () => {

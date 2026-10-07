@@ -15,6 +15,7 @@ export function createBuilderGuildmate(): Guildmate {
 			"Implement the brief in the isolated worktree. You can edit files and run bounded shell commands.",
 			"In this one session: inspect relevant code, edit, run targeted tests, fix failures, and check the final diff against every requirement.",
 			"Use the shell for bounded build, test, and git inspection. Do not push or open a PR. Do not create planning files in the repo.",
+			"Run each check as ONE plain command (e.g. `npm test`, `npx tsc --noEmit`). Do not chain it with `;`, `|`, `|| true` or `echo $?`: the harness records the exit code itself and does not count chained checks.",
 			"If you cannot fix a failure, begin your final answer with FAILED: and explain why. Report observed test exit codes, not guesses.",
 			"End with a PR-ready report: '# <short title>', then Summary, Changes, Testing, and Risks / Unresolved.",
 		].join("\n"),

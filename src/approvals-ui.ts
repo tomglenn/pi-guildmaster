@@ -9,16 +9,17 @@
  */
 
 import * as fs from "node:fs";
-import type { ExtensionAPI, ThemeColor } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, ThemeColor } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { getApprovalManager, getQuestManager } from "./orchestration/manager.ts";
 import { type ReviewVerdict, reviewFlag } from "./execution/gh-tool.ts";
-import type { ApprovalManager, UserRequest } from "./orchestration/approvals.ts";
+import type { UserRequest } from "./orchestration/approvals.ts";
 import { commitsAhead } from "./execution/isolation.ts";
 import { explainUnraisable, raisePr } from "./orchestration/pr.ts";
 import { extractPostableReview } from "./orchestration/review-post.ts";
 import type { QuestRecord } from "./persistence/quest-store.ts";
 import { type CardLine, showCard } from "./ui.ts";
+import { matchOption, numberedOptions, parseRequestArgs, requestCompletions, resolveRequestId } from "./request-input.ts";
 
 /** A short glyph + label for each request kind, for the inbox. */
 const KIND_LABEL: Record<UserRequest["kind"], string> = {
@@ -32,23 +33,15 @@ const KIND_LABEL: Record<UserRequest["kind"], string> = {
 // The Guild status board (status.ts) owns the widget; it auto-repaints from the
 // ApprovalManager's change events, so these commands just resolve/list.
 
-/** Resolve by exact id or a unique suffix, for convenience. */
-function resolveId(approvals: ApprovalManager, arg: string): string | undefined {
-	const trimmed = arg.trim();
-	if (!trimmed) return undefined;
-	if (approvals.has(trimmed)) return trimmed;
-	const matches = approvals.list().filter((a) => a.id.endsWith(trimmed));
-	return matches.length === 1 ? matches[0].id : undefined;
-}
-
-/** Split "<id> rest of line" into the resolved id and the trailing argument. */
-function splitIdAndRest(approvals: ApprovalManager, args: string): { id?: string; rest: string } {
-	const trimmed = args.trim();
-	const sp = trimmed.indexOf(" ");
-	const head = sp === -1 ? trimmed : trimmed.slice(0, sp);
-	const rest = sp === -1 ? "" : trimmed.slice(sp + 1).trim();
-	return { id: resolveId(approvals, head), rest };
-}
+type Kind = UserRequest["kind"];
+/** Which request kinds each command acts on. */
+const COMMAND_KINDS: Record<"approve" | "deny" | "choose" | "answer" | "review", readonly Kind[]> = {
+	approve: ["approve", "review-artifact"],
+	deny: ["approve", "choose", "answer", "review-artifact"],
+	choose: ["choose"],
+	answer: ["answer", "review-artifact"],
+	review: ["review-artifact"],
+};
 
 function requestTitle(questTitle: string | undefined, r: UserRequest): string {
 	return questTitle ? `[${questTitle}] ${r.title}` : r.title;
@@ -100,10 +93,40 @@ function readPostable(artifactPath: string | undefined): ReturnType<typeof extra
 
 export function registerApprovals(pi: ExtensionAPI): void {
 	const approvals = getApprovalManager();
-	const idCompletions = (prefix: string) => {
-		const items = approvals.list().map((a) => ({ value: a.id, label: `${a.id} — ${KIND_LABEL[a.kind]}: ${a.title}` }));
-		const f = items.filter((i) => i.value.startsWith(prefix.trim().split(/\s+/)[0] ?? ""));
-		return f.length > 0 ? f : items.length > 0 ? items : null;
+	// pi replaces the WHOLE argument text with a picked completion, so completions only ever
+	// extend what was typed (never an unrelated id that would swallow the user's option text).
+	const completionsFor = (verb: keyof typeof COMMAND_KINDS) => (prefix: string) => requestCompletions(approvals.list(), COMMAND_KINDS[verb], prefix);
+	const questTitleOf = (r: UserRequest) => (r.questId ? getQuestManager().store.load(r.questId)?.title : undefined);
+
+	/**
+	 * Resolve which request a command targets. The id is optional when only one request of
+	 * the command's kinds is waiting; with several, the interactive UI offers a picker.
+	 */
+	const pickRequest = async (
+		ctx: ExtensionCommandContext,
+		verb: keyof typeof COMMAND_KINDS,
+		args: string,
+	): Promise<{ req: UserRequest; rest: string; implicit: boolean } | undefined> => {
+		const pending = approvals.list();
+		const parsed = parseRequestArgs(pending, COMMAND_KINDS[verb], args);
+		if (parsed.error) {
+			ctx.ui.notify(parsed.error, "warning");
+			return undefined;
+		}
+		if (parsed.id) {
+			const req = approvals.get(parsed.id);
+			if (!req) ctx.ui.notify(`Request ${parsed.id} is no longer pending.`, "warning");
+			return req ? { req, rest: parsed.rest, implicit: Boolean(parsed.implicit) } : undefined;
+		}
+		const eligible = pending.filter((r) => COMMAND_KINDS[verb].includes(r.kind));
+		if (!ctx.hasUI) {
+			ctx.ui.notify(`${eligible.length} requests are waiting. Use /${verb} <id> (see /inbox).`, "warning");
+			return undefined;
+		}
+		const labels = eligible.map((r) => `${r.id} — ${requestTitle(questTitleOf(r), r)}`);
+		const pick = await ctx.ui.select(`/${verb}: which request?`, labels);
+		const req = pick ? eligible[labels.indexOf(pick)] : undefined;
+		return req ? { req, rest: parsed.rest, implicit: false } : undefined;
 	};
 
 	/** The inbox: every parked request across all Quests, with how to answer each. */
@@ -120,16 +143,16 @@ export function registerApprovals(pi: ExtensionAPI): void {
 			lines.push({ text: `${r.id}  ${KIND_LABEL[r.kind]}`, bold: true });
 			lines.push({ text: requestTitle(qTitle, r), indent: 2 });
 			if (r.kind === "choose" && r.options?.length)
-				lines.push({ text: `options: ${r.options.join(", ")}`, color: "muted", indent: 2 });
+				for (const line of numberedOptions(r.options)) lines.push({ text: line, color: "muted", indent: 4 });
 			if (r.kind === "review-artifact" && r.artifactPath)
 				lines.push({ text: `artifact: ${r.artifactPath}`, color: "dim", indent: 2 });
 			const how =
 				r.kind === "approve"
 					? `/approve ${r.id}  ·  /deny ${r.id}`
 					: r.kind === "choose"
-						? `/choose ${r.id} <option>`
+						? `/choose ${r.id}  (opens a picker)  ·  /choose ${r.id} <number>`
 						: r.kind === "answer"
-							? `/answer ${r.id} <text>`
+							? `/answer ${r.id}  (opens an input)  ·  /answer ${r.id} <text>`
 							: r.kind === "huddle"
 								? `a collaborative decision — ask me to pick it up (quest_huddle)`
 								: `/review ${r.id}  (read/edit)  ·  /approve ${r.id}  ·  /answer ${r.id} <notes to send back>`;
@@ -146,14 +169,18 @@ export function registerApprovals(pi: ExtensionAPI): void {
 	for (const verb of ["approve", "deny"] as const) {
 		pi.registerCommand(verb, {
 			description: `${verb === "approve" ? "Approve" : "Deny / decline"} a pending request by id`,
-			getArgumentCompletions: idCompletions,
+			getArgumentCompletions: completionsFor(verb),
 			handler: async (args, ctx) => {
-				const id = resolveId(approvals, args);
-				if (!id) {
-					ctx.ui.notify(`No matching pending request for "${args.trim()}".`, "warning");
-					return;
+				const picked = await pickRequest(ctx, verb, args);
+				if (!picked) return;
+				const { req, implicit } = picked;
+				const id = req.id;
+				// No id typed: never resolve a gate the user has not seen. Confirm it by title.
+				if (implicit && !(verb === "approve" && req.kind === "review-artifact" && req.postsReview)) {
+					if (!ctx.hasUI) return ctx.ui.notify(`Use /${verb} ${id} to ${verb} "${req.title}".`, "warning");
+					const ok = await ctx.ui.confirm(`${verb === "approve" ? "Approve" : "Decline"}: ${requestTitle(questTitleOf(req), req)}?`, req.description ?? "");
+					if (!ok) return ctx.ui.notify(`${id} is still pending.`, "info");
 				}
-				const req = approvals.get(id);
 				if (verb === "approve" && req?.kind === "review-artifact" && req.postsReview) {
 					// Posting a PR review: parse the CURRENT file, show the exact event + body, confirm,
 					// and answer with that snapshot — it is exactly what gets posted.
@@ -194,34 +221,48 @@ export function registerApprovals(pi: ExtensionAPI): void {
 	}
 
 	pi.registerCommand("choose", {
-		description: "Answer a 'choose' request: /choose <id> <option>",
-		getArgumentCompletions: idCompletions,
+		description: "Answer a 'choose' request: /choose opens a picker; or /choose [id] <number|text>",
+		getArgumentCompletions: completionsFor("choose"),
 		handler: async (args, ctx) => {
-			const { id, rest } = splitIdAndRest(approvals, args);
-			if (!id) return ctx.ui.notify(`No matching pending request for "${args.trim().split(/\s+/)[0] ?? ""}".`, "warning");
-			const req = approvals.get(id);
-			if (!rest) return ctx.ui.notify(`Usage: /choose ${id} <option>${req?.options?.length ? ` (${req.options.join(", ")})` : ""}`, "warning");
-			// Accept an exact option or a unique case-insensitive prefix.
-			let choice = rest;
-			if (req?.options?.length) {
-				const exact = req.options.find((o) => o.toLowerCase() === rest.toLowerCase());
-				const pfx = req.options.filter((o) => o.toLowerCase().startsWith(rest.toLowerCase()));
-				choice = exact ?? (pfx.length === 1 ? pfx[0] : rest);
-				if (!exact && pfx.length !== 1) return ctx.ui.notify(`"${rest}" is not one of: ${req.options.join(", ")}.`, "warning");
+			const picked = await pickRequest(ctx, "choose", args);
+			if (!picked) return;
+			const { req, rest } = picked;
+			const options = req.options ?? [];
+			let choice: string | undefined;
+			if (options.length === 0) {
+				choice = rest || (ctx.hasUI ? (await ctx.ui.input(req.title, "Your choice"))?.trim() : undefined);
+				if (!choice) return ctx.ui.notify(`Nothing chosen — ${req.id} is still pending.`, "info");
+			} else {
+				const list = numberedOptions(options);
+				if (rest) {
+					const m = matchOption(options, rest);
+					if ("choice" in m) choice = m.choice;
+					else if (!ctx.hasUI) return ctx.ui.notify(`${m.error}\n${list.join("\n")}`, "warning");
+					else ctx.ui.notify(`${m.error} Pick one from the list.`, "warning");
+				}
+				if (!choice) {
+					if (!ctx.hasUI) return ctx.ui.notify(`Usage: /choose ${req.id} <number>\n${list.join("\n")}`, "warning");
+					const pick = await ctx.ui.select(requestTitle(questTitleOf(req), req), list);
+					if (!pick) return ctx.ui.notify(`Nothing chosen — ${req.id} is still pending.`, "info");
+					choice = options[list.indexOf(pick)];
+				}
 			}
-			approvals.answer(id, { action: "choose", approved: true, choice });
-			ctx.ui.notify(`Chose "${choice}" for ${id}.`, "info");
+			const done = approvals.answer(req.id, { action: "choose", approved: true, choice });
+			ctx.ui.notify(done ? `Chose "${choice}" for ${req.id}.` : `${req.id} is no longer pending; nothing sent.`, done ? "info" : "warning");
 		},
 	});
 
 	pi.registerCommand("answer", {
-		description: "Answer an 'answer' request, or send a review back with notes: /answer <id> <text>",
-		getArgumentCompletions: idCompletions,
+		description: "Answer an 'answer' request, or send a review back with notes: /answer opens an input; or /answer [id] <text>",
+		getArgumentCompletions: completionsFor("answer"),
 		handler: async (args, ctx) => {
-			const { id, rest } = splitIdAndRest(approvals, args);
-			if (!id) return ctx.ui.notify(`No matching pending request for "${args.trim().split(/\s+/)[0] ?? ""}".`, "warning");
-			if (!rest) return ctx.ui.notify(`Usage: /answer ${id} <text>`, "warning");
-			const req = approvals.get(id);
+			const picked = await pickRequest(ctx, "answer", args);
+			if (!picked) return;
+			const { req } = picked;
+			const id = req.id;
+			let rest = picked.rest;
+			if (!rest && ctx.hasUI) rest = (await ctx.ui.input(requestTitle(questTitleOf(req), req), req.kind === "review-artifact" ? "Notes to send back" : "Your answer"))?.trim() ?? "";
+			if (!rest) return ctx.ui.notify(ctx.hasUI ? `Nothing sent — ${id} is still pending.` : `Usage: /answer ${id} <text>`, ctx.hasUI ? "info" : "warning");
 			// For a review-artifact, free text means "send it back with notes" (do NOT proceed).
 			// For an 'answer' question, it is the answer the party asked for.
 			if (req?.kind === "review-artifact") {
@@ -235,13 +276,13 @@ export function registerApprovals(pi: ExtensionAPI): void {
 	});
 
 	pi.registerCommand("review", {
-		description: "Open a review-artifact request to read/edit before approving: /review <id>",
-		getArgumentCompletions: idCompletions,
+		description: "Open a review-artifact request to read/edit before approving: /review [id]",
+		getArgumentCompletions: completionsFor("review"),
 		handler: async (args, ctx) => {
-			const id = resolveId(approvals, args);
-			if (!id) return ctx.ui.notify(`No matching pending request for "${args.trim()}".`, "warning");
-			const req = approvals.get(id);
-			if (!req) return ctx.ui.notify(`Request ${id} is no longer pending.`, "warning");
+			const picked = await pickRequest(ctx, "review", args);
+			if (!picked) return;
+			const { req } = picked;
+			const id = req.id;
 			if (req.kind !== "review-artifact" || !req.artifactPath)
 				return ctx.ui.notify(`${id} is a '${req.kind}' request, not an editable artifact. Use /inbox to see how to answer it.`, "warning");
 			let content = "";
@@ -275,6 +316,54 @@ export function registerApprovals(pi: ExtensionAPI): void {
 					...(content.split("\n").length > 60 ? [{ text: "… (truncated — open the file for the rest)", color: "muted" as ThemeColor }] : []),
 				],
 			});
+		},
+	});
+
+	pi.registerTool({
+		name: "answer_request",
+		label: "Answer request",
+		description: [
+			"Relay the user's explicit answer to a Quest's pending 'choose' or 'answer' inbox request, so the user does not have",
+			"to retype it as a slash command. It cannot approve or deny gates, review artifacts or huddles: those stay with the",
+			"user (/approve, /deny, /review, quest_huddle).",
+		].join(" "),
+		promptSnippet: "Relay the user's explicit decision to a Quest's pending choose/answer request",
+		promptGuidelines: [
+			"Use answer_request only to relay a decision the user has explicitly stated for that request in this conversation (for example 'pick option 1' or 'tell it staging'). Never choose on your own judgement or to get a Quest past a safety concern; if the user's intent is unclear, show them the numbered options and ask.",
+		],
+		parameters: Type.Object({
+			requestId: Type.Optional(Type.String({ description: "Request id (rq-\u2026). Optional when exactly one choose/answer request is pending." })),
+			option: Type.Optional(Type.String({ description: "For a 'choose' request: the 1-based option number, or its text." })),
+			text: Type.Optional(Type.String({ description: "For an 'answer' request: the user's answer." })),
+		}),
+		async execute(_toolCallId, params): Promise<{ content: { type: "text"; text: string }[]; details: { id: string; choice?: string } }> {
+			const pending = approvals.list();
+			const eligible = pending.filter((r) => r.kind === "choose" || r.kind === "answer");
+			const describe = (r: UserRequest) => `${r.id} (${r.kind}): ${requestTitle(questTitleOf(r), r)}${r.options?.length ? `\n${numberedOptions(r.options).map((l) => `  ${l}`).join("\n")}` : ""}`;
+			let req: UserRequest | undefined;
+			if (params.requestId) {
+				const id = resolveRequestId(pending, params.requestId);
+				req = id ? approvals.get(id) : undefined;
+				if (!req) throw new Error(`No pending request matches "${params.requestId}".`);
+				if (req.kind !== "choose" && req.kind !== "answer")
+					throw new Error(`${req.id} is a '${req.kind}' request. Only the user can resolve it (see /inbox).`);
+			} else if (eligible.length === 1) {
+				req = eligible[0];
+			} else {
+				throw new Error(eligible.length === 0 ? "No choose/answer request is pending." : `Several requests are pending; pass requestId:\n${eligible.map(describe).join("\n")}`);
+			}
+			if (req.kind === "choose") {
+				const input = (params.option ?? params.text ?? "").trim();
+				if (!input) throw new Error(`Pass option for ${describe(req)}`);
+				const m = req.options?.length ? matchOption(req.options, input) : { choice: input };
+				if ("error" in m) throw new Error(`${m.error}\n${describe(req)}`);
+				if (!approvals.answer(req.id, { action: "choose", approved: true, choice: m.choice })) throw new Error(`${req.id} is no longer pending.`);
+				return { content: [{ type: "text", text: `Chose "${m.choice}" for ${req.id}. The Quest resumes.` }], details: { id: req.id, choice: m.choice } };
+			}
+			const text = (params.text ?? params.option ?? "").trim();
+			if (!text) throw new Error(`Pass text for ${describe(req)}`);
+			if (!approvals.answer(req.id, { action: "answer", approved: true, text })) throw new Error(`${req.id} is no longer pending.`);
+			return { content: [{ type: "text", text: `Answered ${req.id}. The Quest resumes.` }], details: { id: req.id } };
 		},
 	});
 

@@ -40,7 +40,7 @@ export interface QuestMember {
 	step?: string;
 	lastTool?: string;
 	lastTest?: string;
-	checks?: { command: string; exitCode?: number }[];
+	checks?: { command: string; exitCode?: number; masked?: true }[];
 	budgetExceededAt?: number;
 	/** Which project repo this member worked in (multi-repo projects). */
 	repo?: string;
