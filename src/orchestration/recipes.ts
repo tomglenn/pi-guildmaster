@@ -141,6 +141,14 @@ export const RECIPES = {
 		isolation: "worktree",
 		delivery: "draft-pr",
 	},
+	"write-party": {
+		id: "write-party",
+		description: "Implement a complex or high-risk change with a full specialist party in an isolated worktree.",
+		write: true,
+		github: "none",
+		isolation: "worktree",
+		delivery: "draft-pr",
+	},
 	"plan-implement": {
 		id: "plan-implement",
 		description: "Agree a plan WITH the user (a huddle), then implement it in an isolated worktree; produces a draft PR.",

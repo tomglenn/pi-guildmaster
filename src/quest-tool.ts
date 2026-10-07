@@ -30,6 +30,7 @@ import { raisePr, type RaiseResult } from "./orchestration/pr.ts";
 import { extractPostableReview } from "./orchestration/review-post.ts";
 import { runParty } from "./orchestration/party-leader.ts";
 import { runFastWrite } from "./orchestration/fast-write.ts";
+import { useFastWrite } from "./orchestration/write-routing.ts";
 import { loadRecipeRegistry } from "./orchestration/recipe-loader.ts";
 import { executionShape, preflightRecipe, resolveRecipe } from "./orchestration/recipes.ts";
 import { pickRepoBySlug, readonlyContexts, resolveProjectQuery } from "./orchestration/resolve.ts";
@@ -823,7 +824,7 @@ export function registerQuestTool(pi: ExtensionAPI): void {
 				if (project) {
 					for (const r of project.repos) if (!targets.some((t) => t.name === r.name)) contexts.push({ name: r.name, path: r.path, writable: false });
 				}
-				void runQuestInBackground(record, { write: true, inPlace, contexts, config, globalInstructions: config.globalInstructions, instructions, partyHint: recipe.party, fastWrite: targets.length === 1 && (recipe.id === "write" || recipe.id === "write-in-place") });
+				void runQuestInBackground(record, { write: true, inPlace, contexts, config, globalInstructions: config.globalInstructions, instructions, partyHint: recipe.party, fastWrite: useFastWrite(recipe, targets.length, brief) });
 				return started(record, project?.id, targets.map((t) => t.name).join("+"), true, inPlace);
 			}
 
