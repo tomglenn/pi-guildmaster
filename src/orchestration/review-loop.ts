@@ -54,6 +54,8 @@ export type ReviewLoopResult = {
 	findings?: string;
 	/** A short Markdown section for the report / PR body. */
 	note?: string;
+	/** Each fix round's Builder report, so the PR body describes the code that ships. */
+	fixReports: string[];
 };
 
 export async function runReviewLoop(opts: {
@@ -69,6 +71,7 @@ export async function runReviewLoop(opts: {
 	onMembers?: (members: QuestMember[]) => void;
 }): Promise<ReviewLoopResult> {
 	const members: QuestMember[] = [];
+	const fixReports: string[] = [];
 	let cost = 0;
 	let rounds = 0;
 	let budget = opts.maxFixRounds ?? 2;
@@ -79,22 +82,26 @@ export async function runReviewLoop(opts: {
 	for (;;) {
 		const review = await opts.review();
 		cost += review.cost;
-		if (review.verdict === "skipped") return { outcome: "skipped", fixRounds: rounds, members, cost };
+		if (review.verdict === "skipped") return { outcome: "skipped", fixRounds: rounds, members, cost, fixReports };
 		push(review.member);
 		if (review.verdict === "pass") {
 			const note = rounds === 0
 				? `## Independent review\n${review.reviewer} reviewed the final diff: PASS.`
 				: `## Independent review\n${review.reviewer} blocked the first version. After ${rounds} fix round${rounds > 1 ? "s" : ""}, it passed.`;
-			return { outcome: "passed", reviewer: review.reviewer, fixRounds: rounds, members, cost, note };
+			return { outcome: "passed", reviewer: review.reviewer, fixRounds: rounds, members, cost, note, fixReports };
 		}
 		let guidance: string | undefined;
+		// The reviewer says only a brief change can satisfy it: a fix round would be wasted.
+		let conflict = review.briefConflict ? `${review.reviewer} says the brief itself must change: ${review.briefConflict}` : undefined;
 		for (;;) {
-			let blocker: string | undefined;
-			if (rounds < budget) {
+			let blocker: string | undefined = conflict;
+			conflict = undefined;
+			if (!blocker && rounds < budget) {
 				rounds++;
 				const fix = await opts.fix(fixPrompt(opts.brief, review.reviewer, review.findings, guidance), rounds);
 				push(fix.member);
 				cost += fix.cost;
+				if (fix.report.trim()) fixReports.push(fix.report.trim());
 				guidance = undefined;
 				if (!fix.blocker) break; // re-review the fixed diff
 				blocker = fix.blocker;
@@ -107,7 +114,7 @@ export async function runReviewLoop(opts: {
 			);
 			if (ans.approved && ans.choice === ACCEPT) {
 				return {
-					outcome: "accepted", reviewer: review.reviewer, fixRounds: rounds, members, cost, findings: review.findings,
+					outcome: "accepted", reviewer: review.reviewer, fixRounds: rounds, members, cost, findings: review.findings, fixReports,
 					note: `## Independent review: risk accepted by the user\n${review.reviewer} blocked this change${rounds ? ` after ${rounds} fix round${rounds > 1 ? "s" : ""}` : ""}. The user chose to keep it. Unresolved findings:\n\n${clipFindings(review.findings)}`,
 				};
 			}

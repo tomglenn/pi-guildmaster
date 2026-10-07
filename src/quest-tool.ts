@@ -262,6 +262,7 @@ async function runQuestInBackground(
 					},
 					review: () => reviewSensitiveDiff({
 						isolation: iso, brief: record.brief, roster, config: opts.config, signal: api.signal,
+						checks: evaluateVerification([...party.members, ...loopMembers].filter((m) => m.repo === iso.repo || !m.repo), [iso.repo]).checks,
 						onProgress: (member) => show([member]),
 					}),
 					fix: async (prompt) => {
@@ -292,6 +293,8 @@ async function runQuestInBackground(
 				party.members.push(...loop.members);
 				party.usage.cost += loop.cost;
 				api.setMembers(party.members.slice());
+				if (loop.fixReports.length)
+					party.report = `${party.report}\n\n## Changes from review fix rounds\nThe sections above describe the first version. ${loop.reviewer} review led to these further changes:\n\n${loop.fixReports.map((r, i) => `### Fix round ${i + 1}\n${r.replace(/^#+ /gm, "#### ").slice(0, 3_000)}`).join("\n\n")}`;
 				if (loop.note) party.report = `${party.report}\n\n${loop.note}`;
 				if (loop.fixRounds > 0) {
 					// Fix rounds changed the code: earlier checks are stale. Re-derive from every member

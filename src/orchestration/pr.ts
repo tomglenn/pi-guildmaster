@@ -209,7 +209,7 @@ export async function raisePr(record: QuestRecord, deps: PrDeps): Promise<RaiseR
 			}
 			const ok = deps.confirmSecurity ? await deps.confirmSecurity(`Change to ${pr.repo} looks like a security fix. Raise a PR anyway?`) : false;
 			if (!ok) {
-				results.push({ repo: pr.repo, raised: false, refused: true, reason: "Security-fix PR not confirmed." });
+				results.push({ repo: pr.repo, raised: false, refused: true, reason: deps.confirmSecurity ? "Security-fix PR not confirmed." : "Looks like a security fix, so it was not raised automatically. Review the branch, then use raise_pr to confirm and raise it." });
 				continue;
 			}
 		}

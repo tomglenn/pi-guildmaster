@@ -129,7 +129,7 @@ describe("raisePr", () => {
 		assert.equal(result.raised, 0);
 		assert.equal(result.results[0].raised, false);
 		assert.equal(result.results[0].refused, true);
-		assert.ok(result.results[0].reason.includes("Security-fix"));
+		assert.match(result.results[0].reason, /security fix[\s\S]*raise_pr/i, "says what to do next");
 	});
 
 	test("blocks grafana/grafana first-party security fix (org policy)", async () => {

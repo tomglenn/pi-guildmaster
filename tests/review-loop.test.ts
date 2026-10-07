@@ -76,3 +76,21 @@ test("an abort or declined choice stops (fail-closed), worktree preserved", asyn
 	const h = harness([block()], [fixed("checks failed")]);
 	await assert.rejects(() => h.run(), /Worktree preserved; nothing pushed/);
 });
+
+test("a reviewer BRIEF-CONFLICT goes straight to the user with no wasted fix round", async () => {
+	const conflict: ReviewOutcome = { ...block(), briefConflict: "the brief forbids escaping, which is the only fix" } as ReviewOutcome;
+	const h = harness([conflict], [], [{ action: "choose", approved: true, choice: ACCEPT }]);
+	const r = await h.run();
+	assert.equal(r.outcome, "accepted");
+	assert.equal(r.fixRounds, 0);
+	assert.deepEqual(h.log, ["review", "choose:warden says the brief itself must change: the brief forbids escaping, which is the only fix"]);
+});
+
+test("a brief conflict can still be retried with guidance", async () => {
+	const conflict: ReviewOutcome = { ...block(), briefConflict: "x" } as ReviewOutcome;
+	const h = harness([conflict, pass], [fixed()], [{ action: "choose", approved: true, choice: RETRY }, { action: "answer", approved: true, text: "escape it" }]);
+	const r = await h.run();
+	assert.equal(r.outcome, "passed");
+	assert.deepEqual(h.log, ["review", "choose:warden says the brief itself must change: x", "answer", "fix", "review"]);
+	assert.deepEqual(r.fixReports, ["done"], "fix reports are kept for the PR body");
+});

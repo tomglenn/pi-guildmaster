@@ -5,6 +5,7 @@ import { runChildAgent } from "../execution/child-agent.ts";
 import { resolveModelSpec, type GuildmasterConfig } from "../config.ts";
 import type { QuestIsolation, QuestMember } from "../persistence/quest-store.ts";
 import { findGuildmate, type Guildmate } from "../roster.ts";
+import type { CheckResult } from "./verification.ts";
 export function requiredReviewer(brief: string, files: string[], diff: string): "warden" | "inquisitor" | undefined {
 	if (/\b(auth(?:entication|orization)?|oauth|permission|privilege|secret|credential|token|cryptograph\w*|encrypt\w*|security|vulnerab\w*|injection|xss|csrf|sanitize|untrusted|user[ -]?input)\b/i.test(brief) ||
 		files.some((f) => /(?:auth|permission|policy|security|secret|credential|token|crypto|saniti|csrf|xss)/i.test(f)) ||
@@ -28,7 +29,12 @@ export function reviewPassed(text: string): boolean {
  */
 export type ReviewOutcome =
 	| { verdict: "skipped"; cost: number; member?: undefined }
-	| { verdict: "pass" | "block"; reviewer: "warden" | "inquisitor"; member: QuestMember; cost: number; findings: string };
+	| { verdict: "pass" | "block"; reviewer: "warden" | "inquisitor"; member: QuestMember; cost: number; findings: string; briefConflict?: string };
+
+/** The reviewer says a material finding can only be fixed by changing the brief itself: a fix round cannot help. */
+export function briefConflict(text: string): string | undefined {
+	return /^BRIEF-CONFLICT:\s*(.+)$/im.exec(text)?.[1]?.trim() || undefined;
+}
 
 export async function reviewSensitiveDiff(opts: {
 	isolation: QuestIsolation;
@@ -37,6 +43,8 @@ export async function reviewSensitiveDiff(opts: {
 	config: GuildmasterConfig;
 	signal?: AbortSignal;
 	onProgress?: (member: QuestMember) => void;
+	/** Checks the harness observed (real exit codes), so the reviewer need not re-run them. */
+	checks?: CheckResult[];
 	/** Test seam: independent review without a live model. */
 	runReviewer?: typeof runChildAgent;
 }): Promise<ReviewOutcome> {
@@ -63,7 +71,7 @@ export async function reviewSensitiveDiff(opts: {
 	try {
 		const res = await (opts.runReviewer ?? runChildAgent)({
 			guildmate: reviewer, modelSpec: resolveModelSpec(opts.config, reviewer.model), cwd: iso.worktreePath, signal: opts.signal,
-			task: `Independently review the FINAL change against the full brief. Inspect every changed file (including untracked files). Check for security and correctness issues. End with exactly one standalone line VERDICT: PASS or VERDICT: BLOCK. BLOCK on material issues or incomplete examination. Explain findings with file:line.\n\nBrief:\n${opts.brief}\n\nChanged files:\n${files.join("\n")}\n\nDiff and untracked files:\n${fullDiff}`,
+			task: `Independently review the FINAL change against the full brief. Inspect every changed file (including untracked files). Check for security and correctness issues. End with exactly one standalone line VERDICT: PASS or VERDICT: BLOCK. BLOCK on material issues or incomplete examination. Explain findings with file:line. If a material finding can only be resolved by changing an explicit requirement of the brief (so no code fix within the brief can satisfy it), add one standalone line BRIEF-CONFLICT: <one sentence> before the verdict. Do not BLOCK only because you could not run checks yourself: the harness-observed results are below.\n\nHarness-observed checks (real exit codes):\n${opts.checks?.length ? opts.checks.map((c) => `- ${c.command} → exit ${c.exitCode ?? "?"}`).join("\n") : "(none recorded)"}\n\nBrief:\n${opts.brief}\n\nChanged files:\n${files.join("\n")}\n\nDiff and untracked files:\n${fullDiff}`,
 		});
 		if (res.error || res.stopReason === "aborted" || res.stopReason === "error") {
 			member.status = "failed";
@@ -78,7 +86,7 @@ export async function reviewSensitiveDiff(opts: {
 		member.summary = res.finalText.slice(0, 400);
 		member.finishedAt = Date.now();
 		opts.onProgress?.({ ...member });
-		return { verdict: passed ? "pass" : "block", reviewer: reviewerName, member, cost: res.usage.cost, findings: res.finalText.trim() };
+		return { verdict: passed ? "pass" : "block", reviewer: reviewerName, member, cost: res.usage.cost, findings: res.finalText.trim(), briefConflict: passed ? undefined : briefConflict(res.finalText) };
 	} catch (error) {
 		if (member.status === "running") {
 			member.status = "failed";

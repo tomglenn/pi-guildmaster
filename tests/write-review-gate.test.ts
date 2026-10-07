@@ -4,7 +4,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { execFileSync } from "node:child_process";
-import { reviewSensitiveDiff } from "../src/orchestration/write-review.ts";
+import { briefConflict, reviewSensitiveDiff } from "../src/orchestration/write-review.ts";
 import { DEFAULT_CONFIG } from "../src/config.ts";
 import type { Guildmate } from "../src/roster.ts";
 
@@ -40,6 +40,15 @@ test("actual changed and untracked files trigger an independent review before co
 		});
 		assert.equal(blocked.verdict, "block");
 		assert.ok(blocked.verdict === "block" && blocked.findings.length > 3000, "findings are not cut to a fragment");
+		// The reviewer sees the harness-observed checks, and can flag a brief conflict.
+		await reviewSensitiveDiff({ isolation, brief: "Update app", roster: [warden], config: DEFAULT_CONFIG, runReviewer, checks: [{ command: "npm test", exitCode: 0 }] });
+		assert.match(task, /npm test → exit 0/);
+		assert.match(task, /BRIEF-CONFLICT:/);
+		const conflicted = await reviewSensitiveDiff({ isolation, brief: "Update app", roster: [warden], config: DEFAULT_CONFIG,
+			runReviewer: async (options) => ({ ...(await runReviewer(options)), finalText: "Bad.\nBRIEF-CONFLICT: the brief forbids the fix\nVERDICT: BLOCK" }),
+		});
+		assert.ok(conflicted.verdict === "block" && conflicted.briefConflict === "the brief forbids the fix");
+		assert.equal(briefConflict("no marker\nVERDICT: BLOCK"), undefined);
 		// A reviewer that could not run is still fail-closed.
 		await assert.rejects(() => reviewSensitiveDiff({ isolation, brief: "Update app", roster: [warden], config: DEFAULT_CONFIG,
 			runReviewer: async (options) => ({ ...(await runReviewer(options)), error: "model down" }),

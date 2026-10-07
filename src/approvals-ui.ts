@@ -129,6 +129,18 @@ export function registerApprovals(pi: ExtensionAPI): void {
 		return req ? { req, rest: parsed.rest, implicit: false } : undefined;
 	};
 
+	/** Show WHY the user is being asked before a picker/input: a select only renders the title + options. */
+	const showRequestContext = (req: UserRequest) => {
+		if (!req.description?.trim()) return;
+		showCard(pi, {
+			title: requestTitle(questTitleOf(req), req),
+			lines: [
+				...req.description.split("\n").map((text) => ({ text })),
+				...(req.options?.length ? [{ text: "", color: "muted" as ThemeColor }, ...numberedOptions(req.options).map((text) => ({ text, color: "accent" as ThemeColor }))] : []),
+			],
+		});
+	};
+
 	/** The inbox: every parked request across all Quests, with how to answer each. */
 	const showInbox = (ctx: { ui: { notify: (t: string, l: "info" | "warning" | "error") => void } }) => {
 		const pending = approvals.list();
@@ -242,6 +254,7 @@ export function registerApprovals(pi: ExtensionAPI): void {
 				}
 				if (!choice) {
 					if (!ctx.hasUI) return ctx.ui.notify(`Usage: /choose ${req.id} <number>\n${list.join("\n")}`, "warning");
+					showRequestContext(req);
 					const pick = await ctx.ui.select(requestTitle(questTitleOf(req), req), list);
 					if (!pick) return ctx.ui.notify(`Nothing chosen — ${req.id} is still pending.`, "info");
 					choice = options[list.indexOf(pick)];
@@ -261,6 +274,7 @@ export function registerApprovals(pi: ExtensionAPI): void {
 			const { req } = picked;
 			const id = req.id;
 			let rest = picked.rest;
+			if (!rest && ctx.hasUI) showRequestContext(req);
 			if (!rest && ctx.hasUI) rest = (await ctx.ui.input(requestTitle(questTitleOf(req), req), req.kind === "review-artifact" ? "Notes to send back" : "Your answer"))?.trim() ?? "";
 			if (!rest) return ctx.ui.notify(ctx.hasUI ? `Nothing sent — ${id} is still pending.` : `Usage: /answer ${id} <text>`, ctx.hasUI ? "info" : "warning");
 			// For a review-artifact, free text means "send it back with notes" (do NOT proceed).
