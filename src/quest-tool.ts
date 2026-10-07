@@ -29,6 +29,7 @@ import { getApprovalManager, getQuestManager } from "./orchestration/manager.ts"
 import { raisePr, type RaiseResult } from "./orchestration/pr.ts";
 import { extractPostableReview } from "./orchestration/review-post.ts";
 import { runParty } from "./orchestration/party-leader.ts";
+import { runFastWrite } from "./orchestration/fast-write.ts";
 import { loadRecipeRegistry } from "./orchestration/recipe-loader.ts";
 import { executionShape, preflightRecipe, resolveRecipe } from "./orchestration/recipes.ts";
 import { pickRepoBySlug, readonlyContexts, resolveProjectQuery } from "./orchestration/resolve.ts";
@@ -124,6 +125,7 @@ async function runQuestInBackground(
 		slack?: boolean;
 		/** Advisory preferred party (from the recipe). */
 		partyHint?: string[];
+		fastWrite?: boolean;
 	},
 ): Promise<void> {
 	const manager = getQuestManager();
@@ -138,7 +140,20 @@ async function runQuestInBackground(
 			const fence = (why: string) => {
 				if (api.signal.aborted) throw new Error(why);
 			};
-			const party = await runParty({
+			const party = await (opts.fastWrite ? runFastWrite({
+				brief: api.record.brief,
+				context: opts.contexts[0],
+				config: opts.config,
+				signal: api.signal,
+				instructions: opts.instructions,
+				globalInstructions: opts.globalInstructions,
+				onProgress: (members) => api.setMembers(members),
+				onActivity: () => api.touch(),
+				onLeaderText: (text) => api.notePartial(text),
+				onLeaderMessage: (text) => {
+					if (!api.signal.aborted) fs.writeFileSync(leaderFile, text, { mode: 0o600 });
+				},
+			}) : runParty({
 				brief: api.record.brief,
 				contexts: opts.contexts,
 				roster,
@@ -175,7 +190,7 @@ async function runQuestInBackground(
 					setState: (state) => manager.transition(record, state),
 					scratchDir: questScratchDir(record.id),
 				},
-			});
+			}));
 			// Persist how the party's run ended, for forensics, before anything can throw.
 			record.stopReason = party.stopReason;
 
@@ -808,7 +823,7 @@ export function registerQuestTool(pi: ExtensionAPI): void {
 				if (project) {
 					for (const r of project.repos) if (!targets.some((t) => t.name === r.name)) contexts.push({ name: r.name, path: r.path, writable: false });
 				}
-				void runQuestInBackground(record, { write: true, inPlace, contexts, config, globalInstructions: config.globalInstructions, instructions, partyHint: recipe.party });
+				void runQuestInBackground(record, { write: true, inPlace, contexts, config, globalInstructions: config.globalInstructions, instructions, partyHint: recipe.party, fastWrite: targets.length === 1 && (recipe.id === "write" || recipe.id === "write-in-place") });
 				return started(record, project?.id, targets.map((t) => t.name).join("+"), true, inPlace);
 			}
 

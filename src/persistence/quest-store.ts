@@ -35,6 +35,10 @@ export interface QuestMember {
 	model?: string;
 	status: QuestMemberStatus;
 	summary?: string;
+	startedAt?: number;
+	finishedAt?: number;
+	step?: string;
+	lastTool?: string;
 	/** Which project repo this member worked in (multi-repo projects). */
 	repo?: string;
 }

@@ -22,6 +22,9 @@ const TIER_TOOLS: Record<Tier, string[]> = {
 	// Shell access is a bounded custom tool injected by orchestration (runner-shell.ts),
 	// never the raw `bash` tool — so a runner cannot start a watch/server that never returns.
 	exec: ["read", "grep", "find", "ls"],
+	// Builder can iterate on edits and tests in one session. Its shell is the same
+	// bounded, remote-mutation-gated tool used by Runner, never raw bash.
+	builder: ["read", "grep", "find", "ls", "edit", "write"],
 	// Envoy talks to GitHub. It gets read-only FILE tools here; its shell access is a
 	// separate POLICY-GATED custom tool injected by orchestration (see execution/gh-tool.ts),
 	// never the raw `bash` tool — so it structurally cannot run an ungated mutation.
