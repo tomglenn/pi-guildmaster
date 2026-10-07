@@ -251,20 +251,25 @@ async function runQuestInBackground(
 					}
 				};
 				const context = { name: iso.repo, path: iso.worktreePath, writable: true };
+				let loopMembers: typeof party.members = [];
+				const show = (current: typeof party.members) => api.setMembers([...party.members, ...loopMembers, ...current]);
 				const loop = await runReviewLoop({
 					repo: iso.repo,
 					brief: record.brief,
-					onMembers: (members) => api.setMembers([...party.members, ...members]),
+					onMembers: (members) => {
+						loopMembers = members;
+						show([]);
+					},
 					review: () => reviewSensitiveDiff({
 						isolation: iso, brief: record.brief, roster, config: opts.config, signal: api.signal,
-						onProgress: (member) => api.setMembers([...party.members, member]),
+						onProgress: (member) => show([member]),
 					}),
 					fix: async (prompt) => {
 						fence("Quest aborted during review fix round.");
 						const fixed = await runFastWrite({
 							brief: prompt, context, config: opts.config, signal: api.signal,
 							instructions: opts.instructions, globalInstructions: opts.globalInstructions,
-							onProgress: (members) => api.setMembers([...party.members, ...members]),
+							onProgress: (members) => show(members),
 							onActivity: () => api.touch(),
 						});
 						const member = fixed.members[0];

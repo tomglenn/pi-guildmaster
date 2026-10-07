@@ -32,6 +32,13 @@ const KIND_HINT: Record<string, string> = {
 	huddle: "quest_huddle",
 };
 
+/** The board's one-line answer hint for a request kind (choose/answer open a picker/input with no args). */
+export function requestHint(kind: string): string {
+	if (kind === "huddle") return "ask me to pick it up";
+	if (kind === "review-artifact") return "/review";
+	return KIND_HINT[kind] ?? "/inbox";
+}
+
 const WIDGET = "guildmaster-board";
 const QUEST_CARD = "guildmaster-quest";
 
@@ -378,7 +385,7 @@ export class StatusSurface {
 				if (snapshot.lineage[q.id]) box.addChild(new Text(`      ${fg("muted", `↳ from ${snapshot.lineage[q.id]}`)}`, 0, 0));
 			}
 			for (const a of snapshot.pending) {
-				box.addChild(new Text(`  ${fg("warning", "⚑")} ${fg("dim", a.id)}  ${a.title}  ${fg("muted", "/approve")}`, 0, 0));
+				box.addChild(new Text(`  ${fg("warning", "⚑")} ${fg("dim", a.id)}  ${a.title}  ${fg("muted", requestHint(a.kind))}`, 0, 0));
 			}
 			for (const q of snapshot.done) {
 				const label = q.project ? fg("muted", `[${q.project}] `) : "";

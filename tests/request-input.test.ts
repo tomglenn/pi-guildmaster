@@ -83,3 +83,12 @@ test("completions never replace typed option text with a bare id", () => {
 	// Non-choose commands offer nothing after the id (free text).
 	assert.equal(requestCompletions([req("rq-a-1", "answer")], ["answer"], "rq-a-1 stag"), null);
 });
+
+test("the Guild board hints the right command per request kind (not /approve for everything)", async () => {
+	const { requestHint } = await import("../src/status.ts");
+	assert.equal(requestHint("choose"), "/choose");
+	assert.equal(requestHint("answer"), "/answer");
+	assert.equal(requestHint("approve"), "/approve");
+	assert.equal(requestHint("review-artifact"), "/review");
+	assert.equal(requestHint("huddle"), "ask me to pick it up");
+});
