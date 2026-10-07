@@ -21,7 +21,7 @@ Guildmaster adds a few concepts on top of Pi:
   simply has no write or shell tools).
 - **Consult** — one bounded, read-only investigation delegated to a single
   Guildmate. Runs inline and returns a concise, evidence-backed result.
-- **Quest** — work that runs in the **background**. A bounded, one-repo write Quest uses one worker to edit and test in one session. Complex work uses a Party Leader and specialists. Both return immediately, so you can start other work. Member transcripts do not enter Guildmaster's context.
+- **Quest** — work that runs in the **background**. A Party Leader inspects a write Quest and chooses the smallest useful party. It can dispatch one Builder to edit and test, or add specialists for specific questions. Quests return immediately. Member transcripts do not enter Guildmaster's context.
 - **Approvals** — anything that touches the outside world (pushing a branch,
   posting a PR review) is **parked for your approval**, never auto-done, and never
   blocks unrelated work.
@@ -77,7 +77,7 @@ Natural language is the primary interface. Just tell the Guildmaster what you wa
 
 The Guild board shows the current member, action, elapsed time, and last test result. It also shows pending approvals and finished Quests. A worker still active after five minutes triggers one warning. This is a soft budget: the Quest continues. Completed Quests stay on the board until you turn them in.
 
-For sensitive work, including authentication, permissions, secrets, migrations, or dependency changes, the write Quest uses the full party. Multi-repo writes also use the full party. Use the `write-party` recipe to request a full party for other write tasks.
+The Party Leader handles writes by default. It does not require a plan, two reviews, or a Scribe for every change. The harness checks observed test exit codes for each writable repo. It does not auto-raise an unverified draft PR. The harness also requires independent review of security, migration, and dependency diffs. Use `write-fast` to skip the leader for a bounded one-repo change. Use `write-legacy` to run the old Smith/Runner pipeline.
 
 ### Reviewing a pull request
 
@@ -166,8 +166,9 @@ different model family).
 | **warden** | read-only | Security hunting |
 | **inquisitor** | read-only | Adversarial review (different model family) |
 | **scribe** | write | Human-facing synthesis / final write-ups |
-| **smith** | write | Implementation (in an isolated worktree) |
-| **runner** | exec | Builds and tests |
+| **builder** | builder | Edits, tests, and fixes in one isolated session |
+| **smith** | write | Legacy implementation role (`write-legacy`) |
+| **runner** | exec | Legacy build and test role (`write-legacy`) |
 | **envoy** | envoy | The party's only contact with GitHub (gated shell) |
 
 Capability tiers are enforced **structurally** by the tools each agent is given —

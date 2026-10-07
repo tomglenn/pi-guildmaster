@@ -6,5 +6,6 @@ export function needsFullParty(brief: string): boolean {
 }
 
 export function useFastWrite(recipe: Recipe, writableRepoCount: number, brief: string): boolean {
-	return writableRepoCount === 1 && (recipe.id === "write" || recipe.id === "write-in-place") && !needsFullParty(brief);
+	// The default is a dynamic Party Leader; the one-worker shortcut is an explicit opt-in.
+	return writableRepoCount === 1 && recipe.id === "write-fast" && !needsFullParty(brief);
 }

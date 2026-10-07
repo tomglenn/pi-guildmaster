@@ -31,6 +31,8 @@ import { extractPostableReview } from "./orchestration/review-post.ts";
 import { runParty } from "./orchestration/party-leader.ts";
 import { runFastWrite } from "./orchestration/fast-write.ts";
 import { useFastWrite } from "./orchestration/write-routing.ts";
+import { evaluateVerification } from "./orchestration/verification.ts";
+import { reviewSensitiveDiff } from "./orchestration/write-review.ts";
 import { loadRecipeRegistry } from "./orchestration/recipe-loader.ts";
 import { executionShape, preflightRecipe, resolveRecipe } from "./orchestration/recipes.ts";
 import { pickRepoBySlug, readonlyContexts, resolveProjectQuery } from "./orchestration/resolve.ts";
@@ -45,7 +47,7 @@ function started(record: QuestRecord, projectId?: string, targetRepo?: string, w
 	const tail = write
 		? inPlace
 			? `It is working IN-PLACE in your real checkout${branch ? ` on branch ${branch}` : ""} — changes are committed there for you to review directly. No worktree, no PR.`
-			: "When it finishes it will automatically push and open a draft PR (unless it looks like a security fix)."
+			: "When verified, it will automatically open a draft PR (unless a security gate blocks it). Without observed passing checks, the branch stays local."
 		: "Ask me to show the results when it's done, or check /quests.";
 	return {
 		content: [
@@ -127,6 +129,7 @@ async function runQuestInBackground(
 		/** Advisory preferred party (from the recipe). */
 		partyHint?: string[];
 		fastWrite?: boolean;
+		legacyWrite?: boolean;
 	},
 ): Promise<void> {
 	const manager = getQuestManager();
@@ -161,6 +164,7 @@ async function runQuestInBackground(
 				config: opts.config,
 				signal: api.signal,
 				write: opts.write,
+				legacyWrite: opts.legacyWrite,
 				globalInstructions: opts.globalInstructions,
 				instructions: opts.instructions,
 				review: opts.review ? { prText: opts.review.prText, approvals: opts.review.approvals, questId: record.id } : undefined,
@@ -221,6 +225,30 @@ async function runQuestInBackground(
 			if (!party.report?.trim()) {
 				throw new Error(party.error || "Party produced no report before finalizing.");
 			}
+			if (opts.write) {
+				const verification = evaluateVerification(party.members, record.isolations?.map((iso) => iso.repo));
+				record.verification = verification.state;
+				if (verification.state === "unverified") record.raiseError = "No observed passing verification checks; branch kept local.";
+				api.save();
+				if (verification.state === "failed") {
+					throw new Error(`Verification failed or returned no exit code: ${verification.checks.filter((c) => c.exitCode !== 0).map((c) => `${c.command} (exit ${c.exitCode ?? "?"})`).join(", ")}. Worktree preserved for repair.`);
+				}
+			}
+
+			// Independently inspect risk from the ACTUAL diff, not just the brief. This gate is
+			// enforced by the harness even when the leader elects not to dispatch a reviewer.
+			if (opts.write) for (const iso of record.isolations ?? []) {
+				const review = await reviewSensitiveDiff({
+					isolation: iso, brief: record.brief, roster, config: opts.config, signal: api.signal,
+					onProgress: (member) => api.setMembers([...party.members, member]),
+				});
+				fence("Quest aborted during independent review.");
+				if (review.member) {
+					party.members.push(review.member);
+					party.usage.cost += review.cost;
+					api.setMembers(party.members.slice());
+				}
+			}
 
 			// Commit each writable repo's worktree + draft a PR per changed repo BEFORE
 			// completion, so the completed record already carries its branches/PRs.
@@ -258,7 +286,7 @@ async function runQuestInBackground(
 				// security fixes stay local, and with no confirmSecurity callback any other
 				// security-looking change is refused by default (safe). raise_pr can retry.
 				let raiseResult: RaiseResult | undefined;
-				if (prs.length > 0) {
+				if (prs.length > 0 && record.verification === "verified") {
 					let raiseFailure: unknown;
 					try {
 						raiseResult = await raisePr(record, {
@@ -375,7 +403,7 @@ async function runQuestInBackground(
 					return { report: `${body}${note}`, usage: party.usage };
 				}
 			}
-			return { report: party.report, usage: party.usage };
+			return { report: record.verification === "unverified" ? `${party.report}\n\n⚠️ UNVERIFIED: no observed passing build, lint, typecheck or test. Branch committed but draft PR not auto-raised; run verification before raising.` : party.report, usage: party.usage };
 		}, {});
 	} catch {
 		// manager.run already transitioned the record to failed and persisted it.
@@ -396,6 +424,8 @@ function describeQuest(q: QuestRecord): string {
 	for (const pr of q.prs ?? []) {
 		const status = pr.url
 			? pr.url
+			: q.verification === "unverified"
+				? "unverified — run checks before raising"
 			: q.raiseError
 				? `raise failed — use raise_pr to retry`
 				: "draft, not raised — use raise_pr";
@@ -828,7 +858,7 @@ export function registerQuestTool(pi: ExtensionAPI): void {
 				if (project) {
 					for (const r of project.repos) if (!targets.some((t) => t.name === r.name)) contexts.push({ name: r.name, path: r.path, writable: false });
 				}
-				void runQuestInBackground(record, { write: true, inPlace, contexts, config, globalInstructions: config.globalInstructions, instructions, partyHint: recipe.party, fastWrite: useFastWrite(recipe, targets.length, brief) });
+				void runQuestInBackground(record, { write: true, inPlace, contexts, config, globalInstructions: config.globalInstructions, instructions, partyHint: recipe.party, fastWrite: useFastWrite(recipe, targets.length, brief), legacyWrite: recipe.id === "write-legacy" });
 				return started(record, project?.id, targets.map((t) => t.name).join("+"), true, inPlace);
 			}
 

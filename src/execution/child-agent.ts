@@ -51,6 +51,7 @@ export interface ChildAgentResult {
 	finalText: string;
 	toolCalls: ChildToolCall[];
 	lastShellResult?: { exitCode?: number; command?: string; id: string };
+	shellResults?: { exitCode?: number; command?: string; id: string }[];
 	usage: ChildUsage;
 	stopReason?: string;
 	error?: string;
@@ -95,8 +96,9 @@ export function collectUsage(messages: AgentMessage[]): ChildUsage {
 	return usage;
 }
 
-function lastShellResult(messages: AgentMessage[]): ChildAgentResult["lastShellResult"] {
-	for (let i = messages.length - 1; i >= 0; i--) {
+function collectShellResults(messages: AgentMessage[]): NonNullable<ChildAgentResult["shellResults"]> {
+	const results: NonNullable<ChildAgentResult["shellResults"]> = [];
+	for (let i = 0; i < messages.length; i++) {
 		const msg = messages[i];
 		if (msg.role !== "toolResult" || msg.toolName !== "shell") continue;
 		const details = msg.details as { exitCode?: number } | undefined;
@@ -107,9 +109,9 @@ function lastShellResult(messages: AgentMessage[]): ChildAgentResult["lastShellR
 				if (part.type === "toolCall" && part.id === msg.toolCallId) command = String((part.arguments as { command?: string }).command ?? "");
 			}
 		}
-		return { exitCode: details?.exitCode, command, id: msg.toolCallId };
+		results.push({ exitCode: details?.exitCode, command, id: msg.toolCallId });
 	}
-	return undefined;
+	return results;
 }
 
 function collectToolCalls(messages: AgentMessage[]): ChildToolCall[] {
@@ -277,20 +279,25 @@ export async function runChildAgent(options: RunChildOptions): Promise<ChildAgen
 	const { guildmate, task, modelSpec, cwd, signal, onUpdate } = options;
 	const base = { guildmate: guildmate.name, tier: guildmate.tier, model: modelSpec, task };
 
-	const shape = (r: RunSessionResult): ChildAgentResult => ({
-		...base,
-		model: r.modelSpec ?? modelSpec,
-		finalText: lastAssistantText(r.messages),
-		toolCalls: collectToolCalls(r.messages),
-		lastShellResult: lastShellResult(r.messages),
-		usage: collectUsage(r.messages),
-		stopReason: r.stopReason,
-		error: r.error,
-	});
+	const shape = (r: RunSessionResult): ChildAgentResult => {
+		const shellResults = collectShellResults(r.messages);
+		return {
+			...base,
+			model: r.modelSpec ?? modelSpec,
+			finalText: lastAssistantText(r.messages),
+			toolCalls: collectToolCalls(r.messages),
+			lastShellResult: shellResults.at(-1),
+			shellResults,
+			usage: collectUsage(r.messages),
+			stopReason: r.stopReason,
+			error: r.error,
+		};
+	};
 
 	// Prepend the standing doctrine ahead of the persona so it applies to every member,
 	// regardless of persona wording or how narrowly the task was briefed.
-	const systemPrompt = `${INVESTIGATIVE_DOCTRINE}\n\n${guildmate.systemPrompt}`;
+	const builderDoctrine = "Verify the brief against the relevant source files before editing. Check the entire final diff against every requirement; report anything you did not verify. Do not map unrelated parts of the repository.";
+	const systemPrompt = `${guildmate.tier === "builder" ? builderDoctrine : INVESTIGATIVE_DOCTRINE}\n\n${guildmate.systemPrompt}`;
 
 	const result = await runSession({
 		cwd,

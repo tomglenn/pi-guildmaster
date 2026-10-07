@@ -5,6 +5,21 @@ import type { Guildmate } from "../roster.ts";
 import type { QuestMember } from "../persistence/quest-store.ts";
 import type { RepoContext } from "../persistence/project-store.ts";
 import type { PartyResult } from "./party-leader.ts";
+import { checkResults } from "./verification.ts";
+
+export function createBuilderGuildmate(): Guildmate {
+	return {
+		name: "builder", tier: "builder", description: "Implement, test, and iterate in one session",
+		model: "capable", filePath: "(built-in)",
+		systemPrompt: [
+			"Implement the brief in the isolated worktree. You can edit files and run bounded shell commands.",
+			"In this one session: inspect relevant code, edit, run targeted tests, fix failures, and check the final diff against every requirement.",
+			"Use the shell for bounded build, test, and git inspection. Do not push or open a PR. Do not create planning files in the repo.",
+			"If you cannot fix a failure, begin your final answer with FAILED: and explain why. Report observed test exit codes, not guesses.",
+			"End with a PR-ready report: '# <short title>', then Summary, Changes, Testing, and Risks / Unresolved.",
+		].join("\n"),
+	};
+}
 
 /** One background edit/test loop. The worker keeps its session throughout all fixes. */
 export async function runFastWrite(opts: {
@@ -26,17 +41,7 @@ export async function runFastWrite(opts: {
 	const member: QuestMember = { name: "builder", task: opts.brief, repo: context.name, status: "running", startedAt: Date.now() };
 	const progress = () => opts.onProgress?.([{ ...member }]);
 	progress();
-	const guildmate: Guildmate = {
-		name: "builder", tier: "builder", description: "Implement, test, and iterate in one session",
-		model: "capable", filePath: "(built-in)",
-		systemPrompt: [
-			"You implement the user's brief in this isolated git worktree. You can edit files and run bounded shell commands.",
-			"Work in ONE session: inspect relevant code, make the smallest correct change, run targeted tests, fix failures, and check the final diff against EVERY requirement.",
-			"Use the shell for bounded build/test/git inspection only; do not push or open a PR. Never write planning or scratch files into the repo.",
-			"If blocked or tests fail and you cannot fix them, begin your final answer with FAILED: and explain why. Do not claim a test passed unless you observed its exit code.",
-			"End with a PR-ready report: first line '# <short title>', then Summary, Changes (file references), Testing (commands and observed results), and Risks / Unresolved.",
-		].join("\n"),
-	};
+	const guildmate = createBuilderGuildmate();
 	const task = [opts.brief, opts.globalInstructions && `Guild-wide instructions:\n${opts.globalInstructions}`, opts.instructions && `Project instructions:\n${opts.instructions}`].filter(Boolean).join("\n\n");
 	let seenTools = 0;
 	let seenShellResult: string | undefined;
@@ -56,7 +61,8 @@ export async function runFastWrite(opts: {
 				const shell = partial.lastShellResult;
 				if (shell && shell.id !== seenShellResult) {
 					seenShellResult = shell.id;
-					if (/\b(test|vitest|jest|pytest|go test|cargo test|typecheck|lint|build)\b/i.test(shell.command ?? "")) {
+					member.checks = checkResults(partial.shellResults ?? [shell]);
+					if (member.checks.some((c) => c.command === shell.command)) {
 						member.lastTest = `${shell.exitCode === 0 ? "pass" : `exit ${shell.exitCode ?? "?"}`}: ${(shell.command ?? "test").slice(0, 100)}`;
 						progress();
 					}
@@ -71,6 +77,7 @@ export async function runFastWrite(opts: {
 			if (partial.finalText) opts.onLeaderText?.(partial.finalText);
 			},
 		});
+		if (result.shellResults) member.checks = checkResults(result.shellResults);
 		member.status = result.error || result.stopReason === "error" || result.stopReason === "aborted" ? "failed" : "done";
 		member.finishedAt = Date.now();
 		member.summary = result.finalText.slice(0, 400);
