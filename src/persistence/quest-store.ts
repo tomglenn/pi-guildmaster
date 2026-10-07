@@ -39,6 +39,8 @@ export interface QuestMember {
 	finishedAt?: number;
 	step?: string;
 	lastTool?: string;
+	lastTest?: string;
+	budgetExceededAt?: number;
 	/** Which project repo this member worked in (multi-repo projects). */
 	repo?: string;
 }

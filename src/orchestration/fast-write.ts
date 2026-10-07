@@ -18,6 +18,8 @@ export async function runFastWrite(opts: {
 	onActivity?: () => void;
 	onLeaderText?: (text: string) => void;
 	onLeaderMessage?: (text: string) => void;
+	/** Test seam: exercise the worker lifecycle without calling a model. */
+	runWorker?: typeof runChildAgent;
 }): Promise<PartyResult> {
 	const { context } = opts;
 	if (!context.writable) throw new Error("Builder requires a writable isolated repository.");
@@ -26,7 +28,7 @@ export async function runFastWrite(opts: {
 	progress();
 	const guildmate: Guildmate = {
 		name: "builder", tier: "builder", description: "Implement, test, and iterate in one session",
-		model: "reasoning", filePath: "(built-in)",
+		model: "capable", filePath: "(built-in)",
 		systemPrompt: [
 			"You implement the user's brief in this isolated git worktree. You can edit files and run bounded shell commands.",
 			"Work in ONE session: inspect relevant code, make the smallest correct change, run targeted tests, fix failures, and check the final diff against EVERY requirement.",
@@ -37,14 +39,29 @@ export async function runFastWrite(opts: {
 	};
 	const task = [opts.brief, opts.globalInstructions && `Guild-wide instructions:\n${opts.globalInstructions}`, opts.instructions && `Project instructions:\n${opts.instructions}`].filter(Boolean).join("\n\n");
 	let seenTools = 0;
+	let seenShellResult: string | undefined;
+	// A soft budget only raises visibility; it never cancels legitimate long tests.
+	const budget = setTimeout(() => {
+		member.budgetExceededAt = Date.now();
+		progress();
+	}, 5 * 60_000);
+	budget.unref?.();
 	try {
-		const result = await runChildAgent({
-			guildmate, task, modelSpec: resolveModelSpec(opts.config, "reasoning"), cwd: context.path,
+		const result = await (opts.runWorker ?? runChildAgent)({
+			guildmate, task, modelSpec: resolveModelSpec(opts.config, "capable"), cwd: context.path,
 			signal: opts.signal,
+			onActivity: opts.onActivity,
 			customTools: [createRunnerShellTool({ cwd: context.path, ...opts.config.shell })], extraTools: ["shell"],
 			onUpdate: (partial) => {
-				opts.onActivity?.();
-			const last = partial.toolCalls.at(-1);
+				const shell = partial.lastShellResult;
+				if (shell && shell.id !== seenShellResult) {
+					seenShellResult = shell.id;
+					if (/\b(test|vitest|jest|pytest|go test|cargo test|typecheck|lint|build)\b/i.test(shell.command ?? "")) {
+						member.lastTest = `${shell.exitCode === 0 ? "pass" : `exit ${shell.exitCode ?? "?"}`}: ${(shell.command ?? "test").slice(0, 100)}`;
+						progress();
+					}
+				}
+				const last = partial.toolCalls.at(-1);
 			if (last && partial.toolCalls.length > seenTools) {
 				seenTools = partial.toolCalls.length;
 				member.lastTool = last.name;
@@ -67,5 +84,7 @@ export async function runFastWrite(opts: {
 		member.finishedAt = Date.now();
 		progress();
 		throw err;
+	} finally {
+		clearTimeout(budget);
 	}
 }

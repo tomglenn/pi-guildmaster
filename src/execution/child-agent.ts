@@ -50,6 +50,7 @@ export interface ChildAgentResult {
 	task: string;
 	finalText: string;
 	toolCalls: ChildToolCall[];
+	lastShellResult?: { exitCode?: number; command?: string; id: string };
 	usage: ChildUsage;
 	stopReason?: string;
 	error?: string;
@@ -92,6 +93,23 @@ export function collectUsage(messages: AgentMessage[]): ChildUsage {
 		usage.contextTokens = u.totalTokens ?? usage.contextTokens;
 	}
 	return usage;
+}
+
+function lastShellResult(messages: AgentMessage[]): ChildAgentResult["lastShellResult"] {
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const msg = messages[i];
+		if (msg.role !== "toolResult" || msg.toolName !== "shell") continue;
+		const details = msg.details as { exitCode?: number } | undefined;
+		let command: string | undefined;
+		for (let j = i - 1; j >= 0 && !command; j--) {
+			const prior = messages[j];
+			if (prior.role === "assistant") for (const part of prior.content) {
+				if (part.type === "toolCall" && part.id === msg.toolCallId) command = String((part.arguments as { command?: string }).command ?? "");
+			}
+		}
+		return { exitCode: details?.exitCode, command, id: msg.toolCallId };
+	}
+	return undefined;
 }
 
 function collectToolCalls(messages: AgentMessage[]): ChildToolCall[] {
@@ -232,6 +250,7 @@ export interface RunChildOptions {
 	cwd: string;
 	signal?: AbortSignal;
 	onUpdate?: (partial: ChildAgentResult) => void;
+	onActivity?: () => void;
 	/** Extra custom tools (e.g. the envoy's gated shell). */
 	customTools?: ToolDefinition[];
 	/** Extra tool NAMES to allow alongside the tier's built-ins (the custom tools' names). */
@@ -263,6 +282,7 @@ export async function runChildAgent(options: RunChildOptions): Promise<ChildAgen
 		model: r.modelSpec ?? modelSpec,
 		finalText: lastAssistantText(r.messages),
 		toolCalls: collectToolCalls(r.messages),
+		lastShellResult: lastShellResult(r.messages),
 		usage: collectUsage(r.messages),
 		stopReason: r.stopReason,
 		error: r.error,
@@ -281,6 +301,7 @@ export async function runChildAgent(options: RunChildOptions): Promise<ChildAgen
 		promptText: `Task: ${task}`,
 		signal,
 		onEvent: onUpdate ? (messages) => onUpdate(shape({ messages, modelSpec })) : undefined,
+		onActivity: options.onActivity ? () => options.onActivity?.() : undefined,
 	});
 
 	return shape(result);

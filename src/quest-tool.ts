@@ -385,6 +385,10 @@ async function runQuestInBackground(
 function describeQuest(q: QuestRecord): string {
 	const lines = [`Quest "${q.title}" (${q.id}) — ${q.state}${q.project ? ` [${q.project}]` : ""}`];
 	if (q.members.length) lines.push(`Party: ${q.members.map((m) => `${m.name}@${m.repo ?? "?"}:${m.status}`).join(", ")}`);
+	for (const m of q.members.filter((m) => m.status === "running")) {
+		const mins = Math.max(0, Math.floor((Date.now() - (m.startedAt ?? q.createdAt)) / 60_000));
+		lines.push(`Current: ${m.name} (${mins}m) — ${m.step ?? m.task.split("\n")[0]}${m.lastTest ? `; test ${m.lastTest}` : ""}${m.budgetExceededAt ? "; past 5m soft budget" : ""}`);
+	}
 	if (q.isolations?.length)
 		lines.push(
 			`Branches: ${q.isolations.map((i) => `${i.repo}→${i.branch}${i.baseLabel ? ` (base ${i.baseLabel})` : ""}`).join(", ")}`,

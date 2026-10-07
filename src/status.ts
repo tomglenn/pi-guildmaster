@@ -40,6 +40,14 @@ const MEMBER_GLYPH: Record<QuestMemberStatus, string> = { pending: "○", runnin
 /** Per-status colour for a party member's glyph + name. */
 const MEMBER_COLOR: Record<QuestMemberStatus, ThemeColor> = { pending: "muted", running: "accent", done: "success", failed: "error" };
 
+export function activeProgress(record: QuestRecord, now = Date.now()): string | undefined {
+	const current = record.members.find((m) => m.status === "running");
+	if (!current) return undefined;
+	const elapsed = Math.max(0, Math.floor((now - (current.startedAt ?? record.createdAt)) / 60_000));
+	const step = current.step ?? current.task.split("\n")[0];
+	return `${current.name} · ${elapsed}m · ${step.slice(0, 100)}${current.lastTest ? ` · test ${current.lastTest}` : ""}${current.budgetExceededAt ? " · over 5m soft budget" : ""}`;
+}
+
 /**
  * Calculate the visible display width of a string, stripping ANSI escape codes.
  * Approximate for CJK/emoji; accurate for typical ASCII member names.
@@ -160,6 +168,8 @@ export class StatusSurface {
 	private initialized = false;
 	private repaintScheduled = false;
 	private repaintTimer: ReturnType<typeof setTimeout> | undefined;
+	private elapsedTimer: ReturnType<typeof setInterval> | undefined;
+	private notifiedBudgets = new Set<string>();
 
 	/** Wire subscriptions once. The quest card renderer is registered here too. */
 	init(pi: ExtensionAPI): void {
@@ -180,6 +190,9 @@ export class StatusSurface {
 	/** Capture the current session's UI. Call on session_start (and reload). */
 	attach(ctx: ExtensionContext): void {
 		this.ctx = ctx;
+		if (this.elapsedTimer) clearInterval(this.elapsedTimer);
+		this.elapsedTimer = setInterval(() => this.scheduleRepaint(), 60_000);
+		this.elapsedTimer.unref?.();
 		this.repaint();
 	}
 
@@ -197,6 +210,8 @@ export class StatusSurface {
 			this.repaintTimer = undefined;
 		}
 		this.repaintScheduled = false;
+		if (this.elapsedTimer) clearInterval(this.elapsedTimer);
+		this.elapsedTimer = undefined;
 		this.ctx = undefined;
 	}
 
@@ -216,6 +231,10 @@ export class StatusSurface {
 	}
 
 	private onQuestChange(record: QuestRecord): void {
+		if (record.members.some((m) => m.budgetExceededAt) && !this.notifiedBudgets.has(record.id)) {
+			this.notifiedBudgets.add(record.id);
+			this.notify(`Quest "${record.title}" is past its 5-minute soft budget. Work continues; check the board for the current step.`, "warning");
+		}
 		const prev = this.questStates.get(record.id);
 		if (prev !== record.state) {
 			this.questStates.set(record.id, record.state);
@@ -354,6 +373,8 @@ export class StatusSurface {
 				}
 				
 				box.addChild(new Text(`  ${fg(partyColor(q), "●")} ${label}${fg("toolTitle", q.title)}  ${chips}${end}`, 0, 0));
+				const progress = activeProgress(q);
+				if (progress) box.addChild(new Text(`      ${fg("muted", progress)}`, 0, 0));
 				if (snapshot.lineage[q.id]) box.addChild(new Text(`      ${fg("muted", `↳ from ${snapshot.lineage[q.id]}`)}`, 0, 0));
 			}
 			for (const a of snapshot.pending) {

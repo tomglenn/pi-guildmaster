@@ -383,7 +383,7 @@ export async function runParty(opts: {
 			}
 			const modelSpec = resolveModelSpec(opts.config, mate.model);
 			const index =
-				members.push({ name: mate.name, task: params.task, model: modelSpec, status: "running", repo: context.name }) - 1;
+				members.push({ name: mate.name, task: params.task, model: modelSpec, status: "running", repo: context.name, startedAt: Date.now(), step: params.task.slice(0, 100) }) - 1;
 			opts.onProgress?.(members.slice());
 
 			// A member whose dispatch throws must never stay "running": that would mask a stall
@@ -437,6 +437,7 @@ export async function runParty(opts: {
 				memberCost += res.usage.cost;
 				const failed = Boolean(res.error) || res.stopReason === "error" || res.stopReason === "aborted";
 				members[index].status = failed ? "failed" : "done";
+				members[index].finishedAt = Date.now();
 				members[index].summary = res.finalText.slice(0, 400);
 				opts.onProgress?.(members.slice());
 
@@ -450,6 +451,7 @@ export async function runParty(opts: {
 			} catch (err) {
 				if (members[index].status === "running") {
 					members[index].status = "failed";
+					members[index].finishedAt = Date.now();
 					members[index].summary = `Dispatch failed: ${err instanceof Error ? err.message : String(err)}`.slice(0, 400);
 					opts.onProgress?.(members.slice());
 				}

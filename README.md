@@ -21,9 +21,7 @@ Guildmaster adds a few concepts on top of Pi:
   simply has no write or shell tools).
 - **Consult** — one bounded, read-only investigation delegated to a single
   Guildmate. Runs inline and returns a concise, evidence-backed result.
-- **Quest** — substantial work run in the **background** by a **Party Leader** that
-  composes a party of Guildmates. Returns immediately; you keep working. Its
-  transcript never enters your context — only the final report does.
+- **Quest** — work that runs in the **background**. A bounded, one-repo write Quest uses one worker to edit and test in one session. Complex work uses a Party Leader and specialists. Both return immediately, so you can start other work. Member transcripts do not enter Guildmaster's context.
 - **Approvals** — anything that touches the outside world (pushing a branch,
   posting a PR review) is **parked for your approval**, never auto-done, and never
   blocks unrelated work.
@@ -77,10 +75,9 @@ Natural language is the primary interface. Just tell the Guildmaster what you wa
 
 > "Review PR 1905 on the pathfinder app." → a **review party** (see below).
 
-Work is tracked on the always-on **Guild board** above/below your input: active
-parties with live per-member status, pending approvals, and finished Quests that
-persist until you turn them in — colour-coded so nothing is missed while you
-multitask.
+The Guild board shows the current member, action, elapsed time, and last test result. It also shows pending approvals and finished Quests. A worker still active after five minutes triggers one warning. This is a soft budget: the Quest continues. Completed Quests stay on the board until you turn them in.
+
+For sensitive work, including authentication, permissions, secrets, migrations, or dependency changes, the write Quest uses the full party. Multi-repo writes also use the full party. Use the `write-party` recipe to request a full party for other write tasks.
 
 ### Reviewing a pull request
 
@@ -88,8 +85,7 @@ A review is a party, not a single agent:
 
 1. The **envoy** (the only agent that talks to GitHub, through a policy-gated
    shell) fetches the PR.
-2. Specialists review in parallel — correctness (**scout**/**delver**), security
-   (**warden**), adversarial (**inquisitor**).
+2. Specialists review the full diff. **Scout** or **Delver** checks correctness. **Inquisitor** challenges the findings. **Warden** reviews changes to security-sensitive code.
 3. **Scribe** writes the human-facing review.
 4. The Quest **pauses for your approval**: `/approve` to have the envoy post it,
    or leave it as a draft.
