@@ -406,15 +406,15 @@ export function registerApprovals(pi: ExtensionAPI): void {
 		name: "raise_pr",
 		label: "Raise PR",
 		description: [
-			"Raise the draft PR for a completed write-Quest: pushes the branch and opens a DRAFT pull request.",
-			"PRs are auto-raised on Quest completion; use this tool to retry when auto-raise failed (network/auth) or",
-			"was blocked (security-fix detection). Opening a draft needs no approval (a draft is for the human to review",
+			"Retry opening the draft PR for a completed write-Quest: pushes the branch and opens a DRAFT pull request.",
+			"Quests open their draft PR automatically when done; use this only when that failed (push/auth error) or the",
+			"publish scan refused it and the user has since removed the flagged content. Opening a draft needs no approval (a draft is for the human to review",
 			"and decide whether to mark ready); it never merges, and if a PR already exists for the branch it is adopted",
 			"rather than duplicated. If no questId is given, the most recent completed write-Quest with an un-raised draft is used.",
 		].join(" "),
 		promptSnippet: "Raise (push + open draft PR) the branch a write-Quest produced; no approval needed for a draft",
 		promptGuidelines: [
-			"Use raise_pr after a write Quest has produced a draft PR and the user wants it raised. Opening a draft PR needs no approval and only ever opens a DRAFT; it never merges. (Updating an existing PR via the address-feedback flow still asks for approval.)",
+			"Use raise_pr only to retry a write Quest's draft PR that failed to open (push/auth error, or the publish scan refused it and the content was removed). Opening a draft PR needs no approval and only ever opens a DRAFT; it never merges. (Updating an existing PR via the address-feedback flow still asks for approval.)",
 		],
 		parameters: Type.Object({
 			questId: Type.Optional(Type.String({ description: "Quest id (defaults to most recent un-raised write-Quest)" })),
@@ -455,9 +455,7 @@ export function registerApprovals(pi: ExtensionAPI): void {
 				details: {},
 			});
 
-			const result = await raisePr(record, {
-				confirmSecurity: (message) => ctx.ui.confirm("Possible security fix", message),
-			});
+			const result = await raisePr(record, {});
 			const failures = result.results.filter((r) => !r.raised);
 			record.raiseError = failures.length ? failures.map((f) => `${f.repo}: ${f.reason}`).join("; ") : undefined;
 			manager.store.save(record);

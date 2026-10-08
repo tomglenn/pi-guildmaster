@@ -5,7 +5,10 @@ import type { Guildmate } from "../roster.ts";
 import type { QuestMember } from "../persistence/quest-store.ts";
 import type { RepoContext } from "../persistence/project-store.ts";
 import type { PartyResult } from "./party-leader.ts";
-import { checkResults } from "./verification.ts";
+import { CHECKS_LINE_HELP } from "./checks-line.ts";
+
+/** Display only (the board's live "test" chip); never used to judge the work. */
+const LOOKS_LIKE_CHECK = /\b(test|vitest|jest|pytest|typecheck|lint|tsc|build)\b/i;
 
 export function createBuilderGuildmate(): Guildmate {
 	return {
@@ -13,11 +16,14 @@ export function createBuilderGuildmate(): Guildmate {
 		model: "capable", filePath: "(built-in)",
 		systemPrompt: [
 			"Implement the brief in the isolated worktree. You can edit files and run bounded shell commands.",
-			"In this one session: inspect relevant code, edit, run targeted tests, fix failures, and check the final diff against every requirement.",
+			"In this one session: inspect relevant code, edit, run the checks, fix failures, and check the final diff against every requirement.",
+			"You own the result: nobody re-checks your work. Keep fixing and re-running until every check passes. You are not done while a check fails.",
 			"Use the shell for bounded build, test, and git inspection. Do not push or open a PR. Do not create planning files in the repo.",
-			"Run each check as ONE plain command (e.g. `npm test`, `npx tsc --noEmit`). Do not chain it with `;`, `|`, `|| true` or `echo $?`: the harness records the exit code itself and does not count chained checks.",
-			"If you cannot fix a failure, begin your final answer with FAILED: and explain why. Report observed test exit codes, not guesses.",
+			"Run each check as ONE plain command (e.g. `npm test`, `npx tsc --noEmit`) so its real exit code is visible. Report observed exit codes, not guesses.",
+			"If a check can only pass by breaking an explicit requirement of the brief, do not break it: begin your final answer with FAILED: and name the conflict.",
+			"Your report becomes a public draft PR body: keep secrets, credentials, internal comms (Slack quotes or links) and private or customer information out of it and out of the diff.",
 			"End with a PR-ready report: '# <short title>', then Summary, Changes, Testing, and Risks / Unresolved.",
+			CHECKS_LINE_HELP,
 		].join("\n"),
 	};
 }
@@ -62,8 +68,7 @@ export async function runFastWrite(opts: {
 				const shell = partial.lastShellResult;
 				if (shell && shell.id !== seenShellResult) {
 					seenShellResult = shell.id;
-					member.checks = checkResults(partial.shellResults ?? [shell]);
-					if (member.checks.some((c) => c.command === shell.command)) {
+					if (shell.command && LOOKS_LIKE_CHECK.test(shell.command)) {
 						member.lastTest = `${shell.exitCode === 0 ? "pass" : `exit ${shell.exitCode ?? "?"}`}: ${(shell.command ?? "test").slice(0, 100)}`;
 						progress();
 					}
@@ -78,7 +83,6 @@ export async function runFastWrite(opts: {
 			if (partial.finalText) opts.onLeaderText?.(partial.finalText);
 			},
 		});
-		if (result.shellResults) member.checks = checkResults(result.shellResults);
 		member.status = result.error || result.stopReason === "error" || result.stopReason === "aborted" ? "failed" : "done";
 		member.finishedAt = Date.now();
 		member.summary = result.finalText.slice(0, 400);

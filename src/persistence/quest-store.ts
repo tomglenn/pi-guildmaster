@@ -40,7 +40,6 @@ export interface QuestMember {
 	step?: string;
 	lastTool?: string;
 	lastTest?: string;
-	checks?: { command: string; exitCode?: number; masked?: true }[];
 	budgetExceededAt?: number;
 	/** Which project repo this member worked in (multi-repo projects). */
 	repo?: string;
@@ -100,7 +99,8 @@ export interface QuestRecord {
 	/** How the party's run ended (e.g. "endTurn", "aborted", "error"). Forensics for post-mortems. */
 	stopReason?: string;
 	usage?: { cost: number; turns: number };
-	verification?: "verified" | "unverified" | "failed";
+	/** What the party itself said about its checks (its CHECKS line). Guildmaster does not verify. */
+	checks?: "pass" | "fail" | "none";
 	/** Write-Quest fields: one isolation + one drafted PR per writable repo (§ Projects P3). */
 	isolations?: QuestIsolation[];
 	prs?: QuestPr[];

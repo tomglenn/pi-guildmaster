@@ -5,10 +5,10 @@
  * branch + draft PR — no approval either way. A draft exists for the human to review
  * and decide whether to mark it ready; and once a PR is up, addressing review
  * feedback is the delegated work, so the address-feedback update pushes without a
- * gate too. `gh pr merge` is ALWAYS refused (Guildmaster never merges). A likely
- * security fix is not auto-published (confirmed manually; refused outright for
- * grafana/grafana first-party per org policy). Before creating, an existing PR for
- * the branch is adopted rather than duplicated.
+ * gate too. `gh pr merge` is ALWAYS refused (Guildmaster never merges). Before
+ * pushing, the added diff lines and PR text are scanned for credentials and internal
+ * chat links (publish-scan.ts); a hit refuses the push. Before creating, an existing
+ * PR for the branch is adopted rather than duplicated.
  *
  * git/gh are injected so this is testable without touching the network.
  */
@@ -16,7 +16,8 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { QuestIsolation, QuestRecord } from "../persistence/quest-store.ts";
-import { classifyCommand, isGrafanaFirstParty, isLikelySecurityFix, repoSlugFromRemote } from "../execution/policy.ts";
+import { classifyCommand } from "../execution/policy.ts";
+import { describeHits, scanDiff, scanPrText } from "./publish-scan.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -28,8 +29,6 @@ export type CommandRunner = (args: string[], cwd: string) => Promise<string>;
 export interface PrDeps {
 	runGit?: CommandRunner;
 	runGh?: CommandRunner;
-	/** Confirm proceeding when the change looks like a security fix. Default: refuse. */
-	confirmSecurity?: (message: string) => Promise<boolean>;
 }
 
 export interface RaisedRepo {
@@ -152,8 +151,7 @@ export function explainUnraisable(record: QuestRecord, ahead: (iso: QuestIsolati
 /**
  * Raise every un-raised repo PR for a (possibly cross-repo) write-Quest. Each repo
  * is pushed independently and gated by its OWN approval, so approving/denying one
- * never blocks the others. `gh pr merge` is refused; a likely security fix is
- * confirmed (and refused outright for grafana/grafana first-party).
+ * never blocks the others. `gh pr merge` is refused; sensitive content is never pushed.
  */
 export async function raisePr(record: QuestRecord, deps: PrDeps): Promise<RaiseResult> {
 	const prs = (record.prs ?? []).filter((p) => !p.url);
@@ -190,28 +188,23 @@ export async function raisePr(record: QuestRecord, deps: PrDeps): Promise<RaiseR
 			continue;
 		}
 
-		// Security-fix policy (per repo, since remotes may differ).
-		if (isLikelySecurityFix(`${pr.title}\n${pr.body}`)) {
-			let slug: string | undefined;
-			try {
-				slug = repoSlugFromRemote(await runGit(["remote", "get-url", "origin"], worktreePath));
-			} catch {
-				/* no remote */
-			}
-			if (isGrafanaFirstParty(slug)) {
-				results.push({
-					repo: pr.repo,
-					raised: false,
-					refused: true,
-					reason: "Looks like a first-party security fix for grafana/grafana — not auto-raised (org policy).",
-				});
-				continue;
-			}
-			const ok = deps.confirmSecurity ? await deps.confirmSecurity(`Change to ${pr.repo} looks like a security fix. Raise a PR anyway?`) : false;
-			if (!ok) {
-				results.push({ repo: pr.repo, raised: false, refused: true, reason: deps.confirmSecurity ? "Security-fix PR not confirmed." : "Looks like a security fix, so it was not raised automatically. Review the branch, then use raise_pr to confirm and raise it." });
-				continue;
-			}
+		// Last safety net before anything goes public: never publish credentials or internal chat links.
+		// Only the ADDED diff lines and the PR text are scanned; a hit names the kind and place, never the value.
+		let hits;
+		try {
+			hits = [...scanDiff(await runGit(["diff", iso.baseRef, "HEAD", "--"], worktreePath)), ...scanPrText(pr.title, pr.body)];
+		} catch (e) {
+			results.push({ repo: pr.repo, raised: false, refused: true, reason: `Could not read the diff to check it for secrets before publishing (${errText(e).slice(0, 200)}). Nothing was pushed.` });
+			continue;
+		}
+		if (hits.length) {
+			results.push({
+				repo: pr.repo,
+				raised: false,
+				refused: true,
+				reason: `Not published: the change or PR text looks like it contains sensitive content (${describeHits(hits)}). Nothing was pushed. Remove it from branch \`${pr.branch}\`, then ask me to open the PR.`,
+			});
+			continue;
 		}
 
 		if (sourcePr) {

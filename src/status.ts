@@ -413,7 +413,7 @@ export class StatusSurface {
 				if (q.prs && q.prs.length > 0) {
 					const raisedCount = q.prs.filter((p) => p.url).length;
 					if (raisedCount === 0) {
-						hint = q.verification === "unverified" ? "unverified → run checks before raise_pr" : "draft PR ready → raise_pr";
+						hint = "draft PR not opened — see report";
 					} else if (raisedCount < q.prs.length) {
 						hint = `${raisedCount}/${q.prs.length} raised → raise_pr for rest`;
 					} else {

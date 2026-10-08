@@ -31,9 +31,7 @@ import { extractPostableReview } from "./orchestration/review-post.ts";
 import { runParty } from "./orchestration/party-leader.ts";
 import { runFastWrite } from "./orchestration/fast-write.ts";
 import { useFastWrite } from "./orchestration/write-routing.ts";
-import { evaluateVerification, unverifiedReason } from "./orchestration/verification.ts";
-import { reviewSensitiveDiff } from "./orchestration/write-review.ts";
-import { runReviewLoop } from "./orchestration/review-loop.ts";
+import { parseChecksLine } from "./orchestration/checks-line.ts";
 import { loadRecipeRegistry } from "./orchestration/recipe-loader.ts";
 import { executionShape, preflightRecipe, resolveRecipe } from "./orchestration/recipes.ts";
 import { pickRepoBySlug, readonlyContexts, resolveProjectQuery } from "./orchestration/resolve.ts";
@@ -48,7 +46,7 @@ function started(record: QuestRecord, projectId?: string, targetRepo?: string, w
 	const tail = write
 		? inPlace
 			? `It is working IN-PLACE in your real checkout${branch ? ` on branch ${branch}` : ""} — changes are committed there for you to review directly. No worktree, no PR.`
-			: "When verified, it will automatically open a draft PR (unless a security gate blocks it). Without observed passing checks, the branch stays local."
+			: "When the party is done, it opens a draft PR and the report includes the link."
 		: "Ask me to show the results when it's done, or check /quests.";
 	return {
 		content: [
@@ -76,6 +74,15 @@ function briefWithUpstream(brief: string, parent: QuestRecord): string {
 	}
 	parts.push("---", "## Your task", brief);
 	return parts.join("\n\n");
+}
+
+/** The PR links (or why a PR was not opened), appended to a write-Quest's final report. */
+function prSection(record: QuestRecord): string {
+	const prs = record.prs ?? [];
+	if (!prs.length) return "";
+	const lines = prs.map((p) => (p.url ? `- ${p.repo}: ${p.url}` : `- ${p.repo}: not opened \u2014 branch \`${p.branch}\` kept`));
+	const why = record.raiseError && prs.some((p) => !p.url) ? `\n\n${record.raiseError}` : "";
+	return `\n\n---\n**Draft PR${prs.length > 1 ? "s" : ""}**\n${lines.join("\n")}${why}`;
 }
 
 function draftPrFromReport(report: string): { title: string; body: string } {
@@ -226,94 +233,25 @@ async function runQuestInBackground(
 			if (!party.report?.trim()) {
 				throw new Error(party.error || "Party produced no report before finalizing.");
 			}
-			if (opts.write) {
-				const verification = evaluateVerification(party.members, record.isolations?.map((iso) => iso.repo));
-				record.verification = verification.state;
-				if (verification.state === "unverified") record.raiseError = unverifiedReason(verification.masked);
-				api.save();
-				if (verification.state === "failed") {
-					throw new Error(`Verification failed or returned no exit code: ${verification.checks.filter((c) => c.exitCode !== 0).map((c) => `${c.command} (exit ${c.exitCode ?? "?"})`).join(", ")}. Worktree preserved for repair.`);
+			// The party owns its result: it ran the checks, attacked its own diff and iterated. Guildmaster
+			// only reads what it stated (the CHECKS line) — it never re-judges the work.
+			const checks = opts.write ? parseChecksLine(party.report) : undefined;
+			if (checks) {
+				record.checks = checks.status;
+				party.report = checks.body;
+				if (checks.status === "fail") {
+					api.save();
+					throw new Error(`The party reports failing checks: ${checks.detail || "no detail given"}. Branch kept for repair; no PR opened.`);
 				}
-			}
-
-			// Independently inspect risk from the ACTUAL diff, not just the brief. This gate is
-			// enforced by the harness even when the leader elects not to dispatch a reviewer.
-			// A BLOCK is a finding to iterate on (Builder fix round → checks → re-review); the
-			// user decides only when iterating cannot settle it (see review-loop.ts).
-			if (opts.write) for (const iso of record.isolations ?? []) {
-				const approvals = getApprovalManager();
-				const ask = async (input: Parameters<ApprovalManager["ask"]>[0]) => {
-					manager.transition(record, "awaiting-input");
-					try {
-						return await approvals.ask({ ...input, questId: record.id, signal: api.signal });
-					} finally {
-						if (!api.signal.aborted) manager.transition(record, "running");
-					}
-				};
-				const context = { name: iso.repo, path: iso.worktreePath, writable: true };
-				let loopMembers: typeof party.members = [];
-				const show = (current: typeof party.members) => api.setMembers([...party.members, ...loopMembers, ...current]);
-				const loop = await runReviewLoop({
-					repo: iso.repo,
-					brief: record.brief,
-					onMembers: (members) => {
-						loopMembers = members;
-						show([]);
-					},
-					review: () => reviewSensitiveDiff({
-						isolation: iso, brief: record.brief, roster, config: opts.config, signal: api.signal,
-						checks: evaluateVerification([...party.members, ...loopMembers].filter((m) => m.repo === iso.repo || !m.repo), [iso.repo]).checks,
-						onProgress: (member) => show([member]),
-					}),
-					fix: async (prompt) => {
-						fence("Quest aborted during review fix round.");
-						const fixed = await runFastWrite({
-							brief: prompt, context, config: opts.config, signal: api.signal,
-							instructions: opts.instructions, globalInstructions: opts.globalInstructions,
-							onProgress: (members) => show(members),
-							onActivity: () => api.touch(),
-						});
-						const member = fixed.members[0];
-						member.task = `Fix round: ${prompt.split("\n")[0]}`;
-						const report = fixed.rawFinal ?? "";
-						const checks = evaluateVerification([member], [iso.repo]);
-						const blocker = /^CONFLICT:/i.test(report.trim())
-							? `The Builder reports that a finding conflicts with the brief:\n${report.trim().slice(0, 2_000)}`
-							: fixed.error
-								? `The fix round did not finish: ${fixed.error.slice(0, 2_000)}`
-								: checks.state !== "verified"
-									? `The fix round's checks did not pass (${checks.state}${checks.checks.length ? `: ${checks.checks.map((c) => `${c.command} (exit ${c.exitCode ?? "?"})`).join(", ")}` : ""}).`
-									: undefined;
-						return { member, cost: fixed.usage.cost, report, blocker };
-					},
-					choose: (title, description, options, optionNotes) => ask({ kind: "choose", title, description, options, optionNotes }),
-				});
-				fence("Quest aborted during independent review.");
-				party.members.push(...loop.members);
-				party.usage.cost += loop.cost;
-				api.setMembers(party.members.slice());
-				if (loop.fixReports.length)
-					party.report = `${party.report}\n\n## Changes from review fix rounds\nThe sections above describe the first version. ${loop.reviewer} review led to these further changes:\n\n${loop.fixReports.map((r, i) => `### Fix round ${i + 1}\n${r.replace(/^#+ /gm, "#### ").slice(0, 3_000)}`).join("\n\n")}`;
-				if (loop.note) party.report = `${party.report}\n\n${loop.note}`;
-				if (loop.fixRounds > 0) {
-					// Fix rounds changed the code: earlier checks are stale. Re-derive from every member
-					// (the latest result per command wins), so a failing fix cannot ride on an old pass.
-					const verification = evaluateVerification(party.members, record.isolations?.map((i) => i.repo));
-					record.verification = verification.state;
-					record.raiseError = verification.state === "unverified"
-						? unverifiedReason(verification.masked)
-						: verification.state === "failed"
-							? `Checks fail after the review fix round (${verification.checks.filter((c) => c.exitCode !== 0).map((c) => c.command).join(", ")}); branch kept local.`
-							: undefined;
-				}
-				api.save();
 			}
 
 			// Commit each writable repo's worktree + draft a PR per changed repo BEFORE
 			// completion, so the completed record already carries its branches/PRs.
 			let committedAny = false;
 			if (opts.write && record.isolations?.length) {
-				const { title, body } = draftPrFromReport(party.report);
+				const drafted = draftPrFromReport(party.report);
+				const title = drafted.title;
+				const body = checks?.status === "none" ? `${drafted.body}\n\n_No checks were run: ${checks.detail}_` : drafted.body;
 				const multi = record.isolations.length > 1;
 				const prs = [];
 				for (const iso of record.isolations) {
@@ -340,17 +278,14 @@ async function runQuestInBackground(
 				}
 				record.prs = prs;
 
-				// Auto-raise: push and open draft PRs on completion — no approval (a draft is
-				// the human's review artifact). Security guard still applies: Grafana first-party
-				// security fixes stay local, and with no confirmSecurity callback any other
-				// security-looking change is refused by default (safe). raise_pr can retry.
+				// Auto-raise: push and open draft PRs on completion — no approval (a draft is the
+				// human's review artifact). raisePr refuses only if the publish scan finds secrets or
+				// internal chat links. raise_pr can retry a failed push.
 				let raiseResult: RaiseResult | undefined;
-				if (prs.length > 0 && record.verification === "verified") {
+				if (prs.length > 0) {
 					let raiseFailure: unknown;
 					try {
-						raiseResult = await raisePr(record, {
-							confirmSecurity: undefined, // refuses security-looking changes by default
-						});
+						raiseResult = await raisePr(record, {});
 					} catch (err) {
 						raiseFailure = err;
 					}
@@ -462,7 +397,7 @@ async function runQuestInBackground(
 					return { report: `${body}${note}`, usage: party.usage };
 				}
 			}
-			return { report: record.verification === "unverified" ? `${party.report}\n\n⚠️ UNVERIFIED: ${record.raiseError ?? "no observed passing build, lint, typecheck or test."} Branch committed but draft PR not auto-raised; run verification before raising.` : party.report, usage: party.usage };
+			return { report: `${party.report}${prSection(record)}`, usage: party.usage };
 		}, {});
 	} catch {
 		// manager.run already transitioned the record to failed and persisted it.
@@ -481,16 +416,10 @@ function describeQuest(q: QuestRecord): string {
 			`Branches: ${q.isolations.map((i) => `${i.repo}→${i.branch}${i.baseLabel ? ` (base ${i.baseLabel})` : ""}`).join(", ")}`,
 		);
 	for (const pr of q.prs ?? []) {
-		const status = pr.url
-			? pr.url
-			: q.verification === "unverified"
-				? "unverified — run checks before raising"
-			: q.raiseError
-				? `raise failed — use raise_pr to retry`
-				: "draft, not raised — use raise_pr";
+		const status = pr.url ? pr.url : q.raiseError ? "draft PR not opened (see below)" : "draft PR not opened yet";
 		lines.push(`PR (${pr.repo}): ${status}${pr.diffStat ? `\n${pr.diffStat}` : ""}`);
 	}
-	if (q.raiseError && q.prs?.some((p) => !p.url)) lines.push(`Raise error: ${q.raiseError}`);
+	if (q.raiseError && q.prs?.some((p) => !p.url)) lines.push(`Why the PR was not opened: ${q.raiseError}`);
 	if (q.error) lines.push(`Error: ${q.error}${q.stopReason ? ` [stopReason: ${q.stopReason}]` : ""}`);
 	if (q.report) lines.push(`\n${q.report}`);
 	return lines.join("\n");

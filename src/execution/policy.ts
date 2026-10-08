@@ -489,8 +489,3 @@ export function repoSlugFromRemote(remoteUrl: string): string | undefined {
 	const m = remoteUrl.trim().match(/github\.com[:/]([^/\s]+\/[^/\s]+?)(?:\.git)?\/?$/i);
 	return m ? m[1] : undefined;
 }
-
-/** grafana/grafana first-party: security fixes must not become public PRs without confirmation. */
-export function isGrafanaFirstParty(slug: string | undefined): boolean {
-	return slug === "grafana/grafana";
-}

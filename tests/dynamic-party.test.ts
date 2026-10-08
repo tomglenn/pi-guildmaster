@@ -3,11 +3,10 @@ import assert from "node:assert/strict";
 import { buildSystemPrompt, dynamicDispatchBudget } from "../src/orchestration/party-leader.ts";
 import { DEFAULT_CONFIG } from "../src/config.ts";
 import { createBuilderGuildmate } from "../src/orchestration/fast-write.ts";
-import { evaluateVerification, checkResults, unverifiedReason } from "../src/orchestration/verification.ts";
-import { requiredReviewer, reviewPassed } from "../src/orchestration/write-review.ts";
-import type { QuestMember } from "../src/persistence/quest-store.ts";
+import { parseChecksLine } from "../src/orchestration/checks-line.ts";
+import { scanDiff, scanPrText } from "../src/orchestration/publish-scan.ts";
 
-const prompt = (legacy = false) => buildSystemPrompt("base", [createBuilderGuildmate()], DEFAULT_CONFIG, true, [], undefined, undefined, false, false, "<<<R>>>", "<<<E>>>", undefined, false, legacy);
+const prompt = (legacy = false, interactive = true) => buildSystemPrompt("base", [createBuilderGuildmate()], DEFAULT_CONFIG, true, [], undefined, undefined, false, false, "<<<R>>>", "<<<E>>>", undefined, interactive, legacy);
 
 test("dynamic write leader chooses the party; legacy pipeline is opt-in", () => {
 	assert.match(prompt(), /smallest useful party/);
@@ -15,55 +14,42 @@ test("dynamic write leader chooses the party; legacy pipeline is opt-in", () => 
 	assert.doesNotMatch(prompt(), /THEN dispatch `smith`/);
 	assert.doesNotMatch(prompt(), /inquisitor attack the PLAN/);
 	assert.match(prompt(true), /THEN dispatch `smith`/);
-	assert.equal(dynamicDispatchBudget(1), 6);
-	assert.equal(dynamicDispatchBudget(2), 10);
+	assert.ok(dynamicDispatchBudget(1) >= 12, "the budget is a runaway guard, not a cap on iterating");
 });
 
-test("verification uses observed exit codes, not final prose", () => {
-	const member = (checks?: QuestMember["checks"]): QuestMember => ({ name: "builder", task: "test", status: "done", checks });
-	assert.equal(evaluateVerification([member()]).state, "unverified");
-	assert.equal(evaluateVerification([member([{ command: "npm test", exitCode: 1 }])]).state, "failed");
-	assert.equal(evaluateVerification([member([{ command: "npm test", exitCode: 1 }, { command: "npm test", exitCode: 0 }])]).state, "verified");
-	assert.equal(evaluateVerification([member([{ command: "npm test" }])]).state, "failed");
-	assert.deepEqual(checkResults([{ command: "git diff HEAD", exitCode: 0 }, { command: "npm test", exitCode: 0 }, { command: "npm test || true", exitCode: 0 }]), [{ command: "npm test", exitCode: 0 }, { command: "npm test || true", exitCode: 0, masked: true }]);
-	assert.equal(evaluateVerification([{ ...member([{ command: "npm test", exitCode: 0 }]), repo: "one" }], ["one", "two"]).state, "unverified");
+test("the party owns its checks and its own adversarial review; Guildmaster does not", () => {
+	for (const p of [prompt(), prompt(true)]) {
+		assert.match(p, /not done while a\s+check fails/i);
+		assert.match(p, /warden[\s\S]*attack the ACTUAL diff/);
+		assert.match(p, /CHECKS: PASS/);
+		assert.match(p, /public draft PR/);
+		assert.doesNotMatch(p, /harness (checks|separately|enforces)/i);
+	}
+	assert.match(prompt(), /request_user[\s\S]*noteOptions/, "the leader can offer a one-step send-back with guidance");
+	assert.match(createBuilderGuildmate().systemPrompt, /CHECKS: PASS/);
+	assert.match(createBuilderGuildmate().systemPrompt, /until every check passes/);
+	assert.doesNotMatch(createBuilderGuildmate().systemPrompt, /harness/);
 });
 
-test("a chained check is recorded as masked: never credited, and the unverified status says why", () => {
-	const member = (checks?: QuestMember["checks"]): QuestMember => ({ name: "builder", task: "test", status: "done", checks });
-	// The E2E failure: the builder ran the failing test chained with echo, which exits 0.
-	const checks = checkResults([{ command: 'cd /wt && npm test 2>&1; echo "EXIT=$?"', exitCode: 0 }]);
-	assert.equal(checks.length, 1);
-	assert.equal(checks[0].masked, true);
-	const v = evaluateVerification([member(checks)]);
-	assert.equal(v.state, "unverified");
-	assert.equal(v.masked.length, 1);
-	assert.match(unverifiedReason(v.masked), /chained with ';' or '\|'.*npm test 2>&1; echo/);
-	assert.match(unverifiedReason([]), /No observed passing verification checks/);
-	// A masked check never upgrades or downgrades real results.
-	assert.equal(evaluateVerification([member([...checks, { command: "npm test", exitCode: 0 }])]).state, "verified");
-	assert.equal(evaluateVerification([member([...checks, { command: "npm test", exitCode: 1 }])]).state, "failed");
-	// Redirects and && do not mask an exit code.
-	assert.deepEqual(checkResults([{ command: "npm test 2>&1", exitCode: 1 }, { command: "cd x && npm test &>out.log", exitCode: 1 }]), [{ command: "npm test 2>&1", exitCode: 1 }, { command: "cd x && npm test &>out.log", exitCode: 1 }]);
-	// A path containing "test" is not a check (E2E: `git add ... test/cue.test.js && git commit` was credited).
-	assert.deepEqual(checkResults([
-		{ command: "cd /wt && git add src/cue.js test/cue.test.js && git commit -m x", exitCode: 0 },
-		{ command: "cat test/cue.test.js", exitCode: 0 },
-		{ command: "cd /wt && npm test", exitCode: 0 },
-		{ command: "CI=1 node --test", exitCode: 0 },
-		{ command: "npx tsc --noEmit -p tsconfig.json", exitCode: 0 },
-		{ command: "python -m pytest tests/", exitCode: 0 },
-	]).map((c) => c.command), ["cd /wt && npm test", "CI=1 node --test", "npx tsc --noEmit -p tsconfig.json", "python -m pytest tests/"]);
-	// Builder is told to run plain checks.
-	assert.match(createBuilderGuildmate().systemPrompt, /ONE plain command/);
+test("the CHECKS line is read from the party's report and stripped from the PR body", () => {
+	const pass = parseChecksLine("# Title\n\nBody\n\nCHECKS: PASS — npm test (exit 0)");
+	assert.deepEqual([pass.status, pass.detail, pass.body, pass.stated], ["pass", "npm test (exit 0)", "# Title\n\nBody", true]);
+	assert.equal(parseChecksLine("x\n**CHECKS: FAIL** - npm test (exit 1)").status, "fail");
+	assert.equal(parseChecksLine("CHECKS: FAIL — first\nCHECKS: PASS — after fixing").status, "pass", "the last line wins");
+	const missing = parseChecksLine("# Title\nNo line");
+	assert.deepEqual([missing.status, missing.stated], ["none", false]);
 });
 
-test("post-diff risk review is independent and fail-closed", () => {
-	assert.equal(requiredReviewer("Add cue hint", ["src/cue.js"], "+  hint: {type: 'string'}"), undefined);
-	assert.equal(requiredReviewer("Add hint", ["src/auth/session.ts"], "+  hint: true"), "warden");
-	assert.equal(requiredReviewer("Change dependencies", ["package.json"], "+  version: 1"), "inquisitor");
-	assert.equal(requiredReviewer("Add migration", ["db/migrations/001.sql"], ""), "inquisitor");
-	assert.equal(reviewPassed("VERDICT: PASS\nNo material findings"), true);
-	assert.equal(reviewPassed("Looks fine"), false);
-	assert.equal(reviewPassed("VERDICT: PASS\nVERDICT: BLOCK"), false);
+test("the publish scan flags secrets and chat links in ADDED lines and PR text, not removed lines", () => {
+	const diff = [
+		"+++ b/src/config.js",
+		"@@ -1,2 +1,3 @@",
+		" const a = 1;",
+		"-const old = 'AKIAABCDEFGHIJKLMNOP';",
+		"+const key = 'AKIAABCDEFGHIJKLMNOP';",
+	].join("\n");
+	assert.deepEqual(scanDiff(diff), [{ kind: "AWS access key", where: "src/config.js:2" }]);
+	assert.deepEqual(scanDiff("+++ b/a.js\n@@ -1 +1 @@\n-token = 'ghp_" + "a".repeat(36) + "'"), [], "removing a secret is fine");
+	assert.deepEqual(scanPrText("Fix", "See https://acme.slack.com/archives/C0123ABCD/p1"), [{ kind: "Slack message link", where: "PR body line 1" }]);
+	assert.deepEqual(scanPrText("Add cue tags", "Adds `tags` to cueSchema.\npassword field docs"), []);
 });

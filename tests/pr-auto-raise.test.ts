@@ -45,7 +45,6 @@ describe("raisePr", () => {
 		const result = await raisePr(record, {
 			runGit: mockGit as any,
 			runGh: mockGh as any,
-			confirmSecurity: undefined,
 		});
 
 		assert.equal(result.raised, 1);
@@ -65,7 +64,6 @@ describe("raisePr", () => {
 		const result = await raisePr(record, {
 			runGit: mockGit as any,
 			runGh: mock.fn() as any,
-			confirmSecurity: undefined,
 		});
 
 		assert.equal(result.raised, 0);
@@ -85,10 +83,8 @@ describe("raisePr", () => {
 			]
 		);
 
-		let callCount = 0;
-		const mockGit = mock.fn(async () => {
-			callCount++;
-			if (callCount > 1) throw new Error("Push failed for repo-b");
+		const mockGit = mock.fn(async (args: string[], cwd: string) => {
+			if (args[0] === "push" && cwd === "/tmp/b") throw new Error("Push failed for repo-b");
 			return "";
 		});
 		const mockGh = mock.fn(async () => "https://github.com/test/a/pull/1\n");
@@ -96,7 +92,6 @@ describe("raisePr", () => {
 		const result = await raisePr(record, {
 			runGit: mockGit as any,
 			runGh: mockGh as any,
-			confirmSecurity: undefined,
 		});
 
 		assert.equal(result.raised, 1);
@@ -109,51 +104,29 @@ describe("raisePr", () => {
 		assert.equal(record.prs![1].url, undefined);
 	});
 
-	test("refuses security-looking PR when confirmSecurity is undefined", async () => {
-		const record = makeRecord(
-			[{ repo: "test-repo", title: "Fix SQL injection vulnerability", url: undefined }],
-			[{ repo: "test-repo", worktreePath: "/tmp/test" }]
-		);
-
-		const mockGit = mock.fn(async (args: string[]) => {
-			if (args[0] === "remote") return "https://github.com/other/repo.git";
-			return "";
-		});
-
-		const result = await raisePr(record, {
-			runGit: mockGit as any,
-			runGh: mock.fn() as any,
-			confirmSecurity: undefined, // defaults to refuse
-		});
-
-		assert.equal(result.raised, 0);
-		assert.equal(result.results[0].raised, false);
-		assert.equal(result.results[0].refused, true);
-		assert.match(result.results[0].reason, /security fix[\s\S]*raise_pr/i, "says what to do next");
+	test("a security-looking change is raised like any other: the party owns security review", async () => {
+		const record = makeRecord([{ repo: "test-repo", title: "Fix SQL injection vulnerability", url: undefined }], [{ repo: "test-repo", worktreePath: "/tmp/test" }]);
+		const result = await raisePr(record, { runGit: mock.fn(async () => "") as any, runGh: mock.fn(async () => "https://github.com/o/r/pull/9\n") as any });
+		assert.equal(result.raised, 1);
 	});
 
-	test("blocks grafana/grafana first-party security fix (org policy)", async () => {
-		const record = makeRecord(
-			[{ repo: "grafana", title: "Fix authentication bypass", url: undefined }],
-			[{ repo: "grafana", worktreePath: "/tmp/grafana" }]
-		);
-
-		const mockGit = mock.fn(async (args: string[]) => {
-			if (args[0] === "remote") return "https://github.com/grafana/grafana.git";
-			return "";
-		});
-
-		const result = await raisePr(record, {
-			runGit: mockGit as any,
-			runGh: mock.fn() as any,
-			confirmSecurity: async () => true, // even with confirm, should be blocked
-		});
-
+	test("refuses to publish when the added diff contains a secret, naming the kind and place, never the value", async () => {
+		const record = makeRecord([{ repo: "test-repo", url: undefined }], [{ repo: "test-repo", worktreePath: "/tmp/test" }]);
+		const runGit = mock.fn(async (args: string[]) => (args[0] === "diff" ? "+++ b/src/x.js\n@@ -0,0 +1 @@\n+const t = 'xoxb-1234567890-abcdefghij';" : ""));
+		const runGh = mock.fn(async () => "");
+		const result = await raisePr(record, { runGit: runGit as any, runGh: runGh as any });
 		assert.equal(result.raised, 0);
-		assert.equal(result.results[0].raised, false);
 		assert.equal(result.results[0].refused, true);
-		assert.ok(result.results[0].reason.includes("grafana/grafana"));
-		assert.ok(result.results[0].reason.includes("org policy"));
+		assert.match(result.results[0].reason, /Slack token at src\/x\.js:1/);
+		assert.doesNotMatch(result.results[0].reason, /xoxb-/);
+		assert.ok(!runGit.mock.calls.some((c) => (c.arguments[0] as string[])[0] === "push"), "nothing pushed");
+		assert.equal(runGh.mock.callCount(), 0);
+	});
+
+	test("refuses to publish an internal chat link in the PR body", async () => {
+		const record = makeRecord([{ repo: "test-repo", body: "Context: https://acme.slack.com/archives/C012AB3CD/p123", url: undefined }], [{ repo: "test-repo", worktreePath: "/tmp/test" }]);
+		const result = await raisePr(record, { runGit: mock.fn(async () => "") as any, runGh: mock.fn(async () => "") as any });
+		assert.match(result.results[0].reason, /Slack message link at PR body line 1/);
 	});
 
 	test("skips already-raised PRs", async () => {

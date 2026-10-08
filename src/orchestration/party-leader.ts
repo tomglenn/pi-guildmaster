@@ -22,7 +22,7 @@ import { collectUsage, lastAssistantText, runChildAgent, runSession } from "../e
 import { createEnvoyShellTool } from "../execution/gh-tool.ts";
 import { createRunnerShellTool } from "../execution/runner-shell.ts";
 import { createBuilderGuildmate } from "./fast-write.ts";
-import { checkResults } from "./verification.ts";
+import { CHECKS_LINE_HELP } from "./checks-line.ts";
 import { createHeraldSlackTool, type SlackFetcher, UNBOUND_SLACK_FETCHER } from "../execution/slack-tool.ts";
 import { findGuildmate, type Guildmate, loadPartyLeaderPrompt } from "../roster.ts";
 import type { QuestMember, QuestState } from "../persistence/quest-store.ts";
@@ -53,8 +53,9 @@ const DISPATCHABLE_READONLY_GH: ReadonlySet<string> = new Set(["read-only", "env
 const DISPATCHABLE_WRITE: ReadonlySet<string> = new Set(["read-only", "builder"]);
 const DISPATCHABLE_LEGACY_WRITE: ReadonlySet<string> = new Set(["read-only", "write", "exec"]);
 
+/** A runaway guard only: the party iterates until its checks and reviews pass, so this is generous. */
 export function dynamicDispatchBudget(writableRepos: number): number {
-	return Math.max(6, writableRepos * 4 + 2);
+	return Math.max(12, writableRepos * 10 + 2);
 }
 // Review: read-only specialists judge, scribe (write) composes, envoy talks to GitHub.
 const DISPATCHABLE_REVIEW: ReadonlySet<string> = new Set(["read-only", "write", "envoy"]);
@@ -206,7 +207,7 @@ export function buildSystemPrompt(basePrompt: string, available: Guildmate[], co
 					"  resumes with their answer. Use it ONLY when genuinely blocked on a decision only the user can make,",
 					"  or when a plan/output must be sense-checked before you proceed or before a side-effect. Prefer",
 					"  finishing autonomously; do not pester the user with questions you can resolve by investigation.",
-					"  kinds: `approve` (yes/no gate), `choose` (offer `options`), `answer` (free-text question),",
+					"  kinds: `approve` (yes/no gate), `choose` (offer `options`; `noteOptions` take optional guidance), `answer` (free-text question),",
 					"  `review-artifact` (pass the full draft as `artifact`; the user reads/edits the file, then approves or",
 					"  sends it back), or `huddle` (pass a draft as `artifact` for a genuinely COLLABORATIVE, multi-round",
 					"  decision — e.g. agreeing a PLAN before you implement: the Quest hands the discussion to the foreground",
@@ -251,6 +252,33 @@ export function buildSystemPrompt(basePrompt: string, available: Guildmate[], co
 		"  REPORT ONLY. When you have enough, STOP and produce the final report.",
 	];
 
+	// The party owns what it says about its own work: it runs the checks, attacks its own diff,
+	// iterates until both pass, and states the result. Guildmaster only reads the CHECKS line.
+	const ownership = [
+		"- YOU OWN THE RESULT: nobody re-checks this party's work after you finish. The Quest is not done while a",
+		"  check fails: give the failure to the implementer for another round, re-run the checks, and repeat until",
+		"  they pass. Run each check as one plain command (e.g. `npm test`) so its real exit code is visible.",
+		"- ATTACK YOUR OWN DIFF: when the change touches security, auth, secrets, untrusted input, injection or",
+		"  rendering of user content, dispatch `warden` to attack the ACTUAL diff; for consequential correctness",
+		"  risk (migrations, dependencies, data loss) dispatch `inquisitor`. A material finding goes back to the",
+		"  implementer with the brief, then re-check and re-review. Repeat until the reviewer has no material findings.",
+		...(interactive
+			? [
+					"- ASK THE USER only when iterating cannot settle it: a failing check or finding can be fixed only by",
+					"  breaking an EXPLICIT brief requirement, or rounds stop making progress. Use `request_user` kind",
+					"  `choose`, with the reviewer's findings (Markdown) as `description` and options such as \"Accept the risk:",
+					"  keep the change and record the findings in the PR body\", \"Send it back: another fix round with the",
+					"  findings, plus optional guidance from you\" and \"Stop: keep the branch local and end the Quest\". Put the",
+					"  send-back option in `noteOptions` so the user types guidance in the same step. Then act on the answer.",
+				]
+			: ["- If iterating cannot settle it (a fix would break an explicit brief requirement), report FAILED with the conflict."]),
+		"- PUBLIC BY DEFAULT: your final report becomes the body of a public draft PR, opened automatically. It and",
+		"  the diff must contain no secrets or credentials, no internal comms (Slack quotes or links, private",
+		"  discussions), and no private or customer information. Have the implementer check the diff for this too.",
+		`- ${CHECKS_LINE_HELP} Report what the checks actually returned. Use FAIL only if the user chose to stop or`,
+		"  accept failing checks; FAIL means no PR is opened.",
+	];
+
 	const workflow = reviewMode
 		? reviewWorkflow
 		: acquire
@@ -269,9 +297,9 @@ export function buildSystemPrompt(basePrompt: string, available: Guildmate[], co
 				"  the brief's acceptance criteria; it reads those files (and may ask runner for `git diff`) and checks",
 				"  the implementation against EVERY requirement in the brief.",
 				"- HAND BACK ON MATERIAL ISSUES: if the reviewer finds a correctness bug, a security hole, a broken or",
-				"  missing test, or a brief requirement not met, dispatch `smith` to fix it and then re-review. Cap",
-				"  this at TWO review→fix rounds. Do NOT loop on nits or style — record minor items under Unresolved",
-				"  and move on. Finalize only when the review is clean or the two rounds are spent.",
+				"  missing test, or a brief requirement not met, dispatch `smith` to fix it, `runner` to re-test, then",
+				"  re-review. Do NOT loop on nits or style — record minor items under Unresolved and move on.",
+				...ownership,
 				"- PR BODY SYNTHESIS: after review passes, dispatch `scribe` to write the pull request description.",
 				"  Scribe writes plain, human-readable prose (its persona defines the style). Give Scribe: the brief,",
 				"  what changed (files and why), what runner tested, and any caveats from inquisitor/warden.",
@@ -287,14 +315,9 @@ export function buildSystemPrompt(basePrompt: string, available: Guildmate[], co
 				"  inquisitor to attack a routine plan, or scribe solely to format the PR body.",
 				"- Builder owns the edit/test/fix loop in one session. Dispatch ONE builder per writable repo;",
 				"  parallelize independent read-only questions. Never send parallel builders to the same repo.",
-				"- Dispatch budget is bounded by repo count. If spent, STOP and report completed work and blockers.",
-				"- If a real design ambiguity or security decision arises, ask architect/warden. For consequential",
-				"  changes, use inquisitor on the actual diff, not automatically on a plan. The harness separately",
-				"  checks security-sensitive diffs. Give any material findings to builder for a bounded fix round.",
-				"- Stop once the brief's acceptance criteria are met and tests have passed. If blocked after two",
-				"  fix rounds, report FAILED with concrete blockers; do not silently expand scope or keep dispatching.",
-				"- The harness checks observed test results and commits. Final report: H1 title, Summary, Changes,",
-				"  Testing (observed results), and Risks / Unresolved. Do not claim tests passed without evidence.",
+				"- If a real design ambiguity arises, ask architect. Use inquisitor on the actual diff, not automatically on a plan.",
+				...ownership,
+				"- Final report: H1 title, Summary, Changes, Testing (observed results), and Risks / Unresolved.",
 			]
 		: [
 				"- When you have enough, STOP dispatching and produce the FINAL REPORT: clean human-facing markdown",
@@ -411,10 +434,7 @@ export async function runParty(opts: {
 			}
 			const modelSpec = resolveModelSpec(opts.config, mate.model);
 			if (write && !opts.legacyWrite && members.length >= maxDispatches) {
-				throw new Error(`Dispatch budget (${maxDispatches}) spent. Finalize with completed work and remaining blockers; do not expand the party.`);
-			}
-			if (mate.tier === "builder" && members.filter((m) => m.name === "builder" && m.repo === context.name).length >= 3) {
-				throw new Error(`Builder fix budget spent in ${context.name}. Report remaining blockers rather than looping.`);
+				throw new Error(`Runaway guard: ${maxDispatches} dispatches used. Stop iterating: ask the user with request_user how to continue, or finalize with what is done and what still fails.`);
 			}
 			const index =
 				members.push({ name: mate.name, task: params.task, model: modelSpec, status: "running", repo: context.name, startedAt: Date.now(), step: params.task.slice(0, 100) }) - 1;
@@ -472,7 +492,6 @@ export async function runParty(opts: {
 							lastToolCount = partial.toolCalls.length;
 							const last = partial.toolCalls.at(-1);
 							members[index].step = last?.name === "shell" ? `Running: ${String(last.args.command ?? "command").slice(0, 100)}` : `${last?.name ?? "working"}: ${String(last?.args.path ?? "files").slice(0, 100)}`;
-							if (partial.shellResults) members[index].checks = checkResults(partial.shellResults);
 							opts.onProgress?.(members.slice());
 						}
 					} : undefined,
@@ -481,7 +500,6 @@ export async function runParty(opts: {
 				memberCost += res.usage.cost;
 				const failed = Boolean(res.error) || res.stopReason === "error" || res.stopReason === "aborted";
 				members[index].status = failed ? "failed" : "done";
-				if (res.shellResults) members[index].checks = checkResults(res.shellResults);
 				members[index].finishedAt = Date.now();
 				members[index].summary = res.finalText.slice(0, 400);
 				opts.onProgress?.(members.slice());
@@ -529,6 +547,7 @@ export async function runParty(opts: {
 					options: Type.Optional(Type.Array(Type.String(), { description: "kind 'choose': the options to pick from." })),
 					artifact: Type.Optional(Type.String({ description: "kind 'review-artifact'/'huddle': the FULL draft text to write to a file for the user to read/edit." })),
 					artifactName: Type.Optional(Type.String({ description: "filename for the artifact (default draft.md, or plan.md for a huddle)." })),
+					noteOptions: Type.Optional(Type.Array(Type.String(), { description: "kind 'choose': options that also take optional free-text guidance in the same step (e.g. a send-back option). Must match entries in `options`." })),
 				}),
 				execute: async (_toolCallId, params, signal) => {
 					const artifactKind = params.kind === "review-artifact" || params.kind === "huddle";
@@ -551,6 +570,9 @@ export async function runParty(opts: {
 							title: params.title,
 							description: params.description,
 							options: params.options,
+							optionNotes: params.noteOptions?.length
+								? Object.fromEntries(params.noteOptions.filter((o) => params.options?.includes(o)).map((o) => [o, "Guidance (optional \u2014 leave empty to skip)"]))
+								: undefined,
 							artifactPath,
 							questId: interactive.questId,
 							signal,
@@ -560,7 +582,8 @@ export async function runParty(opts: {
 					}
 					let text: string;
 					if (params.kind === "approve") text = ans.approved ? "User APPROVED." : "User DENIED.";
-					else if (params.kind === "choose") text = ans.choice ? `User chose: ${ans.choice}` : ans.approved ? "User approved." : "User declined to choose.";
+					else if (params.kind === "choose")
+						text = ans.choice ? `User chose: ${ans.choice}${ans.text ? `\nTheir guidance: ${ans.text}` : ""}` : ans.approved ? "User approved." : "User declined to choose.";
 					else if (params.kind === "answer") text = ans.text ? `User answered: ${ans.text}` : "User gave no answer.";
 					else if (params.kind === "huddle")
 						text = ans.approved
