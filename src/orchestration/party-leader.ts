@@ -261,7 +261,8 @@ export function buildSystemPrompt(basePrompt: string, available: Guildmate[], co
 		"- ATTACK YOUR OWN DIFF: when the change touches security, auth, secrets, untrusted input, injection or",
 		"  rendering of user content, dispatch `warden` to attack the ACTUAL diff; for consequential correctness",
 		"  risk (migrations, dependencies, data loss) dispatch `inquisitor`. A material finding goes back to the",
-		"  implementer with the brief, then re-check and re-review. Repeat until the reviewer has no material findings.",
+		"  implementer with the brief, then re-check and re-review. Every fix round, including the last one, goes back",
+		"  to the SAME reviewer before you finalize: finish only when that reviewer has no material findings on the final diff.",
 		...(interactive
 			? [
 					"- ASK THE USER only when iterating cannot settle it: a failing check or finding can be fixed only by",

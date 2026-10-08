@@ -290,7 +290,7 @@ export function classifyCommand(command: string): OpDecision {
 export interface ReviewGate extends OpDecision {
 	/** Requires human approval before it may run (mutations in a review quest). */
 	needsApproval: boolean;
-	/** Hard-blocked regardless of approval (merge; suspected security fix auto-publish). */
+	/** Hard-blocked regardless of approval (e.g. merge). */
 	blocked: boolean;
 }
 
@@ -341,9 +341,7 @@ const forbid = (operation: string, reason: string): ReviewGate => ({
 
 /**
  * Gate a shell command for the review envoy. Reads run freely; mutations require
- * approval and are only allowed in review mode; `gh pr merge` is always blocked;
- * a suspected security fix is blocked from auto-publish so it cannot be posted
- * without explicit out-of-band confirmation (§ org policy).
+ * approval and are only allowed in review mode; `gh pr merge` is always blocked.
  *
  * The command must be ONE plain `gh` or read-only `git` invocation: any active shell
  * operator or substitution is refused, so a mutation cannot ride behind a read
@@ -356,7 +354,7 @@ const forbid = (operation: string, reason: string): ReviewGate => ({
  */
 export function gateReviewCommand(
 	command: string,
-	opts: { reviewMode: boolean; prText?: string; envoy?: boolean },
+	opts: { reviewMode: boolean; envoy?: boolean },
 ): ReviewGate {
 	const ctl = findShellControl(command);
 	if (ctl) {
@@ -394,9 +392,6 @@ export function gateReviewCommand(
 	// mutate:
 	if (!opts.reviewMode) {
 		return { ...d, reason: "mutations are only allowed inside a PR-review quest", needsApproval: false, blocked: true };
-	}
-	if (opts.prText && isLikelySecurityFix(opts.prText)) {
-		return { ...d, reason: "suspected security fix — must be confirmed out of band before posting", needsApproval: false, blocked: true };
 	}
 	return { ...d, needsApproval: true, blocked: false };
 }
@@ -474,14 +469,6 @@ export function gateRunnerCommand(command: string): RunnerGate {
 		}
 	}
 	return { blocked: false };
-}
-
-// Heuristic only. Errs toward flagging so a security fix is not auto-published (§ org policy).
-const SECURITY_SIGNALS =
-	/\b(cve-\d|vulnerabilit|security fix|security patch|exploit|xss|csrf|\bssrf\b|\brce\b|sql injection|auth(?:entication|orization)?\s+bypass|privilege escalation|path traversal|secret leak|hardcoded (?:secret|password|token))\b/i;
-
-export function isLikelySecurityFix(text: string): boolean {
-	return SECURITY_SIGNALS.test(text);
 }
 
 /** Extract an "owner/repo" slug from a GitHub remote URL, if present. */

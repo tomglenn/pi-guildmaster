@@ -21,6 +21,7 @@ test("the party owns its checks and its own adversarial review; Guildmaster does
 	for (const p of [prompt(), prompt(true)]) {
 		assert.match(p, /not done while a\s+check fails/i);
 		assert.match(p, /warden[\s\S]*attack the ACTUAL diff/);
+		assert.match(p, /including the last one, goes back\s+to the SAME reviewer/);
 		assert.match(p, /CHECKS: PASS/);
 		assert.match(p, /public draft PR/);
 		assert.doesNotMatch(p, /harness (checks|separately|enforces)/i);

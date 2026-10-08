@@ -80,9 +80,10 @@ function briefWithUpstream(brief: string, parent: QuestRecord): string {
 function prSection(record: QuestRecord): string {
 	const prs = record.prs ?? [];
 	if (!prs.length) return "";
-	const lines = prs.map((p) => (p.url ? `- ${p.repo}: ${p.url}` : `- ${p.repo}: not opened \u2014 branch \`${p.branch}\` kept`));
-	const why = record.raiseError && prs.some((p) => !p.url) ? `\n\n${record.raiseError}` : "";
-	return `\n\n---\n**Draft PR${prs.length > 1 ? "s" : ""}**\n${lines.join("\n")}${why}`;
+	// The reason already names the branch, so each unopened PR gets exactly one line.
+	const reasons = new Map((record.raiseError ?? "").split("; ").map((r) => [r.split(": ")[0], r.slice(r.indexOf(": ") + 2)] as const));
+	const lines = prs.map((p) => (p.url ? `- ${p.repo}: ${p.url}` : `- ${p.repo}: not opened. ${reasons.get(p.repo) ?? `Branch \`${p.branch}\` kept.`}`));
+	return `\n\n---\n**Draft PR${prs.length > 1 ? "s" : ""}**\n${lines.join("\n")}`;
 }
 
 function draftPrFromReport(report: string): { title: string; body: string } {

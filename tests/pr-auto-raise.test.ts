@@ -98,7 +98,7 @@ describe("raisePr", () => {
 		assert.equal(result.results[0].raised, true);
 		assert.equal(result.results[0].url, "https://github.com/test/a/pull/1");
 		assert.equal(result.results[1].raised, false);
-		assert.ok(result.results[1].reason.includes("Push failed"));
+		assert.match(result.results[1].reason, /Couldn't open the draft PR: Push failed for repo-b\. The branch/);
 		// First PR URL should be preserved
 		assert.equal(record.prs![0].url, "https://github.com/test/a/pull/1");
 		assert.equal(record.prs![1].url, undefined);
@@ -127,6 +127,13 @@ describe("raisePr", () => {
 		const record = makeRecord([{ repo: "test-repo", body: "Context: https://acme.slack.com/archives/C012AB3CD/p123", url: undefined }], [{ repo: "test-repo", worktreePath: "/tmp/test" }]);
 		const result = await raisePr(record, { runGit: mock.fn(async () => "") as any, runGh: mock.fn(async () => "") as any });
 		assert.match(result.results[0].reason, /Slack message link at PR body line 1/);
+	});
+
+	test("push failures read as one plain sentence, not raw git output", async () => {
+		const { explainPushFailure } = await import("../src/orchestration/pr.ts");
+		const raw = "Command failed: git push -u origin b\nfatal: 'origin' does not appear to be a git repository\nfatal: Could not read from remote repository.";
+		assert.equal(explainPushFailure(raw, "b"), "Couldn't push: this repo has no `origin` remote. The branch `b` is kept.");
+		assert.match(explainPushFailure("fatal: Authentication failed for 'https://github.com/x'", "b"), /authentication failed/);
 	});
 
 	test("skips already-raised PRs", async () => {

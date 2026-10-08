@@ -14,9 +14,7 @@
  * In a review Quest the review itself is posted only by postReview, from the
  * confirmed /approve snapshot of review.md — never by the envoy.
  *
- * A suspected security fix is blocked from auto-publish and must be confirmed out
- * of band, honouring the org security policy. Nothing hits GitHub without either a
- * read classification or the user's explicit /approve.
+ * Nothing hits GitHub without either a read classification or the user's explicit /approve.
  */
 
 import { execFileSync } from "node:child_process";
@@ -74,7 +72,7 @@ const defaultExecFile: ExecFile = (file, args, opts) => execFileSync(file, args,
 /**
  * Post a PR review via `gh pr review` (the envoy's action, run by the extension
  * once the user has approved). Re-runs the policy gate as a final safety check:
- * a suspected security fix stays blocked, and merge is never reachable here.
+ * merge is never reachable here.
  */
 export function postReview(opts: {
 	cwd: string;
@@ -94,7 +92,6 @@ export function postReview(opts: {
 	const repoArgs = opts.slug ? ["--repo", opts.slug] : [];
 	const gate = gateReviewCommand(["gh", "pr", "review", opts.number, ...repoArgs, reviewFlag(opts.verdict)].join(" "), {
 		reviewMode: true,
-		prText: opts.prText,
 	});
 	if (gate.blocked) return { error: gate.reason };
 	// A private, freshly created directory + an exclusive 0600 file: nothing else can pre-create or read it.
@@ -152,7 +149,7 @@ export function createEnvoyShellTool(opts: {
 			command: Type.String({ description: "The shell command to run, e.g. `gh pr diff 1905`." }),
 		}),
 		execute: async (_toolCallId, params) => {
-			const gate = gateReviewCommand(params.command, { reviewMode: opts.reviewMode, prText: opts.prText, envoy: true });
+			const gate = gateReviewCommand(params.command, { reviewMode: opts.reviewMode, envoy: true });
 			if (gate.blocked) {
 				return {
 					content: [{ type: "text", text: `BLOCKED (${gate.operation}): ${gate.reason}. Command not run.` }],

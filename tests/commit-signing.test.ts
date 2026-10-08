@@ -426,7 +426,7 @@ test("new-PR path: a non-signature GH013 keeps the generic failure message", asy
 	const result = await raisePr(prRecord(), { runGit, runGh: async () => "" });
 
 	assert.equal(result.raised, 0);
-	assert.match(result.results[0].reason, /^Push\/PR creation failed/);
+	assert.match(result.results[0].reason, /^Couldn't (push|open the draft PR)/);
 	assert.doesNotMatch(result.results[0].reason, /verified|gpg-sign|signed/);
 });
 

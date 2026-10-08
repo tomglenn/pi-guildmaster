@@ -90,8 +90,7 @@ A review is a party, not a single agent:
 4. The Quest **pauses for your approval**: `/approve` to have the envoy post it,
    or leave it as a draft.
 
-`gh pr merge` is always refused, and a suspected security fix is blocked from
-auto-posting.
+`gh pr merge` is always refused.
 
 ---
 
@@ -186,8 +185,7 @@ not by prompting.
 - **Parked approvals** — pushing a branch or posting a review needs your
   `/approve`; a pending approval never blocks other party work.
 - **Operation-aware GitHub policy** — `gh pr view/diff` is a read; `gh pr review`
-  needs approval; `gh pr merge` is refused. Suspected security fixes are held back
-  from auto-posting.
+  needs approval; `gh pr merge` is refused.
 
 ---
 

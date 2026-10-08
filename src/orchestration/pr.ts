@@ -47,6 +47,19 @@ export interface RaiseResult {
 const realGit: CommandRunner = async (args, cwd) => (await execFileAsync("git", args, { cwd, timeout: NETWORK_TIMEOUT_MS })).stdout;
 const realGh: CommandRunner = async (args, cwd) => (await execFileAsync("gh", args, { cwd, timeout: NETWORK_TIMEOUT_MS })).stdout;
 
+/** One plain sentence for a failed push / PR create: known causes in words, otherwise git's first error line. */
+export function explainPushFailure(raw: string, branch: string): string {
+	const kept = ` The branch \`${branch}\` is kept.`;
+	if (/'origin' does not appear to be a git repository|No such remote|no configured push destination/i.test(raw))
+		return `Couldn't push: this repo has no \`origin\` remote.${kept}`;
+	if (/Permission denied|Authentication failed|could not read Username|403|gh auth login/i.test(raw))
+		return `Couldn't push: GitHub authentication failed (check \`gh auth status\` or your SSH key).${kept}`;
+	if (/Could not resolve host|timed out|Connection refused|Network is unreachable|ETIMEDOUT/i.test(raw))
+		return `Couldn't push: GitHub could not be reached (network).${kept}`;
+	const first = raw.split("\n").map((l) => l.replace(/^(fatal|error):\s*/i, "").trim()).find((l) => l && !/^Command failed:/.test(l)) ?? raw.trim();
+	return `Couldn't open the draft PR: ${first.slice(0, 200)}.${kept}`;
+}
+
 /** An error's full text: execFile errors carry git's stderr on `.stderr`, plus the message. */
 function errText(e: unknown): string {
 	const stderr = (e as { stderr?: unknown } | null)?.stderr;
@@ -317,11 +330,7 @@ export async function raisePr(record: QuestRecord, deps: PrDeps): Promise<RaiseR
 				});
 				continue;
 			}
-			results.push({
-				repo: pr.repo,
-				raised: false,
-				reason: `Push/PR creation failed: ${err instanceof Error ? err.message : String(err)}`,
-			});
+			results.push({ repo: pr.repo, raised: false, reason: explainPushFailure(raw, pr.branch) });
 		}
 	}
 
