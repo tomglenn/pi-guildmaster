@@ -77,7 +77,7 @@ Natural language is the primary interface. Just tell the Guildmaster what you wa
 
 The Guild board shows the current member, action, elapsed time, and last test result. It also shows pending approvals and finished Quests. A worker still active after five minutes triggers one warning. This is a soft budget: the Quest continues. Completed Quests stay on the board until you turn them in.
 
-The Party Leader handles writes by default. It does not require a plan, two reviews, or a Scribe for every change. The party owns its result: it runs the checks and iterates until they pass, and it has warden or inquisitor attack its own diff when the change is risky. It ends its report with a `CHECKS: PASS | FAIL | NONE` line. Guildmaster only reads that line: on PASS or NONE it opens a draft PR and puts the link in the report, and on FAIL the Quest fails with the branch kept. Before pushing, a quick scan refuses to publish credentials or internal chat links. Use `write-fast` to skip the leader for a bounded one-repo change. Use `write-legacy` to run the old Smith/Runner pipeline.
+The Party Leader handles writes by default. It does not require a plan, two reviews, or a Scribe for every change. The party owns its result: it runs the checks and iterates until they pass, and it has warden or inquisitor attack its own diff when the change is risky. It ends its report with a `CHECKS: PASS | FAIL | NONE` line. Guildmaster only reads that line: on PASS or NONE it opens a draft PR and puts the link in the report, and on FAIL the Quest fails with the branch kept. Before pushing, a quick scan refuses to publish credentials or internal chat links. Use `write-fast` to skip the leader for a bounded one-repo change.
 
 ### Reviewing a pull request
 
@@ -166,8 +166,6 @@ different model family).
 | **inquisitor** | read-only | Adversarial review (different model family) |
 | **scribe** | write | Human-facing synthesis / final write-ups |
 | **builder** | builder | Edits, tests, and fixes in one isolated session |
-| **smith** | write | Legacy implementation role (`write-legacy`) |
-| **runner** | exec | Legacy build and test role (`write-legacy`) |
 | **envoy** | envoy | The party's only contact with GitHub (gated shell) |
 
 Capability tiers are enforced **structurally** by the tools each agent is given —

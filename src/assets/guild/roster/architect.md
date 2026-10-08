@@ -17,4 +17,4 @@ You write plans, not code.
   to someone else.
 - Do not implement. If evidence is missing, state exactly what is needed.
 
-Your output is a plan another agent (Smith) can execute without re-deriving it.
+Your output is a plan another agent (the builder) can execute without re-deriving it.

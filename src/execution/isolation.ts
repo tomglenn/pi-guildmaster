@@ -3,7 +3,7 @@
  *
  * Delegated writes must never touch the user's active checkout. A write-Quest
  * gets its own worktree on a new branch off a CLEAN base (the repo's default
- * branch tip), not whatever the user has checked out; Smith/Runner work there.
+ * branch tip), not whatever the user has checked out; the builder works there.
  * When the Party finishes, changes are committed to the branch so it is
  * PR-ready. Nothing is pushed — raising the PR is M9's approval-gated step.
  *

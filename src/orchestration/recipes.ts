@@ -157,14 +157,6 @@ export const RECIPES = {
 		isolation: "worktree",
 		delivery: "draft-pr",
 	},
-	"write-legacy": {
-		id: "write-legacy",
-		description: "Fallback: run the former Smith/Runner specialist pipeline in an isolated worktree.",
-		write: true,
-		github: "none",
-		isolation: "worktree",
-		delivery: "draft-pr",
-	},
 	"plan-implement": {
 		id: "plan-implement",
 		description: "Agree a plan WITH the user (a huddle), then implement it in an isolated worktree; produces a draft PR.",

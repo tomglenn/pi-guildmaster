@@ -138,7 +138,6 @@ async function runQuestInBackground(
 		/** Advisory preferred party (from the recipe). */
 		partyHint?: string[];
 		fastWrite?: boolean;
-		legacyWrite?: boolean;
 	},
 ): Promise<void> {
 	const manager = getQuestManager();
@@ -173,7 +172,6 @@ async function runQuestInBackground(
 				config: opts.config,
 				signal: api.signal,
 				write: opts.write,
-				legacyWrite: opts.legacyWrite,
 				globalInstructions: opts.globalInstructions,
 				instructions: opts.instructions,
 				review: opts.review ? { prText: opts.review.prText, approvals: opts.review.approvals, questId: record.id } : undefined,
@@ -847,7 +845,7 @@ export function registerQuestTool(pi: ExtensionAPI): void {
 				if (project) {
 					for (const r of project.repos) if (!targets.some((t) => t.name === r.name)) contexts.push({ name: r.name, path: r.path, writable: false });
 				}
-				void runQuestInBackground(record, { write: true, inPlace, contexts, config, globalInstructions: config.globalInstructions, instructions, partyHint: recipe.party, fastWrite: useFastWrite(recipe, targets.length, brief), legacyWrite: recipe.id === "write-legacy" });
+				void runQuestInBackground(record, { write: true, inPlace, contexts, config, globalInstructions: config.globalInstructions, instructions, partyHint: recipe.party, fastWrite: useFastWrite(recipe, targets.length, brief) });
 				return started(record, project?.id, targets.map((t) => t.name).join("+"), true, inPlace);
 			}
 

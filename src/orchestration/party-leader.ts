@@ -7,9 +7,8 @@
  * decides which specialists to run, in what order, and what runs in parallel, then
  * passes findings between them and writes one coherent final report.
  *
- * Scope for M6: the Party dispatches READ-ONLY Guildmates only. Write (Smith) and
- * exec (Runner) dispatch requires the isolation (M8) and approval (M9) machinery
- * and is deliberately withheld until then, so a Party cannot touch the working tree.
+ * Read-only parties dispatch read-only Guildmates. A write party also gets the builder,
+ * which edits and tests in an isolated worktree.
  */
 
 import { randomUUID } from "node:crypto";
@@ -51,7 +50,6 @@ const DISPATCHABLE_READONLY_SLACK: ReadonlySet<string> = new Set(["read-only", "
 // plus the envoy, whose shell is read-only (it can fetch a PR but cannot post/mutate).
 const DISPATCHABLE_READONLY_GH: ReadonlySet<string> = new Set(["read-only", "envoy"]);
 const DISPATCHABLE_WRITE: ReadonlySet<string> = new Set(["read-only", "builder"]);
-const DISPATCHABLE_LEGACY_WRITE: ReadonlySet<string> = new Set(["read-only", "write", "exec"]);
 
 /** A runaway guard only: the party iterates until its checks and reviews pass, so this is generous. */
 export function dynamicDispatchBudget(writableRepos: number): number {
@@ -156,7 +154,7 @@ function buildRepoBlock(contexts: RepoContext[]): string[] {
 	];
 }
 
-export function buildSystemPrompt(basePrompt: string, available: Guildmate[], config: GuildmasterConfig, write: boolean, contexts: RepoContext[], globalInstructions: string | undefined, instructions: string | undefined, reviewMode: boolean, acquire: boolean, openTag: string, endTag: string, partyHint: string[] | undefined, interactive: boolean, legacyWrite = false): string {
+export function buildSystemPrompt(basePrompt: string, available: Guildmate[], config: GuildmasterConfig, write: boolean, contexts: RepoContext[], globalInstructions: string | undefined, instructions: string | undefined, reviewMode: boolean, acquire: boolean, openTag: string, endTag: string, partyHint: string[] | undefined, interactive: boolean): string {
 	const roster = available
 		.map((m) => `- ${m.name} [${m.tier}] (model: ${resolveModelSpec(config, m.model) ?? "default"}): ${m.tagline ?? m.description}`)
 		.join("\n");
@@ -216,7 +214,7 @@ export function buildSystemPrompt(basePrompt: string, available: Guildmate[], co
 					"  Fold their answer into the work before continuing.",
 				]
 			: []),
-		...(!write || legacyWrite ? [
+		...(!write ? [
 			"- ADVERSARIAL REVIEW: for any review, correctness, security, or decision, once you have a",
 			"  substantive conclusion or plan, dispatch `inquisitor` to attack it. Take material objections seriously.",
 		] : []),
@@ -284,31 +282,6 @@ export function buildSystemPrompt(basePrompt: string, available: Guildmate[], co
 		? reviewWorkflow
 		: acquire
 		? acquireWorkflow
-		: write && legacyWrite
-		? [
-				"- IMPLEMENTATION WORKFLOW: understand the code (scout/delver), get a plan (architect), and have",
-				"  inquisitor attack the PLAN. THEN dispatch `smith` to implement and `runner` to build/test. Only",
-				"  dispatch smith after a plan exists; if smith says the plan is wrong, stop and re-plan rather than",
-				"  improvising. (Runner can only run bounded commands; watch modes/servers are refused by its shell.)",
-				"- COMMITTING: the harness commits any changes left in the worktree when the party finalizes, so smith",
-				"  having no shell is expected and smith need not commit. Commits a member makes are kept and count as changes.",
-				"- REVIEW YOUR OWN DIFF BEFORE FINALIZING: once smith has implemented and runner's build/tests are",
-				"  green, you MUST dispatch `inquisitor` (and `warden` when the change touches security/auth/input",
-				"  handling) to review the ACTUAL CHANGES, not the plan. Give the reviewer the changed-file list and",
-				"  the brief's acceptance criteria; it reads those files (and may ask runner for `git diff`) and checks",
-				"  the implementation against EVERY requirement in the brief.",
-				"- HAND BACK ON MATERIAL ISSUES: if the reviewer finds a correctness bug, a security hole, a broken or",
-				"  missing test, or a brief requirement not met, dispatch `smith` to fix it, `runner` to re-test, then",
-				"  re-review. Do NOT loop on nits or style — record minor items under Unresolved and move on.",
-				...ownership,
-				"- PR BODY SYNTHESIS: after review passes, dispatch `scribe` to write the pull request description.",
-				"  Scribe writes plain, human-readable prose (its persona defines the style). Give Scribe: the brief,",
-				"  what changed (files and why), what runner tested, and any caveats from inquisitor/warden.",
-				"- The final report IS what Scribe wrote — paste it verbatim between the report markers, do not",
-				"  rewrite it. First line must be a concise PR title as H1 (`# ...`). Then sections: Summary,",
-				"  Changes (with file references), Testing (what was verified), and Risks / Unresolved (if any).",
-				"  Do not claim tests passed unless runner actually reported it.",
-			]
 		: write
 		? [
 				"- TRIAGE: use read/ls yourself for relevant files. Choose the smallest useful party; zero specialist scouts is normal.",
@@ -349,8 +322,6 @@ export async function runParty(opts: {
 	onProgress?: (members: QuestMember[]) => void;
 	/** When true, the Party may dispatch a builder into a writable context. */
 	write?: boolean;
-	/** Explicit fallback to the old Smith/Runner pipeline. */
-	legacyWrite?: boolean;
 	/** Standing project context to fold into the Party Leader's prompt. */
 	instructions?: string;
 	/** Guild-wide standing instructions prepended to every Party Leader prompt. */
@@ -385,14 +356,14 @@ export async function runParty(opts: {
 	const dispatchable = reviewMode
 		? DISPATCHABLE_REVIEW
 		: write
-			? opts.legacyWrite ? DISPATCHABLE_LEGACY_WRITE : DISPATCHABLE_WRITE
+			? DISPATCHABLE_WRITE
 			: acquire
 				? DISPATCHABLE_READONLY_GH
 				: slack
 					? DISPATCHABLE_READONLY_SLACK
 					: DISPATCHABLE_READONLY;
 	const available = opts.roster.filter((m) => dispatchable.has(m.tier));
-	if (write && !opts.legacyWrite && !available.some((m) => m.name.toLowerCase() === "builder")) available.push(createBuilderGuildmate());
+	if (write && !available.some((m) => m.name.toLowerCase() === "builder")) available.push(createBuilderGuildmate());
 	const members: QuestMember[] = [];
 	const maxDispatches = dynamicDispatchBudget(contexts.filter((c) => c.writable).length);
 	let memberCost = 0;
@@ -434,7 +405,7 @@ export async function runParty(opts: {
 				);
 			}
 			const modelSpec = resolveModelSpec(opts.config, mate.model);
-			if (write && !opts.legacyWrite && members.length >= maxDispatches) {
+			if (write && members.length >= maxDispatches) {
 				throw new Error(`Runaway guard: ${maxDispatches} dispatches used. Stop iterating: ask the user with request_user how to continue, or finalize with what is done and what still fails.`);
 			}
 			const index =
@@ -445,7 +416,7 @@ export async function runParty(opts: {
 			// from the watchdog forever. Mark it failed, report progress, and rethrow to the leader.
 			try {
 				// Shell access is always a bounded/gated CUSTOM tool, never raw bash: the envoy gets the
-				// policy-gated GitHub shell for review parties; the runner (exec) gets the bounded shell
+				// policy-gated GitHub shell for review parties; the builder gets the bounded shell
 				// that refuses non-terminating commands and reaps a silently hung one.
 				const shellTools =
 					mate.tier === "envoy" && opts.review
@@ -462,7 +433,7 @@ export async function runParty(opts: {
 							? // Read-only envoy: reviewMode:false makes policy REFUSE every mutation
 								// outright (no approval path), so this shell can only fetch.
 								[createEnvoyShellTool({ cwd: context.path, reviewMode: false })]
-							: mate.tier === "exec" || mate.tier === "builder"
+							: mate.tier === "builder"
 								? [createRunnerShellTool({ cwd: context.path, ...opts.config.shell })]
 								: mate.tier === "messenger" && slack
 									? // Read-only Herald: the gated Slack tool refuses every non-read Slack
@@ -473,7 +444,7 @@ export async function runParty(opts: {
 
 				// Requirement fidelity: write/exec members act on the code, so they must see the quest's
 				// authoritative constraints, not just the leader's paraphrase of one bounded task. The brief
-				// is appended so smith/runner satisfy EVERY requirement, not only the observable one.
+				// is appended so they satisfy EVERY requirement, not only the observable one.
 				const memberTask =
 					mate.tier === "write" || mate.tier === "exec" || mate.tier === "builder"
 						? `${params.task}\n\n## Quest brief (authoritative requirements — satisfy ALL of these, not just the task above)\n${opts.brief}`
@@ -615,9 +586,9 @@ export async function runParty(opts: {
 	const run = await runSession({
 		// The leader has no file tools; it just needs a valid cwd for session setup.
 		cwd: contexts[0]?.path ?? process.cwd(),
-		systemPrompt: buildSystemPrompt(loadPartyLeaderPrompt() ?? DEFAULT_LEADER_PROMPT, available, opts.config, write, contexts, opts.globalInstructions, opts.instructions, reviewMode, acquire, openTag, endTag, opts.partyHint, Boolean(interactive), opts.legacyWrite),
+		systemPrompt: buildSystemPrompt(loadPartyLeaderPrompt() ?? DEFAULT_LEADER_PROMPT, available, opts.config, write, contexts, opts.globalInstructions, opts.instructions, reviewMode, acquire, openTag, endTag, opts.partyHint, Boolean(interactive)),
 		modelSpec: resolveModelSpec(opts.config, opts.config.partyLeaderModel),
-		tools: [...(write && !opts.legacyWrite ? ["read", "ls"] : []), "dispatch", ...(requestUser ? ["request_user"] : [])],
+		tools: [...(write ? ["read", "ls"] : []), "dispatch", ...(requestUser ? ["request_user"] : [])],
 		customTools: requestUser ? [dispatch, requestUser] : [dispatch],
 		promptText: opts.brief,
 		signal: opts.signal,

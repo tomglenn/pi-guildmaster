@@ -38,7 +38,7 @@ English:
 - Describe what changed and why, with file references where helpful.
 - State what was tested and what the results were.
 - Note any risks, limitations, or unresolved items flagged during review.
-- NEVER reference agent-only context: no quest IDs, no party member names (smith, inquisitor,
+- NEVER reference agent-only context: no quest IDs, no party member names (builder, inquisitor,
   warden, delver, scout), no internal tool names, no "the party decided", no "Option A/B".
   Write as if a single author made the change.
 

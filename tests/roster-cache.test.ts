@@ -24,8 +24,8 @@ test("loadRoster populates from disk even when a prompt loader primed the cache 
 	const roster = loadRoster();
 	assert.ok(roster.length > 0, `expected a non-empty roster, got ${roster.length} (cache returned empty placeholder?)`);
 	assert.ok(
-		roster.some((m) => m.name.toLowerCase() === "runner"),
-		"expected the runner Guildmate to be present",
+		roster.some((m) => m.name.toLowerCase() === "warden"),
+		"expected the warden Guildmate to be present",
 	);
 });
 

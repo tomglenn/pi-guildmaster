@@ -6,19 +6,18 @@ import { createBuilderGuildmate } from "../src/orchestration/fast-write.ts";
 import { parseChecksLine } from "../src/orchestration/checks-line.ts";
 import { scanDiff, scanPrText } from "../src/orchestration/publish-scan.ts";
 
-const prompt = (legacy = false, interactive = true) => buildSystemPrompt("base", [createBuilderGuildmate()], DEFAULT_CONFIG, true, [], undefined, undefined, false, false, "<<<R>>>", "<<<E>>>", undefined, interactive, legacy);
+const prompt = (interactive = true) => buildSystemPrompt("base", [createBuilderGuildmate()], DEFAULT_CONFIG, true, [], undefined, undefined, false, false, "<<<R>>>", "<<<E>>>", undefined, interactive);
 
-test("dynamic write leader chooses the party; legacy pipeline is opt-in", () => {
+test("the write leader chooses the party; there is no fixed pipeline", () => {
 	assert.match(prompt(), /smallest useful party/);
 	assert.match(prompt(), /builder to own editing, tests, and fixes/);
 	assert.doesNotMatch(prompt(), /THEN dispatch `smith`/);
 	assert.doesNotMatch(prompt(), /inquisitor attack the PLAN/);
-	assert.match(prompt(true), /THEN dispatch `smith`/);
 	assert.ok(dynamicDispatchBudget(1) >= 12, "the budget is a runaway guard, not a cap on iterating");
 });
 
 test("the party owns its checks and its own adversarial review; Guildmaster does not", () => {
-	for (const p of [prompt(), prompt(true)]) {
+	for (const p of [prompt(), prompt(false)]) {
 		assert.match(p, /not done while a\s+check fails/i);
 		assert.match(p, /warden[\s\S]*attack the ACTUAL diff/);
 		assert.match(p, /including the last one, goes back\s+to the SAME reviewer/);
