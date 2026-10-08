@@ -21,6 +21,7 @@ import { type ExtensionAPI, type ExtensionContext, getMarkdownTheme, type ThemeC
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { getApprovalManager, getQuestManager } from "./orchestration/manager.ts";
 import { desktopNotify } from "./execution/notify-desktop.ts";
+import { showCard } from "./ui.ts";
 import type { QuestMemberStatus, QuestRecord } from "./persistence/quest-store.ts";
 
 /** Kind-aware inbox hint + the command that answers it. */
@@ -260,11 +261,9 @@ export class StatusSurface {
 			} else if (record.state === "failed") {
 				this.notify(`Quest "${record.title}" failed: ${record.error ?? "unknown"}.`, "error");
 				this.showQuestCard(record);
-			} else if (record.state === "awaiting-approval") {
-				this.notify(`Quest "${record.title}" is awaiting approval.`, "warning");
-			} else if (record.state === "awaiting-input") {
-				this.notify(`Quest "${record.title}" is paused, waiting on you — see /inbox.`, "warning");
 			}
+			// awaiting-approval / awaiting-input: no notice here. Every pause parks a request, and
+			// onApprovalChange announces that request once (with the command that answers it).
 		}
 		this.scheduleRepaint();
 	}
@@ -273,12 +272,13 @@ export class StatusSurface {
 		const current = getApprovalManager().list();
 		for (const a of current) {
 			if (!this.knownApprovals.has(a.id)) {
+				const quest = a.questId ? getQuestManager().store.load(a.questId)?.title : undefined;
 				if (a.kind === "huddle") {
-					this.notify(`Huddle ready — a Quest wants to work through "${a.title}" with you. Ask me to pick it up.`, "warning");
+					this.announce(quest, a.title, "A Quest wants to work this through with you. Ask me to pick it up.");
 					desktopNotify(a.title, "A Quest wants to huddle — ask the Guildmaster to pick it up.");
 				} else {
 					const cmd = KIND_HINT[a.kind] ?? "/inbox";
-					this.notify(`Waiting on you — ${cmd} ${a.id}  (${a.title})`, "warning");
+					this.announce(quest, a.title, `${cmd} ${a.id}`);
 					// Also fire a native desktop notification: the user is often away from the terminal.
 					desktopNotify(a.title, `${a.kind === "review-artifact" ? "Review" : "Request"} — ${cmd} ${a.id}`);
 				}
@@ -286,6 +286,15 @@ export class StatusSurface {
 		}
 		this.knownApprovals = new Set(current.map((a) => a.id));
 		this.scheduleRepaint();
+	}
+
+	/** One compact transcript card per new request (not a "Warning:" toast): who is asking, what, and how to answer. */
+	private announce(quest: string | undefined, title: string, how: string): void {
+		if (!this.pi || !this.ctx) return;
+		showCard(this.pi, {
+			title: `Waiting on you${quest ? ` — ${quest}` : ""}`,
+			lines: [{ text: title, indent: 2 }, { text: how, color: "accent", indent: 2 }],
+		});
 	}
 
 	private notify(text: string, level: "info" | "warning" | "error"): void {

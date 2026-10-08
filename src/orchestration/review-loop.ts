@@ -16,7 +16,14 @@ import type { ReviewOutcome } from "./write-review.ts";
 import type { QuestMember } from "../persistence/quest-store.ts";
 
 export const ACCEPT = "Accept the risk: keep the change, and record the findings in the PR body";
-export const RETRY = "Send it back for another fix round with my guidance";
+export const RETRY = "Send it back: another fix round with the findings, plus optional guidance from you";
+/** Shown when the user picks RETRY: the guidance is typed in the same step, never a second request. */
+export const RETRY_NOTE = "Guidance for the Builder (optional \u2014 leave empty to send the findings only)";
+
+/** The reviewer's protocol lines (VERDICT / BRIEF-CONFLICT) are for the harness, not the human. */
+export function findingsForDisplay(text: string): string {
+	return text.replace(/^\s*(VERDICT|BRIEF-CONFLICT):.*$/gim, "").replace(/\n{3,}/g, "\n\n").trim();
+}
 export const STOP = "Stop: keep the branch local and end the Quest";
 
 /** Findings can be long; keep them whole up to a generous cap (never cut to a fragment). */
@@ -64,10 +71,8 @@ export async function runReviewLoop(opts: {
 	maxFixRounds?: number;
 	review: () => Promise<ReviewOutcome>;
 	fix: (prompt: string, round: number) => Promise<FixResult>;
-	/** Ask the user to decide (choose). Abort resolves as a deny, which stops. */
-	choose: (title: string, description: string, options: string[]) => Promise<UserAnswer>;
-	/** Ask the user for free-text guidance for a retry round. */
-	answer: (title: string, description: string) => Promise<UserAnswer>;
+	/** Ask the user to decide (choose), optionally with a free-text note for some options. Abort resolves as a deny, which stops. */
+	choose: (title: string, description: string, options: string[], optionNotes?: Record<string, string>) => Promise<UserAnswer>;
 	onMembers?: (members: QuestMember[]) => void;
 }): Promise<ReviewLoopResult> {
 	const members: QuestMember[] = [];
@@ -109,8 +114,9 @@ export async function runReviewLoop(opts: {
 			const why = blocker ?? `The fix budget (${budget} round${budget === 1 ? "" : "s"}) is spent and ${review.reviewer} still blocks.`;
 			const ans = await opts.choose(
 				`${review.reviewer} still blocks ${opts.repo}. How should the Quest continue?`,
-				`${why}\n\nLatest ${review.reviewer} findings:\n${clipFindings(review.findings)}`,
+				`**Why you are asked:** ${why}\n\n---\n\n### Latest ${review.reviewer} findings\n\n${clipFindings(findingsForDisplay(review.findings))}`,
 				[ACCEPT, RETRY, STOP],
+				{ [RETRY]: RETRY_NOTE },
 			);
 			if (ans.approved && ans.choice === ACCEPT) {
 				return {
@@ -119,9 +125,7 @@ export async function runReviewLoop(opts: {
 				};
 			}
 			if (ans.approved && ans.choice === RETRY) {
-				const g = await opts.answer(`Guidance for the next fix round (${opts.repo})`, `What should the Builder do about the ${review.reviewer} findings?`);
-				if (!g.approved) throw new Error(`Stopped: no guidance given after the ${review.reviewer} review. Worktree preserved.\n\n${clipFindings(review.findings)}`);
-				guidance = g.text?.trim() || undefined;
+				guidance = ans.text?.trim() || undefined;
 				budget = rounds + 1;
 				continue;
 			}

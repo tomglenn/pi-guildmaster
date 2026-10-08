@@ -286,8 +286,7 @@ async function runQuestInBackground(
 									: undefined;
 						return { member, cost: fixed.usage.cost, report, blocker };
 					},
-					choose: (title, description, options) => ask({ kind: "choose", title, description, options }),
-					answer: (title, description) => ask({ kind: "answer", title, description }),
+					choose: (title, description, options, optionNotes) => ask({ kind: "choose", title, description, options, optionNotes }),
 				});
 				fence("Quest aborted during independent review.");
 				party.members.push(...loop.members);

@@ -9,8 +9,8 @@
  * commands. Party/Quest live-status widgets are added in later milestones.
  */
 
-import type { ExtensionAPI, ThemeColor } from "@earendil-works/pi-coding-agent";
-import { Container, Text } from "@earendil-works/pi-tui";
+import { type ExtensionAPI, getMarkdownTheme, type ThemeColor } from "@earendil-works/pi-coding-agent";
+import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 
 export const INFO_CARD_ENTRY = "guildmaster-info";
 
@@ -24,6 +24,8 @@ export interface CardLine {
 
 export interface InfoCardData {
 	title: string;
+	/** Rendered as Markdown under the title (e.g. a reviewer's findings), before `lines`. */
+	markdown?: string;
 	lines: CardLine[];
 }
 
@@ -33,6 +35,10 @@ export function registerInfoCard(pi: ExtensionAPI): void {
 		const data = entry.data as InfoCardData;
 		const container = new Container();
 		container.addChild(new Text(theme.fg("toolTitle", theme.bold(`◇ ${data.title}`)), 0, 0));
+		if (data.markdown?.trim()) {
+			container.addChild(new Markdown(data.markdown, 0, 0, getMarkdownTheme()));
+			if (data.lines.length) container.addChild(new Spacer(1));
+		}
 		for (const line of data.lines) {
 			const pad = " ".repeat(Math.max(0, line.indent ?? 0));
 			let body = line.bold ? theme.bold(line.text) : line.text;

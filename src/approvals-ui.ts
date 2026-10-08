@@ -132,12 +132,11 @@ export function registerApprovals(pi: ExtensionAPI): void {
 	/** Show WHY the user is being asked before a picker/input: a select only renders the title + options. */
 	const showRequestContext = (req: UserRequest) => {
 		if (!req.description?.trim()) return;
+		// Descriptions are Markdown (reviewer findings, party questions): render, never print raw.
 		showCard(pi, {
 			title: requestTitle(questTitleOf(req), req),
-			lines: [
-				...req.description.split("\n").map((text) => ({ text })),
-				...(req.options?.length ? [{ text: "", color: "muted" as ThemeColor }, ...numberedOptions(req.options).map((text) => ({ text, color: "accent" as ThemeColor }))] : []),
-			],
+			markdown: req.description,
+			lines: req.options?.length ? numberedOptions(req.options).map((text) => ({ text, color: "accent" as ThemeColor })) : [],
 		});
 	};
 
@@ -162,7 +161,7 @@ export function registerApprovals(pi: ExtensionAPI): void {
 				r.kind === "approve"
 					? `/approve ${r.id}  ·  /deny ${r.id}`
 					: r.kind === "choose"
-						? `/choose ${r.id}  (opens a picker)  ·  /choose ${r.id} <number>`
+						? `/choose ${r.id}  (opens a picker)  ·  /choose ${r.id} <number>${r.optionNotes && Object.keys(r.optionNotes).length ? " [guidance]" : ""}`
 						: r.kind === "answer"
 							? `/answer ${r.id}  (opens an input)  ·  /answer ${r.id} <text>`
 							: r.kind === "huddle"
@@ -241,12 +240,22 @@ export function registerApprovals(pi: ExtensionAPI): void {
 			const { req, rest } = picked;
 			const options = req.options ?? [];
 			let choice: string | undefined;
+			let note: string | undefined;
+			// `/choose 2 <note>`: a note-taking option can carry its text inline.
+			const inline = /^#?(\d+)\.?\s+([\s\S]+)$/.exec(rest);
+			if (inline && options.length) {
+				const m = matchOption(options, inline[1]);
+				if ("choice" in m && req.optionNotes?.[m.choice]) {
+					choice = m.choice;
+					note = inline[2].trim();
+				}
+			}
 			if (options.length === 0) {
 				choice = rest || (ctx.hasUI ? (await ctx.ui.input(req.title, "Your choice"))?.trim() : undefined);
 				if (!choice) return ctx.ui.notify(`Nothing chosen — ${req.id} is still pending.`, "info");
 			} else {
 				const list = numberedOptions(options);
-				if (rest) {
+				if (rest && !choice) {
 					const m = matchOption(options, rest);
 					if ("choice" in m) choice = m.choice;
 					else if (!ctx.hasUI) return ctx.ui.notify(`${m.error}\n${list.join("\n")}`, "warning");
@@ -260,8 +269,18 @@ export function registerApprovals(pi: ExtensionAPI): void {
 					choice = options[list.indexOf(pick)];
 				}
 			}
-			const done = approvals.answer(req.id, { action: "choose", approved: true, choice });
-			ctx.ui.notify(done ? `Chose "${choice}" for ${req.id}.` : `${req.id} is no longer pending; nothing sent.`, done ? "info" : "warning");
+			// Same step, no second request: an option that takes a note asks for it right away.
+			const notePrompt = choice ? req.optionNotes?.[choice] : undefined;
+			if (notePrompt && note === undefined && ctx.hasUI) {
+				const typed = await ctx.ui.input(notePrompt, "Enter to skip");
+				if (typed === undefined) return ctx.ui.notify(`Nothing sent \u2014 ${req.id} is still pending.`, "info");
+				note = typed.trim() || undefined;
+			}
+			const done = approvals.answer(req.id, { action: "choose", approved: true, choice, text: note });
+			ctx.ui.notify(
+				done ? `Chose "${choice}" for ${req.id}${notePrompt ? (note ? " with your guidance" : " (no extra guidance)") : ""}.` : `${req.id} is no longer pending; nothing sent.`,
+				done ? "info" : "warning",
+			);
 		},
 	});
 
@@ -348,7 +367,7 @@ export function registerApprovals(pi: ExtensionAPI): void {
 		parameters: Type.Object({
 			requestId: Type.Optional(Type.String({ description: "Request id (rq-\u2026). Optional when exactly one choose/answer request is pending." })),
 			option: Type.Optional(Type.String({ description: "For a 'choose' request: the 1-based option number, or its text." })),
-			text: Type.Optional(Type.String({ description: "For an 'answer' request: the user's answer." })),
+			text: Type.Optional(Type.String({ description: "For an 'answer' request: the user's answer. For a 'choose' option that takes a note (e.g. send-back guidance): the user's note." })),
 		}),
 		async execute(_toolCallId, params): Promise<{ content: { type: "text"; text: string }[]; details: { id: string; choice?: string } }> {
 			const pending = approvals.list();
@@ -371,7 +390,9 @@ export function registerApprovals(pi: ExtensionAPI): void {
 				if (!input) throw new Error(`Pass option for ${describe(req)}`);
 				const m = req.options?.length ? matchOption(req.options, input) : { choice: input };
 				if ("error" in m) throw new Error(`${m.error}\n${describe(req)}`);
-				if (!approvals.answer(req.id, { action: "choose", approved: true, choice: m.choice })) throw new Error(`${req.id} is no longer pending.`);
+				// With option given, text is the optional note for a note-taking option (e.g. retry guidance).
+				const note = params.option && req.optionNotes?.[m.choice] ? params.text?.trim() || undefined : undefined;
+				if (!approvals.answer(req.id, { action: "choose", approved: true, choice: m.choice, text: note })) throw new Error(`${req.id} is no longer pending.`);
 				return { content: [{ type: "text", text: `Chose "${m.choice}" for ${req.id}. The Quest resumes.` }], details: { id: req.id, choice: m.choice } };
 			}
 			const text = (params.text ?? params.option ?? "").trim();

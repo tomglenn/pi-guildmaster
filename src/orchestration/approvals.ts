@@ -42,6 +42,9 @@ export interface UserRequest {
 	operation?: string;
 	/** kind "choose": the options the user picks from. */
 	options?: string[];
+	/** kind "choose": options that also take OPTIONAL free text in the same step (option → input prompt).
+	 * The text comes back as {@link UserAnswer.text}, so picking e.g. "send it back" never needs a second request. */
+	optionNotes?: Record<string, string>;
 	/** kind "review-artifact": absolute path to a file the user reads/edits before deciding. */
 	artifactPath?: string;
 	/** kind "review-artifact": approving POSTS a PR review parsed from the artifact, so `/approve`
@@ -62,7 +65,7 @@ export interface UserAnswer {
 	approved: boolean;
 	/** kind "choose": the selected option. */
 	choice?: string;
-	/** kind "answer": the free text; kind "review-artifact"/send-back: the user's notes. */
+	/** kind "answer": the free text; kind "choose": the optional note for an {@link UserRequest.optionNotes} option; kind "review-artifact"/send-back: the user's notes. */
 	text?: string;
 	/** postsReview requests: the exact verdict + body the user confirmed at /approve. The post uses this snapshot. */
 	review?: { verdict: "approve" | "request-changes" | "comment"; body: string };
@@ -123,6 +126,7 @@ export class ApprovalManager {
 		description?: string;
 		operation?: string;
 		options?: string[];
+		optionNotes?: Record<string, string>;
 		artifactPath?: string;
 		postsReview?: boolean;
 		questId?: string;
@@ -137,6 +141,7 @@ export class ApprovalManager {
 			description: input.description ?? "",
 			operation: input.operation,
 			options: input.options,
+			optionNotes: input.optionNotes,
 			artifactPath: input.artifactPath,
 			postsReview: input.postsReview,
 			createdAt: Date.now(),
