@@ -9,10 +9,14 @@
  */
 
 import * as fs from "node:fs";
+import { createHash } from "node:crypto";
 import type { ExtensionAPI, ExtensionCommandContext, ThemeColor } from "@earendil-works/pi-coding-agent";
+import { Key, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
+import type { Component } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { getApprovalManager, getQuestManager } from "./orchestration/manager.ts";
 import { type ReviewVerdict, reviewFlag } from "./execution/gh-tool.ts";
+import { ApprovalManager } from "./orchestration/approvals.ts";
 import type { UserRequest } from "./orchestration/approvals.ts";
 import { commitsAhead } from "./execution/isolation.ts";
 import { explainUnraisable, raisePr } from "./orchestration/pr.ts";
@@ -20,6 +24,7 @@ import { extractPostableReview } from "./orchestration/review-post.ts";
 import type { QuestRecord } from "./persistence/quest-store.ts";
 import { type CardLine, showCard } from "./ui.ts";
 import { matchOption, numberedOptions, parseRequestArgs, requestCompletions, resolveRequestId } from "./request-input.ts";
+import { getViewedFingerprint, hasUnsafeChars, openReviewViewer, reviewBodyFingerprint, reviewBodyFingerprintFull, sanitizeForLabel, showReviewCard } from "./review-viewer.ts";
 
 /** A short glyph + label for each request kind, for the inbox. */
 const KIND_LABEL: Record<UserRequest["kind"], string> = {
@@ -55,34 +60,246 @@ const REVIEW_EVENT: Record<ReviewVerdict, string> = {
 };
 
 /**
- * The /approve confirm prompt for posting a PR review. It is self-sufficient: it has
- * the exact event (GitHub event + gh flag + full command line) and the FULL,
- * untruncated body that will be posted, so the user never has to trust a separate
- * card. pi renders confirm as a wrapping text block with no length cap.
+ * Parse a PR label (e.g. "owner/repo#123") from an operation string like
+ * "gh pr review 123 --repo owner/repo". Returns undefined if not parseable.
  */
-export function buildReviewConfirm(
-	operation: string | undefined,
-	verdict: ReviewVerdict,
-	body: string,
-): { title: string; message: string } {
-	const flag = reviewFlag(verdict);
-	const command = `${operation ?? "gh pr review"} ${flag}`;
+export function parsePrLabelFromOperation(operation: string | undefined): string | undefined {
+	if (!operation) return undefined;
+	const m = /^gh pr review (\d+)(?:\s+--repo\s+([\w.\-/]+))?/.exec(operation);
+	if (!m) return undefined;
+	const [, number, slug] = m;
+	return slug ? `${slug}#${number}` : `#${number}`;
+}
+
+/**
+ * Build the compact /approve prompt for posting a PR review.
+ *
+ * Returns a `title` (multi-line summary: PR, verdict, body size + fingerprint, hint)
+ * and `options` ordered `["Cancel", "Post … review (…)"]` so index 0 = Cancel is
+ * the safe default when the user presses Enter without reading.
+ *
+ * The fingerprint (first 8 hex of sha256 of the body) is also shown in the /review
+ * viewer header so the user can match what they are approving.
+ *
+ * No body content appears in the title or options — the full body is in /review.
+ */
+export function buildCompactReviewSelect(opts: {
+	id: string;
+	operation: string | undefined;
+	/** PR label like "owner/repo#123" or "#123". Derived from operation when not supplied. */
+	label?: string;
+	verdict: ReviewVerdict;
+	body: string;
+	/** Contextual warnings shown in the confirm title. */
+	warnings?: {
+		/** User never viewed this review in /review this session. */
+		neverViewed?: boolean;
+		/** Body changed since it was last viewed in /review. */
+		viewedDiffers?: boolean;
+		/** No --repo slug: repository inferred by gh from checkout. */
+		noSlug?: boolean;
+		/** The file contained unsafe control/bidi/tag characters when last viewed. */
+		viewedUnsafe?: boolean;
+	};
+}): { title: string; options: string[]; titleLinesPriority: string[] } {
+	const flag = reviewFlag(opts.verdict);
+	const event = REVIEW_EVENT[opts.verdict];
+	const label = opts.label ?? parsePrLabelFromOperation(opts.operation);
+	const lines = opts.body.split("\n");
+	const fingerprint = reviewBodyFingerprint(opts.body);
+	const command = `${opts.operation ?? "gh pr review"} ${flag}`;
+
+	// Title lines in PRIORITY ORDER (most important first for budget-aware rendering):
+	// 1. verdict/event+flag  2. PR  3. warnings  4. size+fingerprint  5. /review hint
+	const verdictLine = `Verdict: ${event} (${flag})`;
+	const prLine = label ? `PR: ${label}` : undefined;
+	const sizeAndFp = `Body: ${lines.length} lines / ${opts.body.length} chars · ${fingerprint}`;
+	const hintLine = `Review/edit first: /review ${opts.id}`;
+
+	const warningLines: string[] = [];
+	if (opts.warnings?.neverViewed) warningLines.push("⚠ Not yet viewed in /review this session");
+	if (opts.warnings?.viewedDiffers) warningLines.push("⚠ Body changed since last /review — review again");
+	if (opts.warnings?.viewedUnsafe) warningLines.push("⚠ File contained unsafe characters when last viewed");
+	if (opts.warnings?.noSlug) warningLines.push("⚠ No --repo: repository inferred by gh from checkout");
+
+	// Priority-ordered (for TUI budget trimming): verdict first, then PR, warnings, size/fp, hint
+	const titleLinesPriority: string[] = [
+		verdictLine,
+		...(prLine ? [prLine] : []),
+		...warningLines,
+		sizeAndFp,
+		hintLine,
+	];
+
+	// Full title for non-TUI display (all lines in original order)
+	const titleLines = titleLinesPriority;
+
 	return {
-		title: `Post this review as ${REVIEW_EVENT[verdict]} (${flag})?`,
-		message: [
-			`Event: ${REVIEW_EVENT[verdict]}`,
-			`Command: ${command}`,
-			"Inline comments are not supported; only the body below is posted.",
-			"",
-			"----- exact body (posted verbatim) -----",
-			body,
-			"----- end of body -----",
-		].join("\n"),
+		title: titleLines.join("\n"),
+		options: ["Cancel", `Post ${event} review (${command})`],
+		titleLinesPriority,
 	};
 }
 
+// ---------------------------------------------------------------------------
+// ReviewConfirmComponent — TUI-mode confirm for /approve (review-artifact)
+// ---------------------------------------------------------------------------
+
+/** Injectable clock for testing the grace period. */
+export interface ReviewConfirmClock {
+	now(): number;
+	setTimeout(fn: () => void, ms: number): ReturnType<typeof setTimeout>;
+	clearTimeout(t: ReturnType<typeof setTimeout>): void;
+}
+
+const defaultClock: ReviewConfirmClock = {
+	now: () => Date.now(),
+	setTimeout: (fn, ms) => setTimeout(fn, ms),
+	clearTimeout: (t) => clearTimeout(t),
+};
+
+/**
+ * A compact TUI overlay confirm component for posting a PR review.
+ *
+ * Safety properties:
+ *  - defaults to Cancel (index 0)
+ *  - ignores ALL input for a ~500 ms grace period after opening (shows "arming…" indicator)
+ *  - after the grace period, moves ONLY with ↑/↓/Tab/←/→; letters (j/k etc.) are ignored
+ *  - Enter activates the highlighted option
+ *  - Esc/ctrl+c cancel regardless of state
+ */
+export class ReviewConfirmComponent implements Component {
+	private selectedIndex = 0; // 0 = Cancel
+	private arming = true;
+	private armTimer: ReturnType<typeof setTimeout> | undefined;
+	private firstRendered = false;
+	private readonly clock: ReviewConfirmClock;
+	private readonly tui: { terminal: { rows: number }; requestRender(): void };
+	private readonly titleLines: string[];
+	/** Priority-ordered title lines for budget-aware rendering (verdict first). */
+	private readonly priorityTitleLines: string[];
+	private readonly options: string[];
+	private readonly done: (result: string | undefined) => void;
+	private readonly getBudgetRows: () => number;
+
+	/** Grace period in ms; override in tests via clock injection. */
+	static GRACE_MS = 500;
+
+	constructor(
+		tui: { terminal: { rows: number }; requestRender(): void },
+		title: string,
+		options: string[],
+		done: (result: string | undefined) => void,
+		clock?: ReviewConfirmClock,
+		getBudgetRows?: () => number,
+		priorityTitleLines?: string[],
+	) {
+		this.tui = tui;
+		this.titleLines = title.split("\n");
+		this.priorityTitleLines = priorityTitleLines ?? this.titleLines;
+		this.options = options;
+		this.done = done;
+		this.clock = clock ?? defaultClock;
+		this.getBudgetRows = getBudgetRows ?? (() => Math.max(1, this.tui.terminal.rows - 2));
+		// Timer is NOT started here — it starts on first render (Issue 5).
+	}
+
+	private startArmTimer(): void {
+		if (this.armTimer !== undefined) this.clock.clearTimeout(this.armTimer);
+		this.armTimer = this.clock.setTimeout(() => {
+			this.arming = false;
+			this.armTimer = undefined;
+			this.tui.requestRender();
+		}, ReviewConfirmComponent.GRACE_MS);
+	}
+
+	dispose(): void {
+		if (this.armTimer !== undefined) {
+			this.clock.clearTimeout(this.armTimer);
+			this.armTimer = undefined;
+		}
+	}
+
+	invalidate(): void {
+		// Stateless re-render: nothing to invalidate.
+	}
+
+	render(width: number): string[] {
+		// Start the grace timer on first render (not constructor), so typed-ahead keys
+		// arriving before the first render are discarded (Issue 5).
+		if (!this.firstRendered) {
+			this.firstRendered = true;
+			this.startArmTimer();
+		}
+
+		const w = Math.max(1, width);
+		// Budget: matches the overlay's effective height (margin:1, maxHeight:"100%" → rows-2).
+		const budget = this.getBudgetRows();
+		// Fixed bottom section: options + footer. No blank lines in minimal layout.
+		const fixedBottom = this.options.length + 1; // N options + 1 footer
+		const titleBudget = budget - fixedBottom;
+
+		// "Too small" state: cannot show even one priority title line + options + footer.
+		if (titleBudget <= 0) {
+			return [truncateToWidth("Terminal too small to confirm safely — Esc to cancel", w)].slice(0, budget);
+		}
+
+		// Select up to titleBudget lines from priority-ordered title lines.
+		const selectedTitle = this.priorityTitleLines.slice(0, titleBudget);
+
+		// Options with selection marker.
+		const optionLines: string[] = [];
+		for (let i = 0; i < this.options.length; i++) {
+			const marker = i === this.selectedIndex ? "→ " : "  ";
+			optionLines.push(truncateToWidth(`${marker}${this.options[i]}`, w));
+		}
+
+		// Footer: arming indicator or key hints.
+		const footer = this.arming
+			? "Arming (wait)  Esc: cancel"
+			: "↑↓ Tab ←→ navigate  Enter: confirm  Esc: cancel";
+
+		return [
+			...selectedTitle.map((l) => truncateToWidth(l, w)),
+			...optionLines,
+			truncateToWidth(footer, w),
+		];
+	}
+
+	handleInput(data: string): void {
+		// Esc and ctrl+c always cancel, even during grace — use matchesKey for Kitty protocol support.
+		if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {
+			this.done(undefined);
+			return;
+		}
+
+		// "Too small" state: only Esc/ctrl+c work (handled above).
+		const budget = this.getBudgetRows();
+		if (budget - this.options.length - 1 <= 0) return;
+
+		// During grace period: discard the input AND restart the quiet timer (Issue 5).
+		if (this.arming) {
+			this.startArmTimer();
+			return;
+		}
+
+		// Navigation: ↑/↓/Tab/←/→ ONLY (not j/k or other letters).
+		if (matchesKey(data, Key.up) || matchesKey(data, Key.left)) {
+			this.selectedIndex = Math.max(0, this.selectedIndex - 1);
+		} else if (matchesKey(data, Key.down) || matchesKey(data, Key.right) || matchesKey(data, Key.tab)) {
+			this.selectedIndex = Math.min(this.options.length - 1, this.selectedIndex + 1);
+		} else if (matchesKey(data, Key.enter)) {
+			// Enter: activate highlighted option.
+			this.done(this.options[this.selectedIndex]);
+			return;
+		}
+		// All other keys (j, k, letters, etc.) are silently ignored.
+		this.tui.requestRender();
+	}
+}
+
 /** Read a postsReview artifact FRESH and parse what would post (never a cached or whole-file body). */
-function readPostable(artifactPath: string | undefined): ReturnType<typeof extractPostableReview> {
+export function readPostable(artifactPath: string | undefined): ReturnType<typeof extractPostableReview> {
 	if (!artifactPath) return { error: "the request has no review file" };
 	try {
 		return extractPostableReview(fs.readFileSync(artifactPath, "utf-8"));
@@ -91,8 +308,16 @@ function readPostable(artifactPath: string | undefined): ReturnType<typeof extra
 	}
 }
 
-export function registerApprovals(pi: ExtensionAPI): void {
-	const approvals = getApprovalManager();
+export function registerApprovals(
+	pi: ExtensionAPI,
+	opts?: {
+		/** Inject an ApprovalManager (tests). Defaults to the singleton. */
+		approvals?: ApprovalManager;
+		/** Inject a clock for the grace-period timer (tests). */
+		reviewConfirmClock?: ReviewConfirmClock;
+	},
+): void {
+	const approvals = opts?.approvals ?? getApprovalManager();
 	// pi replaces the WHOLE argument text with a picked completion, so completions only ever
 	// extend what was typed (never an unrelated id that would swallow the user's option text).
 	const completionsFor = (verb: keyof typeof COMMAND_KINDS) => (prefix: string) => requestCompletions(approvals.list(), COMMAND_KINDS[verb], prefix);
@@ -123,7 +348,7 @@ export function registerApprovals(pi: ExtensionAPI): void {
 			ctx.ui.notify(`${eligible.length} requests are waiting. Use /${verb} <id> (see /inbox).`, "warning");
 			return undefined;
 		}
-		const labels = eligible.map((r) => `${r.id} — ${requestTitle(questTitleOf(r), r)}`);
+		const labels = eligible.map((r) => `${r.id} — ${sanitizeForLabel(requestTitle(questTitleOf(r), r))}`);
 		const pick = await ctx.ui.select(`/${verb}: which request?`, labels);
 		const req = pick ? eligible[labels.indexOf(pick)] : undefined;
 		return req ? { req, rest: parsed.rest, implicit: false } : undefined;
@@ -189,40 +414,105 @@ export function registerApprovals(pi: ExtensionAPI): void {
 				// No id typed: never resolve a gate the user has not seen. Confirm it by title.
 				if (implicit && !(verb === "approve" && req.kind === "review-artifact" && req.postsReview)) {
 					if (!ctx.hasUI) return ctx.ui.notify(`Use /${verb} ${id} to ${verb} "${req.title}".`, "warning");
-					const ok = await ctx.ui.confirm(`${verb === "approve" ? "Approve" : "Decline"}: ${requestTitle(questTitleOf(req), req)}?`, req.description ?? "");
-					if (!ok) return ctx.ui.notify(`${id} is still pending.`, "info");
+					// Cancel-first select (exact-equality consent) — avoids a stray Enter approving.
+					const safeTitle = sanitizeForLabel(requestTitle(questTitleOf(req), req));
+					const confirmLabel = `${verb === "approve" ? "Approve" : "Decline"}: "${safeTitle}"`;
+					const cancelLabel = "Cancel";
+					const confirmPick = await ctx.ui.select(
+						`${verb === "approve" ? "Approve" : "Decline"}: ${safeTitle}?`,
+						[cancelLabel, confirmLabel],
+					);
+					if (confirmPick !== confirmLabel) return ctx.ui.notify(`${id} is still pending.`, "info");
 				}
 				if (verb === "approve" && req?.kind === "review-artifact" && req.postsReview) {
-					// Posting a PR review: parse the CURRENT file, show the exact event + body, confirm,
-					// and answer with that snapshot — it is exactly what gets posted.
-					const parsed = readPostable(req.artifactPath);
-					if ("error" in parsed) {
-						ctx.ui.notify(`Not posted: ${parsed.error}. Edit ${req.artifactPath ?? "review.md"} and /approve ${id} again.`, "warning");
+					// ---------------------------------------------------------------
+					// Posting a PR review: compact TUI confirm with grace period,
+					// Cancel-first, no j/k type-ahead; select() fallback for RPC.
+					// ---------------------------------------------------------------
+					if (!ctx.hasUI) {
+						ctx.ui.notify(`Not posted: ${id} posts a PR review and needs an interactive confirm. Run /approve ${id} in the interactive terminal.`, "warning");
 						return;
 					}
-					if (!ctx.hasUI) {
-						ctx.ui.notify(`Not posted: ${id} posts a PR review and needs an interactive confirm of the exact body. Run /approve ${id} in the interactive terminal.`, "warning");
+					// Parse the current file fresh.
+					const parsed = readPostable(req.artifactPath);
+					if ("error" in parsed) {
+						ctx.ui.notify(`Not posted: ${sanitizeForLabel(parsed.error)}. Edit ${req.artifactPath ?? "review.md"} and /approve ${id} again.`, "warning");
+						return;
+					}
+					// Guard: refuse to post if body/verdict contains unsafe chars (injection risk).
+					// Covers C0/C1 controls, bidi controls, Unicode tag chars, and ZW non-printing chars.
+					if (hasUnsafeChars(parsed.body) || hasUnsafeChars(parsed.verdict)) {
+						ctx.ui.notify(
+							`Not posted: the review body or verdict contains control/bidi/tag characters that could indicate tampering. ` +
+								`Edit ${req.artifactPath ?? "review.md"} to remove them, then /approve ${id} again.`,
+							"warning",
+						);
 						return;
 					}
 					const flag = reviewFlag(parsed.verdict);
-					const command = `${req.operation ?? "gh pr review"} ${flag}`;
-					showCard(pi, {
-						title: `About to post: ${req.title}`,
-						lines: [
-							{ text: command, color: "accent", bold: true },
-							{ text: "Inline comments are not supported; only this text is posted.", color: "muted" },
-							{ text: "", color: "muted" },
-							...parsed.body.split("\n").map((line) => ({ text: line })),
-						],
+					const label = parsePrLabelFromOperation(req.operation);
+					// Warn when the review was never viewed, or body changed since last /review.
+					// Use FULL sha256 hash for comparison (not truncated 8-char display version).
+					const viewedEntry = getViewedFingerprint(id);
+					const fingerprintFull = reviewBodyFingerprintFull(parsed.body);
+					const fingerprint = fingerprintFull.slice(0, 8); // display only
+					const neverViewed = viewedEntry === undefined;
+					const viewedDiffers = viewedEntry !== undefined && viewedEntry.hash !== fingerprintFull;
+					const viewedUnsafe = viewedEntry?.hasUnsafeChars === true;
+					// Warn if no --repo slug (gh infers from checkout).
+					const noSlug = !label || label.startsWith("#");
+					const prompt = buildCompactReviewSelect({
+						id,
+						operation: req.operation,
+						label,
+						verdict: parsed.verdict,
+						body: parsed.body,
+						warnings: { neverViewed, viewedDiffers, noSlug, viewedUnsafe },
 					});
-					const prompt = buildReviewConfirm(req.operation, parsed.verdict, parsed.body);
-					const ok = await ctx.ui.confirm(prompt.title, prompt.message);
-					if (!ok) {
-						ctx.ui.notify(`Not posted — ${id} is still pending. Edit ${req.artifactPath} and /approve ${id} again, or /deny ${id}.`, "info");
+					let pick: string | undefined;
+					if (ctx.mode === "tui") {
+						// TUI: custom confirm with grace period and budget-aware rendering.
+						// overlay margin:1, maxHeight:"100%" → budget = rows-2 (matches component).
+						pick = await ctx.ui.custom<string | undefined>(
+							(tui, _theme, _kb, done) => {
+								const getRows = () => Math.max(1, tui.terminal.rows - 2);
+								return new ReviewConfirmComponent(
+									tui, prompt.title, prompt.options, done,
+									opts?.reviewConfirmClock, getRows, prompt.titleLinesPriority,
+								);
+							},
+							{
+								overlay: true,
+								overlayOptions: {
+									margin: 1,
+									maxHeight: "100%",
+									width: "80%",
+									minWidth: 40,
+								},
+							},
+						);
+					} else {
+						// Non-TUI (RPC etc.): plain select fallback.
+						pick = await ctx.ui.select(prompt.title, prompt.options);
+					}
+					// Only EXACT equality with the Post option counts as consent.
+					if (pick !== prompt.options[1]) {
+						ctx.ui.notify(`Not posted — ${id} is still pending. /review ${id} to read/edit, then /approve ${id} again.`, "info");
 						return;
 					}
+					// TOCTOU: re-read after confirm; compare EXACT body AND verdict (not fingerprint hash).
+					const reParsed = readPostable(req.artifactPath);
+					if ("error" in reParsed) {
+						ctx.ui.notify(`Not posted: file changed while confirming (${sanitizeForLabel(reParsed.error)}). /approve ${id} again.`, "warning");
+						return;
+					}
+					if (reParsed.body !== parsed.body || reParsed.verdict !== parsed.verdict) {
+						ctx.ui.notify(`Not posted: the review file changed while you were confirming. Run /approve ${id} again.`, "warning");
+						return;
+					}
+					// Post the EXACT snapshot the user confirmed.
 					const done = approvals.answer(id, { action: "approve", approved: true, review: { verdict: parsed.verdict, body: parsed.body } });
-					ctx.ui.notify(done ? `Request ${id} approved — posting as ${flag}.` : `Request ${id} is no longer pending; nothing posted.`, done ? "info" : "warning");
+					ctx.ui.notify(done ? `Approved ${id} — posting ${REVIEW_EVENT[parsed.verdict]} (${flag}).` : `${id} is no longer pending; nothing posted.`, done ? "info" : "warning");
 					return;
 				}
 				approvals.resolve(id, verb === "approve");
@@ -264,7 +554,7 @@ export function registerApprovals(pi: ExtensionAPI): void {
 				if (!choice) {
 					if (!ctx.hasUI) return ctx.ui.notify(`Usage: /choose ${req.id} <number>\n${list.join("\n")}`, "warning");
 					showRequestContext(req);
-					const pick = await ctx.ui.select(requestTitle(questTitleOf(req), req), list);
+					const pick = await ctx.ui.select(sanitizeForLabel(requestTitle(questTitleOf(req), req)), list);
 					if (!pick) return ctx.ui.notify(`Nothing chosen — ${req.id} is still pending.`, "info");
 					choice = options[list.indexOf(pick)];
 				}
@@ -294,7 +584,7 @@ export function registerApprovals(pi: ExtensionAPI): void {
 			const id = req.id;
 			let rest = picked.rest;
 			if (!rest && ctx.hasUI) showRequestContext(req);
-			if (!rest && ctx.hasUI) rest = (await ctx.ui.input(requestTitle(questTitleOf(req), req), req.kind === "review-artifact" ? "Notes to send back" : "Your answer"))?.trim() ?? "";
+			if (!rest && ctx.hasUI) rest = (await ctx.ui.input(sanitizeForLabel(requestTitle(questTitleOf(req), req)), req.kind === "review-artifact" ? "Notes to send back" : "Your answer"))?.trim() ?? "";
 			if (!rest) return ctx.ui.notify(ctx.hasUI ? `Nothing sent — ${id} is still pending.` : `Usage: /answer ${id} <text>`, ctx.hasUI ? "info" : "warning");
 			// For a review-artifact, free text means "send it back with notes" (do NOT proceed).
 			// For an 'answer' question, it is the answer the party asked for.
@@ -318,37 +608,14 @@ export function registerApprovals(pi: ExtensionAPI): void {
 			const id = req.id;
 			if (req.kind !== "review-artifact" || !req.artifactPath)
 				return ctx.ui.notify(`${id} is a '${req.kind}' request, not an editable artifact. Use /inbox to see how to answer it.`, "warning");
-			let content = "";
-			try {
-				content = fs.readFileSync(req.artifactPath, "utf-8");
-			} catch {
-				content = "(could not read the artifact file)";
+			const label = parsePrLabelFromOperation(req.operation);
+			if (ctx.mode === "tui") {
+				// TUI: scrollable, editable viewer. Never posts — use /approve <id>.
+				await openReviewViewer(ctx, req as UserRequest & { kind: "review-artifact"; artifactPath: string }, pi, label ?? undefined);
+			} else {
+				// Non-TUI fallback: card with the FULL file (no truncation).
+				showReviewCard(pi, req as UserRequest & { kind: "review-artifact"; artifactPath: string }, label ?? undefined);
 			}
-			const preview = content.split("\n").slice(0, 60);
-			// A review that posts: lead with exactly what /approve would send (or why it can't).
-			const postable: CardLine[] = [];
-			if (req.postsReview) {
-				const parsed = readPostable(req.artifactPath);
-				if ("error" in parsed) {
-					postable.push({ text: `\u26a0 Cannot post: ${parsed.error}`, color: "warning", bold: true });
-				} else {
-					postable.push({ text: `Will post: ${reviewFlag(parsed.verdict)}`, color: "accent", bold: true });
-					postable.push(...parsed.body.split("\n").map((line) => ({ text: line })));
-				}
-				postable.push({ text: "", color: "muted" });
-			}
-			showCard(pi, {
-				title: `Review: ${req.title}`,
-				lines: [
-					...postable,
-					{ text: `Edit this file, then /approve ${id} to use the edited version:`, color: "muted" },
-					{ text: req.artifactPath, color: "accent" },
-					{ text: `Or /answer ${id} <notes> to send it back for revision, or /deny ${id} to leave it as a draft.`, color: "muted" },
-					{ text: "", color: "muted" },
-					...preview.map((line) => ({ text: line, color: "dim" as ThemeColor })),
-					...(content.split("\n").length > 60 ? [{ text: "… (truncated — open the file for the rest)", color: "muted" as ThemeColor }] : []),
-				],
-			});
 		},
 	});
 

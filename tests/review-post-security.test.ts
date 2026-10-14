@@ -330,6 +330,8 @@ test("postReview execs gh with an argv (no shell), via a private 0600 body file 
 		const i = args.indexOf("--body-file");
 		if (i === -1) {
 			calls.push({ file, args });
+			// gh api user -> login; gh api reviews -> review URL
+			if (args.includes("user")) return "testuser\n";
 			return "https://github.com/o/r/pull/12#pullrequestreview-1\n";
 		}
 		const bodyFile = args[i + 1];
@@ -339,7 +341,8 @@ test("postReview execs gh with an argv (no shell), via a private 0600 body file 
 	const res = postReview({ cwd: process.cwd(), number: "12", slug: "o/r", verdict: "comment", body: "hello $(id) `x`", exec });
 	assert.equal(res.error, undefined);
 	assert.equal(res.url, "https://github.com/o/r/pull/12#pullrequestreview-1");
-	assert.equal(calls.length, 2);
+	// calls[0] = pr review (body file), calls[1] = gh api user, calls[2] = gh api reviews
+	assert.equal(calls.length, 3);
 	assert.equal(calls[0].file, "gh");
 	assert.deepEqual(calls[0].args.slice(0, 6), ["pr", "review", "12", "--repo", "o/r", "--comment"]);
 	assert.equal(calls[0].body, "hello $(id) `x`");
@@ -347,7 +350,13 @@ test("postReview execs gh with an argv (no shell), via a private 0600 body file 
 	const bodyFile = calls[0].args[calls[0].args.indexOf("--body-file") + 1];
 	assert.ok(!fs.existsSync(bodyFile), "body file removed");
 	assert.ok(!fs.existsSync(bodyFile.slice(0, bodyFile.lastIndexOf("/"))), "private temp dir removed");
-	assert.deepEqual(calls[1], { file: "gh", args: ["pr", "view", "12", "--repo", "o/r", "--json", "reviews", "-q", ".reviews[-1].url"] });
+	// calls[1] = user login lookup
+	assert.deepEqual(calls[1], { file: "gh", args: ["api", "user", "--jq", ".login"] });
+	// calls[2] = reviews lookup with user filter
+	assert.equal(calls[2].file, "gh");
+	assert.ok(calls[2].args.includes("--paginate"), "reviews call uses --paginate");
+	assert.ok(calls[2].args.some((a: string) => a.includes("repos/o/r/pulls/12/reviews")), "reviews endpoint");
+	assert.ok(calls[2].args.some((a: string) => a.includes("select(.user.login")), "filters by user login");
 });
 
 test("postReview refuses an invalid target before running anything", () => {

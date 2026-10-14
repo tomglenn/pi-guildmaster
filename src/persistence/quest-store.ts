@@ -65,6 +65,8 @@ export interface QuestReview {
 	verdict?: "approve" | "request-changes" | "comment";
 	posted?: boolean;
 	url?: string;
+	/** True when url is a review anchor (review link); false/undefined when it's the PR page URL. */
+	urlIsReview?: boolean;
 }
 
 /** Drafted (M8) or opened (M9) pull request for one repo. Guildmaster never merges. */

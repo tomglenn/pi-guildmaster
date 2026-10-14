@@ -82,7 +82,7 @@ export function postReview(opts: {
 	body: string;
 	prText?: string;
 	exec?: ExecFile;
-}): { url?: string; error?: string } {
+}): { url?: string; urlIsReview?: boolean; error?: string } {
 	const exec = opts.exec ?? defaultExecFile;
 	try {
 		assertPrTarget(opts.number, opts.slug);
@@ -107,18 +107,75 @@ export function postReview(opts: {
 			stdio: ["ignore", "pipe", "pipe"],
 		});
 		let url: string | undefined;
-		try {
-			url =
-				exec("gh", ["pr", "view", opts.number, ...repoArgs, "--json", "reviews", "-q", ".reviews[-1].url"], {
-					cwd: opts.cwd,
-					encoding: "utf-8",
-					timeout: 20_000,
-					stdio: ["ignore", "pipe", "pipe"],
-				}).trim() || undefined;
-		} catch {
-			/* url is best-effort */
+		let urlIsReview: boolean | undefined;
+		if (opts.slug) {
+			// Step 1: get the current user's login (validates as GitHub username chars only).
+			// Used to filter the reviews list to the current user's reviews.
+			// Bot logins like "name[bot]" contain "[" and "]" which are NOT safe to
+			// embed in a jq string literal; treat them as unknown -> PR link.
+			// When login is unknown: skip the reviews lookup entirely to avoid returning
+			// someone else's review URL from an unfiltered query.
+			let login: string | undefined;
+			try {
+				const rawLogin = exec(
+					"gh",
+					["api", "user", "--jq", ".login"],
+					{ cwd: opts.cwd, encoding: "utf-8", timeout: 10_000, stdio: ["ignore", "pipe", "pipe"] },
+				).trim();
+				// GitHub usernames: alphanumeric + hyphens only (no adjacent hyphens,
+				// no leading/trailing, no brackets or special chars).
+				if (/^[a-zA-Z0-9][a-zA-Z0-9-]*$/.test(rawLogin)) login = rawLogin;
+			} catch { /* login remains undefined */ }
+
+			if (login) {
+				// Step 2: get the current user's latest review URL from the REST reviews endpoint.
+				// Paginated; take the last line starting with https://github.com/.
+				// Falls back to the PR page URL if no review URL is found.
+				try {
+					const jqFilter = `.[] | select(.user.login == "${login}") | .html_url`;
+					const raw = exec(
+						"gh",
+						["api", "--paginate", `repos/${opts.slug}/pulls/${opts.number}/reviews`, "--jq", jqFilter],
+						{ cwd: opts.cwd, encoding: "utf-8", timeout: 20_000, stdio: ["ignore", "pipe", "pipe"] },
+					);
+					const lastGhUrl = raw
+						.split("\n")
+						.filter((l) => l.trim() && l.trim() !== "null" && l.trim().startsWith("https://github.com/"))
+						.pop()
+						?.trim();
+					if (lastGhUrl) {
+						url = lastGhUrl;
+						urlIsReview = true;
+					} else {
+						url = `https://github.com/${opts.slug}/pull/${opts.number}`;
+						urlIsReview = false;
+					}
+				} catch {
+					url = `https://github.com/${opts.slug}/pull/${opts.number}`;
+					urlIsReview = false;
+				}
+			} else {
+				// Login unknown (lookup failed or invalid/bot login): skip reviews lookup,
+				// use the PR page URL to avoid showing someone else's review URL.
+				url = `https://github.com/${opts.slug}/pull/${opts.number}`;
+				urlIsReview = false;
+			}
+		} else {
+			// No slug: use gh pr view for the PR URL (best-effort, no fallback).
+			try {
+				const raw = exec(
+					"gh",
+					["pr", "view", opts.number, "--json", "url", "--jq", ".url"],
+					{ cwd: opts.cwd, encoding: "utf-8", timeout: 20_000, stdio: ["ignore", "pipe", "pipe"] },
+				);
+				const trimmed = raw.trim();
+				url = trimmed && trimmed !== "null" && trimmed.startsWith("https://") ? trimmed : undefined;
+				urlIsReview = false; // No slug means we can't get a review URL
+			} catch {
+				/* url remains undefined */
+			}
 		}
-		return { url };
+		return { url, urlIsReview };
 	} catch (err) {
 		const e = err as { stderr?: string; message?: string };
 		return { error: e.stderr || e.message || String(err) };

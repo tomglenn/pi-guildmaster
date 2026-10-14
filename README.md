@@ -87,8 +87,11 @@ A review is a party, not a single agent:
    shell) fetches the PR.
 2. Specialists review the full diff. **Scout** or **Delver** checks correctness. **Inquisitor** challenges the findings. **Warden** reviews changes to security-sensitive code.
 3. **Scribe** writes the human-facing review.
-4. The Quest **pauses for your approval**: `/approve` to have the envoy post it,
-   or leave it as a draft.
+4. The Quest **pauses for your approval**: use `/review <id>` to open a scrollable
+   viewer (`e` to edit the review, `q` to close), then `/approve <id>` to post it
+   (Cancel is the default — use ↑/↓ or Tab to navigate options; Enter confirms after
+   a short arming delay, Esc cancels at any time) or `/answer <id> <notes>`
+   to send it back with notes. The full review stays as a draft until you explicitly approve.
 
 `gh pr merge` is always refused.
 
@@ -106,7 +109,11 @@ Commands are introspection and power-user controls — never required ceremony.
 | `/quests` | Show current and recent Quests |
 | `/quest-cancel <id>` | Cancel a running background Quest |
 | `/consult <guildmate> <question>` | Consult a Guildmate directly |
-| `/approvals` · `/approve <id>` · `/deny <id>` | List / resolve parked approvals |
+| `/inbox` · `/approvals` | List all pending approvals, reviews and questions |
+| `/review <id>` | Open a scrollable, editable review viewer; `e` to edit, `q` to close (TUI only) |
+| `/approve <id>` | Compact confirm to post a PR review (Cancel default; grace period before keys arm) |
+| `/deny <id>` | Decline a pending approval or review |
+| `/answer <id> [notes]` | Send a review back with notes, or answer a pending question |
 | `/projects` · `/project-remove <id>` | List / remove registered projects |
 
 ---
