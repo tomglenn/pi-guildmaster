@@ -23,6 +23,7 @@ import { getApprovalManager, getQuestManager } from "./orchestration/manager.ts"
 import { desktopNotify } from "./execution/notify-desktop.ts";
 import { showCard } from "./ui.ts";
 import type { QuestMemberStatus, QuestRecord } from "./persistence/quest-store.ts";
+import { sanitizeForDisplay } from "./sanitize.ts";
 
 /** Kind-aware inbox hint + the command that answers it. */
 const KIND_HINT: Record<string, string> = {
@@ -256,7 +257,11 @@ export class StatusSurface {
 						: `${totalPrs} draft PR(s) ready to raise`;
 				const prUrls = (record.prs ?? []).filter((p) => p.url).map((p) => p.url).join(", ");
 				const completionMsg = `Quest "${record.title}" completed${totalPrs > 0 ? ` — ${prStatus}` : ""}.`;
-				this.notify(completionMsg + (prUrls ? ` ${prUrls}` : ""), "info");
+				// For review Quests that posted successfully, include the review URL in the toast.
+				// Label as "Review:" when the URL is a review anchor, "PR:" when it's the PR page.
+				const reviewUrlLabel = record.review?.urlIsReview ? "Review" : "PR";
+				const reviewUrl = record.review?.posted && record.review?.url ? ` ${reviewUrlLabel}: ${record.review.url}` : "";
+				this.notify(completionMsg + (prUrls ? ` ${prUrls}` : "") + reviewUrl, "info");
 				this.showQuestCard(record);
 			} else if (record.state === "failed") {
 				this.notify(`Quest "${record.title}" failed: ${record.error ?? "unknown"}.`, "error");
@@ -446,7 +451,9 @@ function renderQuestCard(record: QuestRecord, theme: { fg: (c: ThemeColor, t: st
 	if (record.error) c.addChild(new Text(fg("error", `error: ${record.error}`), 0, 0));
 	if (record.report) {
 		// Render the report as formatted markdown (headings, code, lists) rather than raw text.
-		const full = record.report.trim();
+		// Issue 4: sanitize before passing to Markdown renderer so ESC/OSC/bidi from the
+		// party's report cannot reach the terminal.
+		const full = sanitizeForDisplay(record.report.trim());
 		const allLines = full.split("\n");
 		const shown = expanded ? full : allLines.slice(0, 20).join("\n");
 		c.addChild(new Markdown(shown, 0, 0, getMarkdownTheme()));

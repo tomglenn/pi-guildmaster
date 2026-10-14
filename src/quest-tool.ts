@@ -389,11 +389,17 @@ async function runQuestInBackground(
 					if (!res.error) {
 						record.review.posted = true;
 						record.review.url = res.url;
+						record.review.urlIsReview = res.urlIsReview;
 					}
-					const note = res.error
-						? `\n\n---\n⚠\ufe0f Posting failed: ${res.error}. Left as a draft.`
-						: `\n\n---\n✅ Posted **${verdict}** review${res.url ? `: ${res.url}` : ""}.`;
-					return { report: `${body}${note}`, usage: party.usage };
+					// Short report: one confirmation line + review URL + artifact path. No full body.
+					const label = review.label;
+					const event = verdict.toUpperCase().replace("-", "_");
+					const urlLabel = res.urlIsReview ? "review" : "PR";
+					const shortNote = res.error
+						? `⚠️ Posting failed: ${res.error}. Left as a draft.`
+						: `✅ Posted ${event} review on ${label}${res.url ? ` — ${urlLabel}: ${res.url}` : ""}.`;
+					const reportNote = res.error ? shortNote : `${shortNote}\nArtifact: ${artifactPath}`;
+					return { report: reportNote, usage: party.usage };
 				}
 			}
 			return { report: `${party.report}${prSection(record)}`, usage: party.usage };

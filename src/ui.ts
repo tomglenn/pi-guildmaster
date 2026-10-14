@@ -11,6 +11,7 @@
 
 import { type ExtensionAPI, getMarkdownTheme, type ThemeColor } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
+import { sanitizeForDisplay, sanitizeForLabel } from "./sanitize.ts";
 
 export const INFO_CARD_ENTRY = "guildmaster-info";
 
@@ -34,14 +35,19 @@ export function registerInfoCard(pi: ExtensionAPI): void {
 	pi.registerEntryRenderer(INFO_CARD_ENTRY, (entry, _opts, theme) => {
 		const data = entry.data as InfoCardData;
 		const container = new Container();
-		container.addChild(new Text(theme.fg("toolTitle", theme.bold(`◇ ${data.title}`)), 0, 0));
+		// Issue 4: sanitize title and all line text so ESC/OSC/bidi injected from
+		// untrusted sources (review body, request description, quest report) cannot
+		// reach the terminal via the card renderer.
+		const safeTitle = sanitizeForLabel(data.title);
+		container.addChild(new Text(theme.fg("toolTitle", theme.bold(`◇ ${safeTitle}`)), 0, 0));
 		if (data.markdown?.trim()) {
-			container.addChild(new Markdown(data.markdown, 0, 0, getMarkdownTheme()));
+			container.addChild(new Markdown(sanitizeForDisplay(data.markdown), 0, 0, getMarkdownTheme()));
 			if (data.lines.length) container.addChild(new Spacer(1));
 		}
 		for (const line of data.lines) {
 			const pad = " ".repeat(Math.max(0, line.indent ?? 0));
-			let body = line.bold ? theme.bold(line.text) : line.text;
+			const safeText = sanitizeForDisplay(line.text);
+			let body = line.bold ? theme.bold(safeText) : safeText;
 			if (line.color) body = theme.fg(line.color, body);
 			container.addChild(new Text(pad + body, 0, 0));
 		}

@@ -13,7 +13,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { test } from "node:test";
-import { buildReviewConfirm } from "../src/approvals-ui.ts";
+import { buildCompactReviewSelect, parsePrLabelFromOperation, readPostable } from "../src/approvals-ui.ts";
 import type { GuildmasterConfig } from "../src/config.ts";
 import { reviewFlag } from "../src/execution/gh-tool.ts";
 import { ApprovalManager } from "../src/orchestration/approvals.ts";
@@ -165,34 +165,117 @@ test("reviewFlag maps every verdict to its gh flag", () => {
 	assert.equal(reviewFlag("comment"), "--comment");
 });
 
-test("the /approve confirm prompt itself carries the exact event and the FULL body", () => {
-	// A long body: nothing may be truncated or deferred to a separate card.
-	const body = ["Thanks for all the work here.", "", ...Array.from({ length: 200 }, (_, i) => `Line ${i}: \`file${i}.ts:${i}\` details`), "LAST LINE"].join("\n");
-	const { title, message } = buildReviewConfirm("gh pr review 1957 --repo grafana/grafana-pathfinder-app", "request-changes", body);
-	const text = `${title}\n${message}`;
-	assert.ok(message.includes(body), "full body, verbatim and untruncated");
-	assert.ok(text.includes("gh pr review 1957 --repo grafana/grafana-pathfinder-app --request-changes"), "the exact gh pr review line");
-	assert.match(title, /REQUEST_CHANGES/);
-	assert.match(title, /--request-changes/);
-	assert.match(message, /Event: REQUEST_CHANGES/);
-	assert.match(message, /Inline comments are not supported/);
-	assert.doesNotMatch(text, /shown above/);
+// ── buildCompactReviewSelect (the new /approve UX) ──────────────────────────────
+
+test("buildCompactReviewSelect: Cancel is option index 0 (default = safe)", () => {
+	const { options } = buildCompactReviewSelect({
+		id: "rq-1",
+		operation: "gh pr review 42 --repo o/r",
+		verdict: "request-changes",
+		body: "LGTM",
+	});
+	assert.equal(options[0], "Cancel", "Cancel must be first (default on Enter)");
+	assert.equal(options.length, 2);
 });
 
-test("buildReviewConfirm maps each verdict to its event and flag", () => {
+test("buildCompactReviewSelect: title contains PR, verdict, flag and fingerprint but NOT the body", () => {
+	const longBody = Array.from({ length: 200 }, (_, i) => `Line ${i}: detail here`).join("\n");
+	const { title, options } = buildCompactReviewSelect({
+		id: "rq-99",
+		operation: "gh pr review 1957 --repo grafana/grafana-pathfinder-app",
+		verdict: "request-changes",
+		body: longBody,
+	});
+	const all = `${title}\n${options.join("\n")}`;
+	// Must contain key identifiers
+	assert.match(all, /REQUEST_CHANGES/);
+	assert.match(all, /--request-changes/);
+	assert.match(all, /grafana\/grafana-pathfinder-app#1957/);
+	// Title lines must be compact — fewer than 10 lines total
+	assert.ok(title.split("\n").length < 10, `title must be compact, got ${title.split("\n").length} lines`);
+	// Body content must NOT appear in the prompt (use /review to read it)
+	assert.doesNotMatch(all, /Line 0:/);
+	assert.doesNotMatch(all, /Line 199:/);
+	// Fingerprint (8 hex chars) appears in title
+	assert.match(title, /[0-9a-f]{8}/);
+});
+
+test("buildCompactReviewSelect: Post option includes event and command", () => {
+	const { options } = buildCompactReviewSelect({
+		id: "rq-7",
+		operation: "gh pr review 10 --repo a/b",
+		verdict: "approve",
+		body: "Looks good",
+	});
+	assert.match(options[1], /APPROVE/);
+	assert.match(options[1], /--approve/);
+});
+
+test("buildCompactReviewSelect: maps each verdict to its event and flag", () => {
 	const cases: Array<["approve" | "request-changes" | "comment", string, string]> = [
 		["approve", "APPROVE", "--approve"],
 		["request-changes", "REQUEST_CHANGES", "--request-changes"],
 		["comment", "COMMENT", "--comment"],
 	];
 	for (const [verdict, event, flag] of cases) {
-		const { title, message } = buildReviewConfirm(undefined, verdict, "LGTM");
-		assert.ok(title.includes(`${event} (${flag})`), title);
-		assert.ok(message.includes(`Event: ${event}\n`), message);
-		assert.ok(message.includes(`Command: gh pr review ${flag}\n`), message);
-		assert.ok(message.includes("\nLGTM\n"), message);
+		const { title, options } = buildCompactReviewSelect({ id: "rq-x", operation: undefined, verdict, body: "LGTM" });
+		assert.match(title, new RegExp(event));
+		assert.match(options[1], new RegExp(event));
+		assert.match(options[1], new RegExp(flag.replace("+", "\\+")));
 	}
 });
+
+test("buildCompactReviewSelect: title includes /review hint", () => {
+	const { title } = buildCompactReviewSelect({ id: "rq-abc", operation: undefined, verdict: "approve", body: "x" });
+	assert.match(title, /\/review rq-abc/);
+});
+
+test("buildCompactReviewSelect: parsePrLabelFromOperation extracts label from operation", () => {
+	assert.equal(parsePrLabelFromOperation("gh pr review 42 --repo owner/repo"), "owner/repo#42");
+	assert.equal(parsePrLabelFromOperation("gh pr review 42"), "#42");
+	assert.equal(parsePrLabelFromOperation(undefined), undefined);
+	assert.equal(parsePrLabelFromOperation("not a review command"), undefined);
+});
+
+test("buildCompactReviewSelect: fingerprint is deterministic and 8 hex chars", () => {
+	const body = "Thanks for the work.";
+	const fp1 = buildCompactReviewSelect({ id: "rq-1", operation: undefined, verdict: "approve", body }).title;
+	const fp2 = buildCompactReviewSelect({ id: "rq-1", operation: undefined, verdict: "approve", body }).title;
+	assert.equal(fp1, fp2);
+	// Different body → different fingerprint
+	const fp3 = buildCompactReviewSelect({ id: "rq-1", operation: undefined, verdict: "approve", body: body + "!" }).title;
+	assert.notEqual(fp1, fp3);
+});
+
+// readPostable ──────────────────────────────────────────────────────────────────
+
+test("readPostable returns error when path is undefined", () => {
+	const r = readPostable(undefined);
+	assert.ok("error" in r);
+	assert.match(r.error, /no review file/);
+});
+
+test("readPostable returns error for a missing file", () => {
+	const r = readPostable("/nonexistent/path/review.md");
+	assert.ok("error" in r);
+});
+
+test("readPostable parses a valid review file", () => {
+	const { verdict, body } = ok(draft("Verdict: Approve"));
+	// Write to a temp file and read back
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gm-rp-"));
+	const p = path.join(dir, "review.md");
+	fs.writeFileSync(p, draft("Verdict: Approve"));
+	const r = readPostable(p);
+	assert.ok(!("error" in r));
+	if (!("error" in r)) {
+		assert.equal(r.verdict, verdict);
+		assert.equal(r.body, body);
+	}
+	fs.rmSync(dir, { recursive: true });
+});
+
+// ── review format + persistence ─────────────────────────────────────────────────
 
 test("REVIEW_FORMAT_EXAMPLE parses", () => {
 	const r = ok(REVIEW_FORMAT_EXAMPLE);
